@@ -1,1 +1,17 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@example.com
+      name: Admin User
+      password: '$2b$12$Y1kE8T/gLdeifd6JpWZyv.eA.cDV7G6a.YgVThqLg2N8o.gK2qVmG'
+    jsmith:
+      email: jsmith@example.com
+      name: John Smith
+      password: '$2b$12$JPLmU3.4LgGeO85ncm58E.1uYpPWVn6hC7VBlAW..l0T7s.dAPdDG'
+cookie:
+  expiry_days: 30
+  key: some_random_signature_key
+  name: forecast_app_cookie
+preauthorized:
+  emails: []
 
