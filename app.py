@@ -39,24 +39,19 @@ def apply_custom_styling():
         .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: white; font-weight: bold; }
     </style>""", unsafe_allow_html=True)
 
-# --- Firestore Initialization (CORRECTED) ---
+# --- Firestore Initialization ---
 @st.cache_resource
 def init_firestore():
     """
     Initializes the Firestore client using credentials from st.secrets.
-    This function has been corrected to directly use the dictionary
-    provided by st.secrets without trying to access a '.key' attribute.
     """
     try:
         if not firebase_admin._apps:
-            # The st.secrets.firebase_credentials object is a dictionary-like object.
-            # We convert it to a standard dictionary and pass it to Certificate().
             creds_dict = dict(st.secrets.firebase_credentials)
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
-        # Provide a more specific error message if possible.
         st.error(f"Firestore Connection Error: Failed to initialize. Please check your Streamlit secrets. Error: {e}")
         return None
 
@@ -100,7 +95,13 @@ def add_to_firestore(db_client, collection_name, data):
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
     if db_client is None: return
-    db_client.collection(collection_name).document(doc_id).set(data, merge=True)
+    # Ensure data being sent for update doesn't contain complex objects if not needed
+    update_dict = {}
+    for key, value in data.items():
+        if isinstance(value, (int, float, str, bool)):
+             update_dict[key] = value
+    db_client.collection(collection_name).document(doc_id).set(update_dict, merge=True)
+
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
@@ -273,15 +274,19 @@ if db:
                     st.success("Record added!")
                     st.rerun()
         
+        # --- THIS ENTIRE SECTION WAS MISSING AND HAS BEEN RESTORED ---
         st.subheader("Edit Historical Data")
         df = st.session_state.historical_df.copy()
         if not df.empty:
+            # Create a column for month-year filtering
             df['month_year'] = df['date'].dt.to_period('M').astype(str)
             month_options = sorted(df['month_year'].unique(), reverse=True)
             selected_month = st.selectbox("Select month to view/edit:", month_options)
             
+            # Filter the dataframe for the selected month
             monthly_df = df[df['month_year'] == selected_month].copy()
             
+            # Display the data editor for the filtered data
             edited_df = st.data_editor(
                 monthly_df, 
                 use_container_width=True,
@@ -298,13 +303,20 @@ if db:
                 disabled=['atv']
             )
 
+            # Save changes button
             if st.button("💾 Save Changes", key=f"save_{selected_month}"):
                 with st.spinner("Saving changes..."):
-                    for index, row in edited_df.iterrows():
-                        doc_id = row['id']
-                        update_data = row.drop(['id', 'month_year', 'atv', 'date']).to_dict()
-                        update_in_firestore(db, 'historical_data', doc_id, update_data)
+                    # Compare original monthly_df with edited_df to find changes
+                    changes = monthly_df.compare(edited_df)
+                    if not changes.empty:
+                        for index, row in changes.iterrows():
+                            doc_id = monthly_df.loc[index, 'id']
+                            update_data = edited_df.loc[index].drop(['id', 'month_year', 'atv', 'date']).to_dict()
+                            update_in_firestore(db, 'historical_data', doc_id, update_data)
                 
                 st.success("Changes saved!")
                 st.session_state.historical_df = load_from_firestore(db, 'historical_data')
                 st.rerun()
+        else:
+            st.info("No historical data found. Add a record to get started.")
+
