@@ -39,18 +39,25 @@ def apply_custom_styling():
         .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: white; font-weight: bold; }
     </style>""", unsafe_allow_html=True)
 
-# --- Firestore Initialization ---
+# --- Firestore Initialization (CORRECTED) ---
 @st.cache_resource
 def init_firestore():
+    """
+    Initializes the Firestore client using credentials from st.secrets.
+    This function has been corrected to directly use the dictionary
+    provided by st.secrets without trying to access a '.key' attribute.
+    """
     try:
         if not firebase_admin._apps:
-            creds_json_str = st.secrets.firebase_credentials.key
-            creds_dict = json.loads(creds_json_str)
+            # The st.secrets.firebase_credentials object is a dictionary-like object.
+            # We convert it to a standard dictionary and pass it to Certificate().
+            creds_dict = dict(st.secrets.firebase_credentials)
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
-        st.error(f"Firestore Connection Error: {e}")
+        # Provide a more specific error message if possible.
+        st.error(f"Firestore Connection Error: Failed to initialize. Please check your Streamlit secrets. Error: {e}")
         return None
 
 # --- App State Management ---
@@ -301,4 +308,3 @@ if db:
                 st.success("Changes saved!")
                 st.session_state.historical_df = load_from_firestore(db, 'historical_data')
                 st.rerun()
-
