@@ -84,6 +84,7 @@ def load_from_firestore(db_client, collection_name):
 
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
+    # Ensure date is in the correct format before sending to Firestore
     data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     db_client.collection(collection_name).add(data)
 
@@ -94,6 +95,48 @@ def update_in_firestore(db_client, collection_name, doc_id, data):
 
 def convert_df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
+
+# --- NEW: Automatic Database Seeding ---
+def seed_database_if_empty(db_client):
+    """Checks if the database is empty and seeds it from the repo CSV if it is."""
+    if db_client is None or 'db_seeded_check' in st.session_state:
+        return
+
+    collection_ref = db_client.collection('historical_data')
+    # Use limit(1) for an efficient check to see if any document exists
+    docs = collection_ref.limit(1).stream()
+    is_empty = not any(docs)
+
+    if is_empty:
+        st.info("First-time setup: Database is empty. Seeding with sample data from GitHub...")
+        file_path = 'sample_historical_data.csv'
+        try:
+            with st.spinner(f"Reading '{file_path}' from repository and populating database..."):
+                df_from_repo = pd.read_csv(file_path)
+                
+                required_cols = {'date', 'sales', 'customers'}
+                if not required_cols.issubset(df_from_repo.columns):
+                    st.error(f"Seeding failed: '{file_path}' must contain columns: {', '.join(required_cols)}")
+                    st.session_state.db_seeded_check = True # Mark as checked to avoid loop
+                    return
+
+                # Upload data to Firestore
+                for i, row in df_from_repo.iterrows():
+                    add_to_firestore(db_client, 'historical_data', row.to_dict())
+            
+            st.success("Database successfully seeded with sample data!")
+            st.session_state.db_seeded_check = True
+            # Short delay before rerunning to allow user to see the message
+            time.sleep(3)
+            st.rerun()
+
+        except FileNotFoundError:
+            st.error(f"Automatic Seeding Failed: Could not find '{file_path}' in the root of your GitHub repository.")
+        except Exception as e:
+            st.error(f"An error occurred during automatic database seeding: {e}")
+    
+    # Mark as checked so we don't perform this check on every interaction
+    st.session_state.db_seeded_check = True
 
 # --- Business Logic & Data Processing ---
 def calculate_atv(df):
@@ -168,7 +211,11 @@ def train_and_forecast_component(historical_df, periods, target_col, model_choic
 apply_custom_styling()
 db = init_firestore()
 if db:
+    # This will now run on the first load to populate the database if needed.
+    seed_database_if_empty(db)
+    
     initialize_state(db)
+    
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png")
         st.title(f"Welcome, *{st.session_state.name}*")
@@ -243,34 +290,6 @@ if db:
                     st.success("Record added!")
                     st.rerun()
         
-        # --- NEW: LOAD FROM GITHUB REPO ---
-        with st.expander("📂 Load Data from GitHub Repo"):
-            st.info("This will load the `sample_historical_data.csv` file from your GitHub repository and add it to your Firestore database.")
-            if st.button("Load sample_historical_data.csv from Repo"):
-                file_path = 'sample_historical_data.csv'
-                try:
-                    with st.spinner("Reading data from GitHub..."):
-                        df_from_repo = pd.read_csv(file_path)
-                    
-                    required_cols = {'date', 'sales', 'customers'}
-                    if not required_cols.issubset(df_from_repo.columns):
-                        st.error(f"CSV must contain the following columns: {', '.join(required_cols)}")
-                    else:
-                        st.write("Preview of data to be loaded:")
-                        st.dataframe(df_from_repo.head())
-                        if st.button("Confirm and Migrate to Firestore"):
-                            with st.spinner("Uploading data to Firestore... This may take a moment."):
-                                for i, row in df_from_repo.iterrows():
-                                    add_to_firestore(db, 'historical_data', row.to_dict())
-                            st.success("Data migration from GitHub complete!")
-                            st.session_state.historical_df = load_from_firestore(db, 'historical_data')
-                            st.rerun()
-
-                except FileNotFoundError:
-                    st.error(f"Error: Could not find '{file_path}' in the root of your GitHub repository.")
-                except Exception as e:
-                    st.error(f"An error occurred while processing the file: {e}")
-
         with st.expander("📤 Upload Historical Data from CSV"):
             uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
             if uploaded_file is not None:
