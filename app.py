@@ -176,7 +176,6 @@ if db:
         
         model_choice = st.selectbox("Select Forecasting Model:", ("Prophet Only", "Prophet + RandomForest", "Prophet + XGBoost"), index=1)
         
-        # --- ADD-ON SALES INPUT (RESTORED) ---
         st.session_state.add_on_sales = st.number_input(
             "Add-on Sales (₱)", 
             min_value=0.0, 
@@ -244,7 +243,34 @@ if db:
                     st.success("Record added!")
                     st.rerun()
         
-        # --- CSV UPLOADER (RESTORED) ---
+        # --- NEW: LOAD FROM GITHUB REPO ---
+        with st.expander("📂 Load Data from GitHub Repo"):
+            st.info("This will load the `sample_historical_data.csv` file from your GitHub repository and add it to your Firestore database.")
+            if st.button("Load sample_historical_data.csv from Repo"):
+                file_path = 'sample_historical_data.csv'
+                try:
+                    with st.spinner("Reading data from GitHub..."):
+                        df_from_repo = pd.read_csv(file_path)
+                    
+                    required_cols = {'date', 'sales', 'customers'}
+                    if not required_cols.issubset(df_from_repo.columns):
+                        st.error(f"CSV must contain the following columns: {', '.join(required_cols)}")
+                    else:
+                        st.write("Preview of data to be loaded:")
+                        st.dataframe(df_from_repo.head())
+                        if st.button("Confirm and Migrate to Firestore"):
+                            with st.spinner("Uploading data to Firestore... This may take a moment."):
+                                for i, row in df_from_repo.iterrows():
+                                    add_to_firestore(db, 'historical_data', row.to_dict())
+                            st.success("Data migration from GitHub complete!")
+                            st.session_state.historical_df = load_from_firestore(db, 'historical_data')
+                            st.rerun()
+
+                except FileNotFoundError:
+                    st.error(f"Error: Could not find '{file_path}' in the root of your GitHub repository.")
+                except Exception as e:
+                    st.error(f"An error occurred while processing the file: {e}")
+
         with st.expander("📤 Upload Historical Data from CSV"):
             uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
             if uploaded_file is not None:
