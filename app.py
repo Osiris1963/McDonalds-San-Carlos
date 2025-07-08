@@ -93,12 +93,11 @@ def load_from_firestore(db_client, collection_name):
     existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
     for col in existing_numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    # Fill NA for last_year features, as new data won't have it
     if 'last_year_sales' in df.columns: df['last_year_sales'].fillna(0, inplace=True)
     if 'last_year_customers' in df.columns: df['last_year_customers'].fillna(0, inplace=True)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True) # Ensure core columns are not null
+    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True) 
     for col in existing_numeric_cols:
          if col in df.columns: df[col] = df[col].astype(float)
     if not df.empty:
@@ -190,7 +189,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         holidays=all_manual_events,
         daily_seasonality=True,
         weekly_seasonality=True,
-        yearly_seasonality=False,
+        yearly_seasonality=False, 
         changepoint_prior_scale=0.01,
         changepoint_range=0.8
     )
@@ -202,7 +201,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
 
     # --- Residual Fitting Logic ---
     if corrector_model != 'None':
-        # Prepare data for the corrector model
         forecast_in_sample = prophet_model.predict(df_prophet)
         df_rf = df_train.copy()
         df_rf['residuals'] = df_prophet['y'].values - forecast_in_sample['yhat'].values
@@ -218,7 +216,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         X = df_rf[features].fillna(df_rf[features].mean())
         y = df_rf['residuals']
         
-        # --- Initialize and train the chosen corrector model ---
         if corrector_model == 'Random Forest':
             model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
         elif corrector_model == 'XGBoost':
@@ -226,7 +223,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         model.fit(X, y)
 
-        # Prepare future data for prediction
         if weather_df is not None:
             future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
         else:
@@ -234,10 +230,12 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
 
-        hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
-        hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
-        hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
-        future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
+        # This logic for future year-over-year data is disabled due to short history
+        # but is kept here for when more data is available.
+        # hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
+        # hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
+        # hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
+        # future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
         
         for col in X.columns:
             if col not in future_rf_data.columns: future_rf_data[col] = 0
@@ -245,7 +243,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         future_rf_data['add_on_sales'] = 0
         future_rf_data['consecutive_uptrend'] = 0
 
-        # Predict residuals and add them to the base forecast
         future_residuals = model.predict(future_rf_data[X.columns].fillna(0))
         prophet_forecast['yhat'] += future_residuals
 
@@ -254,23 +251,18 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
-# --- Plotting Functions & Firestore Data I/O ---
-# MODIFIED: This function now handles all required columns, including new ones
+# --- RESTORED: Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     else: return
-    
-    # Define all possible numeric columns
     all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
     for col in all_cols:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            # If a column is missing (like last_year_sales for a new record), add it as 0
             data[col] = 0.0
-            
     db_client.collection(collection_name).add(data)
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
@@ -305,7 +297,6 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
 
-
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -338,8 +329,6 @@ if db:
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
-                        # Last year features are disabled due to data constraints but can be re-enabled
-                        # hist_df_final = engineer_last_year_features(hist_df_with_trends)
                         
                         ev_df = st.session_state.events_df.copy()
                         
