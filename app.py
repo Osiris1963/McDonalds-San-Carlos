@@ -45,7 +45,7 @@ def apply_custom_styling():
         .st-emotion-cache-1r4qj8v, .st-emotion-cache-1xw8zdv { color: #ffc72c; }
     </style>""", unsafe_allow_html=True)
 
-# --- Firestore Initialization (Corrected) ---
+# --- Firestore Initialization ---
 @st.cache_resource
 def init_firestore():
     try:
@@ -158,6 +158,32 @@ def calculate_atv(df):
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
+
+# --- NEW FUNCTION TO ENGINEER THE CONSECUTIVE TREND FEATURE ---
+def engineer_consecutive_trend_feature(df):
+    """
+    Engineers a feature to count consecutive week-over-week uptrends for a given day.
+    """
+    df = df.sort_values('date').copy()
+    # Get the value from 7 days ago to compare the same weekdays
+    df['sales_lag_7'] = df['sales'].shift(7)
+    # Determine the direction of the weekly trend
+    df['weekly_trend_up'] = (df['sales'] > df['sales_lag_7']).astype(int)
+    
+    # Calculate the consecutive uptrend counter
+    df['consecutive_uptrend'] = 0
+    consecutive_count = 0
+    for i in range(len(df)):
+        if df['weekly_trend_up'].iloc[i] == 1:
+            consecutive_count += 1
+        else:
+            consecutive_count = 0
+        df.loc[df.index[i], 'consecutive_uptrend'] = consecutive_count
+        
+    # Clean up helper columns
+    df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
+    return df
+
 @st.cache_resource
 def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction,floor=0):
     df_train=historical_df.copy();df_train[target_col]=pd.to_numeric(df_train[target_col],errors='coerce');df_train.replace([np.inf,-np.inf],np.nan,inplace=True);df_train.dropna(subset=['date',target_col],inplace=True)
@@ -171,7 +197,11 @@ def train_and_forecast_component(historical_df,events_df,weather_df,periods,targ
     else:future_weather=future.copy();[future_weather.update({col:np.nan})for col in['temp_max','precipitation','wind_speed','weather']];df_rf=df_train.copy()
     forecast_in_sample=prophet_model.predict(df_prophet);df_rf['residuals']=df_prophet['y'].values-forecast_in_sample['yhat'].values
     if'weather'not in df_rf.columns:df_rf['weather']='Cloudy'
-    df_rf=pd.get_dummies(df_rf,columns=['weather'],drop_first=True,dummy_na=True);features=[col for col in df_rf.columns if col.startswith('weather_')or col in['add_on_sales','temp_max','precipitation','wind_speed']]
+    df_rf=pd.get_dummies(df_rf,columns=['weather'],drop_first=True,dummy_na=True)
+    
+    # --- MODIFIED: Added 'consecutive_uptrend' to the list of features for the Random Forest model ---
+    features=[col for col in df_rf.columns if col.startswith('weather_')or col in['add_on_sales','temp_max','precipitation','wind_speed','consecutive_uptrend']]
+    
     for col in features:
         if col in df_rf.columns:df_rf[col]=pd.to_numeric(df_rf[col],errors='coerce')
     X=df_rf[features].fillna(df_rf[features].mean());y=df_rf['residuals']
@@ -179,7 +209,13 @@ def train_and_forecast_component(historical_df,events_df,weather_df,periods,targ
         rf_model=RandomForestRegressor(n_estimators=100,random_state=42,min_samples_split=5);rf_model.fit(X,y);future_rf_data=pd.get_dummies(future_weather,columns=['weather'],dummy_na=True)
         for col in X.columns:
             if col not in future_rf_data.columns:future_rf_data[col]=0
-        future_rf_data['add_on_sales']=0;future_rf_data=future_rf_data[X.columns].fillna(df_rf[features].mean());future_residuals=rf_model.predict(future_rf_data);prophet_forecast=prophet_model.predict(future);prophet_forecast['yhat']+=future_residuals
+        
+        # --- MODIFIED: Initialize new features for future predictions ---
+        future_rf_data['add_on_sales']=0
+        if 'consecutive_uptrend' in X.columns:
+             future_rf_data['consecutive_uptrend'] = 0 # Assume neutral trend for future dates
+        
+        future_rf_data=future_rf_data[X.columns].fillna(df_rf[features].mean());future_residuals=rf_model.predict(future_rf_data);prophet_forecast=prophet_model.predict(future);prophet_forecast['yhat']+=future_residuals
     else:prophet_forecast=prophet_model.predict(future)
     prophet_forecast['yhat']=np.clip(prophet_forecast['yhat'],floor,cap);forecast_components=prophet_forecast[['ds','trend','holidays','weekly','yearly','yhat']];metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
     return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
@@ -212,7 +248,13 @@ if db:
                 if st.button("🔄 Generate Component Forecast",type="primary",use_container_width=True):
                     with st.spinner("🛰️ Fetching live weather..."):weather_df=get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
-                        hist_df=calculate_atv(st.session_state.historical_df.copy());ev_df=st.session_state.events_df.copy()
+                        
+                        # --- MODIFIED: Apply new feature engineering before training ---
+                        base_df = st.session_state.historical_df.copy()
+                        hist_df = calculate_atv(base_df)
+                        hist_df = engineer_consecutive_trend_feature(hist_df) # New step
+                        
+                        ev_df=st.session_state.events_df.copy()
                         cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df,ev_df,weather_df,15,'customers',use_rf_correction=True)
                         atv_f,atv_m,_,_=train_and_forecast_component(hist_df,ev_df,weather_df,15,'atv',use_rf_correction=False)
                         if not cust_f.empty and not atv_f.empty:
