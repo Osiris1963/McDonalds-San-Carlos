@@ -100,13 +100,10 @@ def load_from_firestore(db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
 
-# --- MODIFIED: Function now returns the cleaned data and the count of removed rows ---
 def remove_sales_outliers(df, threshold=200000):
-    """Removes rows where sales exceed a given threshold."""
     original_rows = len(df)
     cleaned_df = df[df['sales'] < threshold].copy()
     removed_rows = original_rows - len(cleaned_df)
-    # The function no longer calls st.sidebar.warning directly
     return cleaned_df, removed_rows
 
 def calculate_atv(df):
@@ -208,7 +205,31 @@ def train_and_forecast_component(historical_df,events_df,weather_df,periods,targ
     metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
     return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
 
-# --- Plotting Functions ---
+# --- Plotting Functions & Firestore Data I/O ---
+def add_to_firestore(db_client, collection_name, data):
+    if db_client is None: return
+    if 'date' in data and pd.notna(data['date']):
+        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
+    else: return
+    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
+        if col in data and data[col] is not None: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+    db_client.collection(collection_name).add(data)
+
+def update_in_firestore(db_client, collection_name, doc_id, data):
+    if db_client is None: return
+    if 'date' in data and pd.notna(data['date']):
+        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
+    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
+        if col in data and data[col] is not None:
+            data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+    db_client.collection(collection_name).document(doc_id).set(data)
+
+def delete_from_firestore(db_client, collection_name, doc_id):
+    if db_client is None: return
+    db_client.collection(collection_name).document(doc_id).delete()
+
+def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
+
 def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
     fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
@@ -243,18 +264,17 @@ if db:
                         
                         base_df = st.session_state.historical_df.copy()
                         
-                        # --- MODIFIED: The main UI now handles the warning message ---
-                        # 1. Remove outliers and get the count of removed rows
                         cleaned_df, removed_count = remove_sales_outliers(base_df, threshold=200000)
                         if removed_count > 0:
                             st.warning(f"Removed {removed_count} outlier day(s) to improve accuracy.")
 
-                        # 2. Continue processing with the cleaned dataframe
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
                         ev_df=st.session_state.events_df.copy()
                         cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'customers',use_rf_correction=True)
+                        
+                        # --- MODIFIED: Removed the extra 'floor' argument from this call ---
                         atv_f,atv_m,_,_=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'atv',use_rf_correction=False)
                         
                         if not cust_f.empty and not atv_f.empty:
