@@ -50,12 +50,10 @@ def apply_custom_styling():
 def init_firestore():
     try:
         if not firebase_admin._apps:
-            # Construct the credentials dictionary from Streamlit's secrets
             creds_dict = {
               "type": st.secrets.firebase_credentials.type,
               "project_id": st.secrets.firebase_credentials.project_id,
               "private_key_id": st.secrets.firebase_credentials.private_key_id,
-              # Replace escaped newlines in the private key
               "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
               "client_email": st.secrets.firebase_credentials.client_email,
               "client_id": st.secrets.firebase_credentials.client_id,
@@ -76,7 +74,7 @@ def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
-    defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': True, 'sales_cap': 1000000.0, 'customers_cap': 2500, 'atv_cap': 500.0, 'forecast_components': pd.DataFrame(), 'migration_done': False}
+    defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': True, 'forecast_components': pd.DataFrame(), 'migration_done': False}
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
@@ -85,25 +83,19 @@ def load_from_firestore(db_client, collection_name):
     if db_client is None: return pd.DataFrame()
     docs = db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
     if not records: return pd.DataFrame()
-    
     df = pd.DataFrame(records)
-    
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        # --- DEFINITIVE TIMEZONE FIX ---
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    
     existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
     for col in existing_numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(subset=existing_numeric_cols, inplace=True)
-    
     for col in existing_numeric_cols:
          df[col] = df[col].astype(float)
-    
     if not df.empty:
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
@@ -116,6 +108,7 @@ def add_to_firestore(db_client, collection_name, data):
     for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
         if col in data and data[col] is not None: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).add(data)
+
 def update_in_firestore(db_client, collection_name, doc_id, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
@@ -124,6 +117,7 @@ def update_in_firestore(db_client, collection_name, doc_id, data):
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).document(doc_id).set(data)
+
 def delete_from_firestore(db_client, collection_name, doc_id):
     if db_client is None: return
     db_client.collection(collection_name).document(doc_id).delete()
@@ -140,12 +134,14 @@ def get_weather_forecast(days=16):
         df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
         return df
     except requests.exceptions.RequestException:return None
+
 def map_weather_code(code):
     if code in[0,1]:return"Sunny"
     if code in[2,3]:return"Cloudy"
     if code in[51,53,55,61,63,65,80,81,82]:return"Rainy"
     if code in[95,96,99]:return"Storm"
     return"Cloudy"
+
 def generate_recurring_local_events(start_date,end_date):
     local_events=[];current_date=start_date
     while current_date<=end_date:
@@ -153,24 +149,17 @@ def generate_recurring_local_events(start_date,end_date):
         if current_date.month==7 and current_date.day==1:local_events.append({'holiday':'San Carlos Charter Day','ds':current_date,'lower_window':0,'upper_window':0})
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
+
 def calculate_atv(df):
     sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
-# --- NEW FUNCTION TO ENGINEER THE CONSECUTIVE TREND FEATURE ---
 def engineer_consecutive_trend_feature(df):
-    """
-    Engineers a feature to count consecutive week-over-week uptrends for a given day.
-    """
     df = df.sort_values('date').copy()
-    # Get the value from 7 days ago to compare the same weekdays
     df['sales_lag_7'] = df['sales'].shift(7)
-    # Determine the direction of the weekly trend
     df['weekly_trend_up'] = (df['sales'] > df['sales_lag_7']).astype(int)
-    
-    # Calculate the consecutive uptrend counter
     df['consecutive_uptrend'] = 0
     consecutive_count = 0
     for i in range(len(df)):
@@ -179,53 +168,68 @@ def engineer_consecutive_trend_feature(df):
         else:
             consecutive_count = 0
         df.loc[df.index[i], 'consecutive_uptrend'] = consecutive_count
-        
-    # Clean up helper columns
     df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
     return df
 
+# --- MODIFIED: This function now uses a linear trend model ---
 @st.cache_resource
 def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction,floor=0):
     df_train=historical_df.copy();df_train[target_col]=pd.to_numeric(df_train[target_col],errors='coerce');df_train.replace([np.inf,-np.inf],np.nan,inplace=True);df_train.dropna(subset=['date',target_col],inplace=True)
     if df_train.empty or len(df_train)<15:return pd.DataFrame(),{},pd.DataFrame(),pd.DataFrame()
-    cap = df_train[target_col].max() * 1.25
-    df_train['cap']=cap;df_train['floor']=floor;df_prophet=df_train.rename(columns={'date':'ds',target_col:'y'})[['ds','y','cap','floor']]
+    
+    # Removed the 'cap' and 'floor' logic for logistic growth
+    df_prophet=df_train.rename(columns={'date':'ds',target_col:'y'})[['ds','y']]
+    
     start_date=df_train['date'].min();end_date=df_train['date'].max()+timedelta(days=periods);recurring_events=generate_recurring_local_events(start_date,end_date);all_manual_events=pd.concat([events_df.rename(columns={'date':'ds','event_name':'holiday'}),recurring_events])
-    prophet_model=Prophet(growth='logistic',holidays=all_manual_events,daily_seasonality=True,weekly_seasonality=True,yearly_seasonality=True);prophet_model.add_country_holidays(country_name='PH');prophet_model.fit(df_prophet)
-    all_holidays_for_model=prophet_model.holidays;future=prophet_model.make_future_dataframe(periods=periods);future['cap']=cap;future['floor']=floor
+    
+    # Changed growth to 'linear'
+    prophet_model=Prophet(growth='linear',holidays=all_manual_events,daily_seasonality=True,weekly_seasonality=True,yearly_seasonality=True)
+    prophet_model.add_country_holidays(country_name='PH')
+    prophet_model.fit(df_prophet)
+    
+    all_holidays_for_model=prophet_model.holidays
+    future=prophet_model.make_future_dataframe(periods=periods)
+    
     if weather_df is not None:future_weather=pd.merge(future,weather_df,left_on='ds',right_on='date',how='left').ffill().bfill();df_rf=pd.merge(df_train,weather_df,on='date',how='left')
     else:future_weather=future.copy();[future_weather.update({col:np.nan})for col in['temp_max','precipitation','wind_speed','weather']];df_rf=df_train.copy()
-    forecast_in_sample=prophet_model.predict(df_prophet);df_rf['residuals']=df_prophet['y'].values-forecast_in_sample['yhat'].values
+    
+    forecast_in_sample=prophet_model.predict(df_prophet)
+    df_rf['residuals']=df_prophet['y'].values-forecast_in_sample['yhat'].values
     if'weather'not in df_rf.columns:df_rf['weather']='Cloudy'
     df_rf=pd.get_dummies(df_rf,columns=['weather'],drop_first=True,dummy_na=True)
     
-    # --- MODIFIED: Added 'consecutive_uptrend' to the list of features for the Random Forest model ---
     features=[col for col in df_rf.columns if col.startswith('weather_')or col in['add_on_sales','temp_max','precipitation','wind_speed','consecutive_uptrend']]
     
     for col in features:
         if col in df_rf.columns:df_rf[col]=pd.to_numeric(df_rf[col],errors='coerce')
     X=df_rf[features].fillna(df_rf[features].mean());y=df_rf['residuals']
+    
     if use_rf_correction:
         rf_model=RandomForestRegressor(n_estimators=100,random_state=42,min_samples_split=5);rf_model.fit(X,y);future_rf_data=pd.get_dummies(future_weather,columns=['weather'],dummy_na=True)
         for col in X.columns:
             if col not in future_rf_data.columns:future_rf_data[col]=0
         
-        # --- MODIFIED: Initialize new features for future predictions ---
         future_rf_data['add_on_sales']=0
         if 'consecutive_uptrend' in X.columns:
-             future_rf_data['consecutive_uptrend'] = 0 # Assume neutral trend for future dates
+             future_rf_data['consecutive_uptrend'] = 0 
         
         future_rf_data=future_rf_data[X.columns].fillna(df_rf[features].mean());future_residuals=rf_model.predict(future_rf_data);prophet_forecast=prophet_model.predict(future);prophet_forecast['yhat']+=future_residuals
     else:prophet_forecast=prophet_model.predict(future)
-    prophet_forecast['yhat']=np.clip(prophet_forecast['yhat'],floor,cap);forecast_components=prophet_forecast[['ds','trend','holidays','weekly','yearly','yhat']];metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
+    
+    # Removed the np.clip function that enforced the cap
+    forecast_components=prophet_forecast[['ds','trend','holidays','weekly','yearly','yhat']]
+    metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
     return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
+
 def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
     fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
+
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
     holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}";x_data=['Baseline Trend','Day of Week Effect','Seasonal Effect',holiday_text,'Final Forecast'];y_data=[day_data['trend'],day_data['weekly'],day_data['yearly'],day_data['holidays'],day_data['yhat']]
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=["absolute","relative","relative","relative","total"],x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=[y_data[0],y_data[1],y_data[2],y_data[3],y_data[4]],connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+
 def generate_insight_summary(day_data,selected_date):
     effects={'Day of the Week':day_data['weekly'],'Time of Year':day_data['yearly'],'Holidays/Events':day_data['holidays']};significant_effects={k:v for k,v in effects.items()if abs(v)>1}
     if not significant_effects:return f"For **{selected_date.strftime('%A,%B %d')}**,the forecast of **{day_data['yhat']:.0f} customers** is driven primarily by the baseline trend of **{day_data['trend']:.0f}**."
@@ -249,10 +253,9 @@ if db:
                     with st.spinner("🛰️ Fetching live weather..."):weather_df=get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         
-                        # --- MODIFIED: Apply new feature engineering before training ---
                         base_df = st.session_state.historical_df.copy()
                         hist_df = calculate_atv(base_df)
-                        hist_df = engineer_consecutive_trend_feature(hist_df) # New step
+                        hist_df = engineer_consecutive_trend_feature(hist_df) 
                         
                         ev_df=st.session_state.events_df.copy()
                         cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df,ev_df,weather_df,15,'customers',use_rf_correction=True)
