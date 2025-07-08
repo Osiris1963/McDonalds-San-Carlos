@@ -18,7 +18,7 @@ import json
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="McDonald's AI Forecaster",
+    page_title="McDonald's AI Sales Forecaster",
     page_icon="🍔",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -100,15 +100,14 @@ def load_from_firestore(db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
 
-# --- NEW: Function to remove unrealistic data points ---
+# --- MODIFIED: Function now returns the cleaned data and the count of removed rows ---
 def remove_sales_outliers(df, threshold=200000):
     """Removes rows where sales exceed a given threshold."""
     original_rows = len(df)
     cleaned_df = df[df['sales'] < threshold].copy()
     removed_rows = original_rows - len(cleaned_df)
-    if removed_rows > 0:
-        st.sidebar.warning(f"Removed {removed_rows} outlier day(s) with sales over ₱{threshold:,} to improve forecast accuracy.")
-    return cleaned_df
+    # The function no longer calls st.sidebar.warning directly
+    return cleaned_df, removed_rows
 
 def calculate_atv(df):
     sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
@@ -242,17 +241,19 @@ if db:
                     with st.spinner("🛰️ Fetching live weather..."):weather_df=get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         
-                        # --- MODIFIED: Full data cleaning and feature engineering pipeline ---
                         base_df = st.session_state.historical_df.copy()
-                        # 1. Remove outliers first
-                        cleaned_df = remove_sales_outliers(base_df)
-                        # 2. Calculate ATV on cleaned data
+                        
+                        # --- MODIFIED: The main UI now handles the warning message ---
+                        # 1. Remove outliers and get the count of removed rows
+                        cleaned_df, removed_count = remove_sales_outliers(base_df, threshold=200000)
+                        if removed_count > 0:
+                            st.warning(f"Removed {removed_count} outlier day(s) to improve accuracy.")
+
+                        # 2. Continue processing with the cleaned dataframe
                         hist_df_with_atv = calculate_atv(cleaned_df)
-                        # 3. Engineer features on cleaned data
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
                         ev_df=st.session_state.events_df.copy()
-                        # Use the final, cleaned dataframe for training
                         cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'customers',use_rf_correction=True)
                         atv_f,atv_m,_,_=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'atv',use_rf_correction=False)
                         
