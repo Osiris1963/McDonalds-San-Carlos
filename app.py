@@ -171,19 +171,26 @@ def engineer_consecutive_trend_feature(df):
     df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
     return df
 
-# --- MODIFIED: This function now uses a linear trend model ---
+# --- MODIFIED: This function now has refined Prophet parameters ---
 @st.cache_resource
 def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction,floor=0):
     df_train=historical_df.copy();df_train[target_col]=pd.to_numeric(df_train[target_col],errors='coerce');df_train.replace([np.inf,-np.inf],np.nan,inplace=True);df_train.dropna(subset=['date',target_col],inplace=True)
     if df_train.empty or len(df_train)<15:return pd.DataFrame(),{},pd.DataFrame(),pd.DataFrame()
     
-    # Removed the 'cap' and 'floor' logic for logistic growth
     df_prophet=df_train.rename(columns={'date':'ds',target_col:'y'})[['ds','y']]
     
     start_date=df_train['date'].min();end_date=df_train['date'].max()+timedelta(days=periods);recurring_events=generate_recurring_local_events(start_date,end_date);all_manual_events=pd.concat([events_df.rename(columns={'date':'ds','event_name':'holiday'}),recurring_events])
     
-    # Changed growth to 'linear'
-    prophet_model=Prophet(growth='linear',holidays=all_manual_events,daily_seasonality=True,weekly_seasonality=True,yearly_seasonality=True)
+    # --- MODIFIED: Added parameters to stabilize the trend ---
+    prophet_model=Prophet(
+        growth='linear',
+        holidays=all_manual_events,
+        daily_seasonality=True,
+        weekly_seasonality=True,
+        yearly_seasonality=True,
+        changepoint_prior_scale=0.01,  # Lowered from default 0.05 to make trend less flexible
+        changepoint_range=0.8          # Use first 80% of data for trend to avoid recent volatility
+    )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
@@ -216,7 +223,6 @@ def train_and_forecast_component(historical_df,events_df,weather_df,periods,targ
         future_rf_data=future_rf_data[X.columns].fillna(df_rf[features].mean());future_residuals=rf_model.predict(future_rf_data);prophet_forecast=prophet_model.predict(future);prophet_forecast['yhat']+=future_residuals
     else:prophet_forecast=prophet_model.predict(future)
     
-    # Removed the np.clip function that enforced the cap
     forecast_components=prophet_forecast[['ds','trend','holidays','weekly','yearly','yhat']]
     metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
     return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
