@@ -89,7 +89,7 @@ def load_from_firestore(db_client, collection_name):
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
+    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales'] if col in df.columns]
     for col in existing_numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -100,11 +100,19 @@ def load_from_firestore(db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
 
-def remove_sales_outliers(df, threshold=200000):
+# --- MODIFIED: New robust outlier removal function using IQR ---
+def remove_outliers_iqr(df, column='sales'):
+    """Identifies and removes outliers from a dataframe column using the IQR method."""
+    Q1 = df[column].quantile(0.25)
+    Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1
+    upper_bound = Q3 + 1.5 * IQR
+    
     original_rows = len(df)
-    cleaned_df = df[df['sales'] < threshold].copy()
+    cleaned_df = df[df[column] <= upper_bound].copy()
     removed_rows = original_rows - len(cleaned_df)
-    return cleaned_df, removed_rows
+    
+    return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
     sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
@@ -211,7 +219,7 @@ def add_to_firestore(db_client, collection_name, data):
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     else: return
-    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
+    for col in ['sales', 'customers', 'add_on_sales']:
         if col in data and data[col] is not None: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).add(data)
 
@@ -219,7 +227,7 @@ def update_in_firestore(db_client, collection_name, doc_id, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
+    for col in ['sales', 'customers', 'add_on_sales']:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).document(doc_id).set(data)
@@ -264,17 +272,16 @@ if db:
                         
                         base_df = st.session_state.historical_df.copy()
                         
-                        cleaned_df, removed_count = remove_sales_outliers(base_df, threshold=200000)
+                        # --- MODIFIED: Using the robust IQR outlier removal method ---
+                        cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
                         if removed_count > 0:
-                            st.warning(f"Removed {removed_count} outlier day(s) to improve accuracy.")
+                            st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f} to improve accuracy.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
                         ev_df=st.session_state.events_df.copy()
                         cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'customers',use_rf_correction=True)
-                        
-                        # --- MODIFIED: Removed the extra 'floor' argument from this call ---
                         atv_f,atv_m,_,_=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'atv',use_rf_correction=False)
                         
                         if not cust_f.empty and not atv_f.empty:
@@ -338,7 +345,7 @@ if db:
                             for index,row in edited_df.iterrows():
                                 if not row.equals(original_filtered_df.loc[index]):
                                     doc_id=row['id'];update_data=row.to_dict();del update_data['id']
-                                    update_in_firestore(db,'historical_data',doc_id,update_data) # Send corrected data
+                                    update_in_firestore(db,'historical_data',doc_id,update_data)
                             st.session_state.historical_df=load_from_firestore(db,'historical_data');st.toast(f"Changes for {selected_month_str} saved!");time.sleep(1);st.rerun()
                     else:st.write("No historical data to display.")
                 else:st.write("No historical data to display.")
