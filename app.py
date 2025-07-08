@@ -15,7 +15,7 @@ from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
-import xgboost as xgb # Import XGBoost
+import xgboost as xgb
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -90,13 +90,17 @@ def load_from_firestore(db_client, collection_name):
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales'] if col in df.columns]
+    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
     for col in existing_numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
+    # Fill NA for last_year features, as new data won't have it
+    if 'last_year_sales' in df.columns: df['last_year_sales'].fillna(0, inplace=True)
+    if 'last_year_customers' in df.columns: df['last_year_customers'].fillna(0, inplace=True)
+
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=existing_numeric_cols, inplace=True)
+    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True) # Ensure core columns are not null
     for col in existing_numeric_cols:
-         df[col] = df[col].astype(float)
+         if col in df.columns: df[col] = df[col].astype(float)
     if not df.empty:
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
@@ -130,6 +134,12 @@ def engineer_consecutive_trend_feature(df):
             consecutive_count = 0
         df.loc[df.index[i], 'consecutive_uptrend'] = consecutive_count
     df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
+    return df
+
+def engineer_last_year_features(df):
+    df = df.sort_values('date').copy()
+    df['last_year_sales'] = df['sales'].shift(364)
+    df['last_year_customers'] = df['customers'].shift(364)
     return df
 
 @st.cache_data(ttl=3600)
@@ -180,7 +190,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         holidays=all_manual_events,
         daily_seasonality=True,
         weekly_seasonality=True,
-        yearly_seasonality=False, # Disabled for short data, can be enabled with >1 year of data
+        yearly_seasonality=False,
         changepoint_prior_scale=0.01,
         changepoint_range=0.8
     )
@@ -201,7 +211,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
             df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
         
         df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
-        features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']]
+        features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend', 'last_year_sales', 'last_year_customers']]
         
         for col in features:
             if col not in df_rf.columns: df_rf[col] = 0
@@ -221,8 +231,14 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
             future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
         else:
             future_rf_data = future.copy()
-
+        
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
+
+        hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
+        hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
+        hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
+        future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
+        
         for col in X.columns:
             if col not in future_rf_data.columns: future_rf_data[col] = 0
         
@@ -230,7 +246,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         future_rf_data['consecutive_uptrend'] = 0
 
         # Predict residuals and add them to the base forecast
-        future_residuals = model.predict(future_rf_data[X.columns])
+        future_residuals = model.predict(future_rf_data[X.columns].fillna(0))
         prophet_forecast['yhat'] += future_residuals
 
     forecast_components = prophet_forecast[['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']]
@@ -238,23 +254,30 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
-
 # --- Plotting Functions & Firestore Data I/O ---
-# (These functions remain unchanged)
+# MODIFIED: This function now handles all required columns, including new ones
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     else: return
-    for col in ['sales', 'customers', 'add_on_sales']:
-        if col in data and data[col] is not None: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+    
+    # Define all possible numeric columns
+    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
+    for col in all_cols:
+        if col in data and data[col] is not None:
+            data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+        else:
+            # If a column is missing (like last_year_sales for a new record), add it as 0
+            data[col] = 0.0
+            
     db_client.collection(collection_name).add(data)
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    for col in ['sales', 'customers', 'add_on_sales']:
+    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).document(doc_id).set(data)
@@ -292,14 +315,13 @@ if db:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
             
-            # --- MODIFIED: Added model selector ---
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
                 help="Choose a model. Hybrid models use Prophet for the baseline and a second model to refine it."
             )
 
-            if len(st.session_state.historical_df) < 20: # Increased minimum for stability
+            if len(st.session_state.historical_df) < 20: 
                 st.warning("Provide at least 20 days of data for reliable forecasting.")
                 st.button("🔄 Generate Forecast", type="primary", use_container_width=True, disabled=True)
             else:
@@ -308,6 +330,7 @@ if db:
                         weather_df = get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         base_df = st.session_state.historical_df.copy()
+                        
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
                         
                         if removed_count > 0:
@@ -315,10 +338,11 @@ if db:
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
+                        # Last year features are disabled due to data constraints but can be re-enabled
+                        # hist_df_final = engineer_last_year_features(hist_df_with_trends)
                         
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- MODIFIED: Set corrector model based on user selection ---
                         corrector_choice = "None"
                         if model_option == "Prophet + Random Forest":
                             corrector_choice = "Random Forest"
@@ -326,7 +350,7 @@ if db:
                             corrector_choice = "XGBoost"
 
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
-                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None') # ATV forecast remains simple
+                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
@@ -349,7 +373,6 @@ if db:
 
         st.title("🍔 McDonald's AI Sales Forecaster");tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
         with tabs[0]:
-            # (UI code remains unchanged)
             if not st.session_state.forecast_df.empty:
                 st.header("15-Day Component Forecast");today=pd.to_datetime('today').normalize();future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
                 if future_forecast_df.empty:st.warning("Forecast contains no future dates.")
@@ -364,7 +387,6 @@ if db:
                     with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
             else:st.info("Click the 'Generate Component Forecast' button to begin.")
         with tabs[1]:
-            # (UI code remains unchanged)
             st.header("The 'Why' Engine: Understanding Your Forecast");
             if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
             else:
@@ -377,7 +399,6 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            # (UI code remains unchanged)
             st.header("Manage Your Data")
             with st.expander("➕ Add New Daily Record",expanded=True):
                 with st.form("new_record_form",clear_on_submit=True):
