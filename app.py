@@ -78,7 +78,7 @@ def initialize_state_firestore(db_client):
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
-# --- Firestore Data Operations ---
+# --- Data Processing and Feature Engineering ---
 def load_from_firestore(db_client, collection_name):
     if db_client is None: return pd.DataFrame()
     docs = db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
@@ -100,31 +100,37 @@ def load_from_firestore(db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
 
-def add_to_firestore(db_client, collection_name, data):
-    if db_client is None: return
-    if 'date' in data and pd.notna(data['date']):
-        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    else: return
-    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
-        if col in data and data[col] is not None: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
-    db_client.collection(collection_name).add(data)
+# --- NEW: Function to remove unrealistic data points ---
+def remove_sales_outliers(df, threshold=200000):
+    """Removes rows where sales exceed a given threshold."""
+    original_rows = len(df)
+    cleaned_df = df[df['sales'] < threshold].copy()
+    removed_rows = original_rows - len(cleaned_df)
+    if removed_rows > 0:
+        st.sidebar.warning(f"Removed {removed_rows} outlier day(s) with sales over ₱{threshold:,} to improve forecast accuracy.")
+    return cleaned_df
 
-def update_in_firestore(db_client, collection_name, doc_id, data):
-    if db_client is None: return
-    if 'date' in data and pd.notna(data['date']):
-        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
-        if col in data and data[col] is not None:
-            data[col] = float(pd.to_numeric(data[col], errors='coerce'))
-    db_client.collection(collection_name).document(doc_id).set(data)
+def calculate_atv(df):
+    sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
+    with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
+    df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
+    return df
 
-def delete_from_firestore(db_client, collection_name, doc_id):
-    if db_client is None: return
-    db_client.collection(collection_name).document(doc_id).delete()
+def engineer_consecutive_trend_feature(df):
+    df = df.sort_values('date').copy()
+    df['sales_lag_7'] = df['sales'].shift(7)
+    df['weekly_trend_up'] = (df['sales'] > df['sales_lag_7']).astype(int)
+    df['consecutive_uptrend'] = 0
+    consecutive_count = 0
+    for i in range(len(df)):
+        if df['weekly_trend_up'].iloc[i] == 1:
+            consecutive_count += 1
+        else:
+            consecutive_count = 0
+        df.loc[df.index[i], 'consecutive_uptrend'] = consecutive_count
+    df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
+    return df
 
-def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
-
-# --- Hyperlocal & Business Logic Features ---
 @st.cache_data(ttl=3600)
 def get_weather_forecast(days=16):
     try:
@@ -150,46 +156,22 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
-def calculate_atv(df):
-    sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
-    with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
-    df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
-    return df
-
-def engineer_consecutive_trend_feature(df):
-    df = df.sort_values('date').copy()
-    df['sales_lag_7'] = df['sales'].shift(7)
-    df['weekly_trend_up'] = (df['sales'] > df['sales_lag_7']).astype(int)
-    df['consecutive_uptrend'] = 0
-    consecutive_count = 0
-    for i in range(len(df)):
-        if df['weekly_trend_up'].iloc[i] == 1:
-            consecutive_count += 1
-        else:
-            consecutive_count = 0
-        df.loc[df.index[i], 'consecutive_uptrend'] = consecutive_count
-    df = df.drop(columns=['sales_lag_7', 'weekly_trend_up'])
-    return df
-
-# --- MODIFIED: This function now has refined Prophet parameters ---
+# --- Core Forecasting Model ---
 @st.cache_resource
-def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction,floor=0):
+def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction):
     df_train=historical_df.copy();df_train[target_col]=pd.to_numeric(df_train[target_col],errors='coerce');df_train.replace([np.inf,-np.inf],np.nan,inplace=True);df_train.dropna(subset=['date',target_col],inplace=True)
     if df_train.empty or len(df_train)<15:return pd.DataFrame(),{},pd.DataFrame(),pd.DataFrame()
-    
     df_prophet=df_train.rename(columns={'date':'ds',target_col:'y'})[['ds','y']]
-    
     start_date=df_train['date'].min();end_date=df_train['date'].max()+timedelta(days=periods);recurring_events=generate_recurring_local_events(start_date,end_date);all_manual_events=pd.concat([events_df.rename(columns={'date':'ds','event_name':'holiday'}),recurring_events])
     
-    # --- MODIFIED: Added parameters to stabilize the trend ---
     prophet_model=Prophet(
         growth='linear',
         holidays=all_manual_events,
         daily_seasonality=True,
         weekly_seasonality=True,
         yearly_seasonality=True,
-        changepoint_prior_scale=0.01,  # Lowered from default 0.05 to make trend less flexible
-        changepoint_range=0.8          # Use first 80% of data for trend to avoid recent volatility
+        changepoint_prior_scale=0.01,
+        changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -227,6 +209,7 @@ def train_and_forecast_component(historical_df,events_df,weather_df,periods,targ
     metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
     return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
 
+# --- Plotting Functions ---
 def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
     fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
@@ -252,20 +235,27 @@ if db:
     if st.session_state["authentication_status"]:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
-            st.info("The AI now dynamically analyzes your data to set realistic forecast ceilings.")
+            
             if len(st.session_state.historical_df)<15:st.warning("Provide at least 15 days of data.");st.button("🔄 Generate Component Forecast",type="primary",use_container_width=True,disabled=True)
             else:
                 if st.button("🔄 Generate Component Forecast",type="primary",use_container_width=True):
                     with st.spinner("🛰️ Fetching live weather..."):weather_df=get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         
+                        # --- MODIFIED: Full data cleaning and feature engineering pipeline ---
                         base_df = st.session_state.historical_df.copy()
-                        hist_df = calculate_atv(base_df)
-                        hist_df = engineer_consecutive_trend_feature(hist_df) 
+                        # 1. Remove outliers first
+                        cleaned_df = remove_sales_outliers(base_df)
+                        # 2. Calculate ATV on cleaned data
+                        hist_df_with_atv = calculate_atv(cleaned_df)
+                        # 3. Engineer features on cleaned data
+                        hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
                         ev_df=st.session_state.events_df.copy()
-                        cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df,ev_df,weather_df,15,'customers',use_rf_correction=True)
-                        atv_f,atv_m,_,_=train_and_forecast_component(hist_df,ev_df,weather_df,15,'atv',use_rf_correction=False)
+                        # Use the final, cleaned dataframe for training
+                        cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'customers',use_rf_correction=True)
+                        atv_f,atv_m,_,_=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'atv',use_rf_correction=False)
+                        
                         if not cust_f.empty and not atv_f.empty:
                             combo_f=pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}),atv_f.rename(columns={'yhat':'forecast_atv'}),on='ds');combo_f['forecast_sales']=combo_f['forecast_customers']*combo_f['forecast_atv']
                             if weather_df is not None:combo_f=pd.merge(combo_f,weather_df[['date','weather']],left_on='ds',right_on='date',how='left').drop(columns=['date'])
@@ -303,25 +293,6 @@ if db:
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
             st.header("Manage Your Data")
-            with st.container(border=True):
-                st.subheader("Database Migration Tool")
-                if st.session_state.get('migration_done',False)or not load_from_firestore(db,'historical_data').empty:st.success("Data source is now Firestore. CSV files are no longer used.")
-                else:
-                    st.warning("Action Required: Your data is still in CSV files. Migrate it to the new Firestore database.");
-                    if st.button("Migrate CSV Data to Firestore"):
-                        with st.spinner("Migrating data... This may take a moment."):
-                            try:
-                                for file_name, collection_name in [('sample_historical_data.csv', 'historical_data'), ('sample_future_events.csv', 'future_events')]:
-                                    df_csv = pd.read_csv(file_name)
-                                    df_csv['date'] = pd.to_datetime(df_csv['date'], errors='coerce')
-                                    df_csv.dropna(subset=['date'], inplace=True)
-                                    for _, row in df_csv.iterrows():
-                                        add_to_firestore(db, collection_name, row.to_dict())
-                                    st.write(f"✅ Migrated {collection_name} successfully.")
-                                st.session_state.migration_done = True;st.success("Migration complete!");st.rerun()
-                            except Exception as e:
-                                st.error(f"Migration Failed: {e}")
-            st.info("The model automatically incorporates PH National Holidays, paydays, and San Carlos Charter Day. Manage other events below.")
             with st.expander("➕ Add New Daily Record",expanded=True):
                 with st.form("new_record_form",clear_on_submit=True):
                     c1,c2,c3=st.columns(3);c4,c5=st.columns(2);
