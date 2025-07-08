@@ -45,18 +45,30 @@ def apply_custom_styling():
         .st-emotion-cache-1r4qj8v, .st-emotion-cache-1xw8zdv { color: #ffc72c; }
     </style>""", unsafe_allow_html=True)
 
-# --- Firestore Initialization ---
+# --- Firestore Initialization (Corrected) ---
 @st.cache_resource
 def init_firestore():
     try:
         if not firebase_admin._apps:
-            creds_json_str = st.secrets.firebase_credentials.key
-            creds_dict = json.loads(creds_json_str)
+            # Construct the credentials dictionary from Streamlit's secrets
+            creds_dict = {
+              "type": st.secrets.firebase_credentials.type,
+              "project_id": st.secrets.firebase_credentials.project_id,
+              "private_key_id": st.secrets.firebase_credentials.private_key_id,
+              # Replace escaped newlines in the private key
+              "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
+              "client_email": st.secrets.firebase_credentials.client_email,
+              "client_id": st.secrets.firebase_credentials.client_id,
+              "auth_uri": st.secrets.firebase_credentials.auth_uri,
+              "token_uri": st.secrets.firebase_credentials.token_uri,
+              "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
+              "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url
+            }
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
-        st.error(f"Firestore Connection Error: Failed to parse credentials. Please ensure your JSON key is correctly formatted in Streamlit Secrets. Error details: {e}")
+        st.error(f"Firestore Connection Error: Failed to initialize Firebase. Please check your Streamlit Secrets configuration. Error details: {e}")
         return None
 
 # --- App State Management ---
