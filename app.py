@@ -15,6 +15,7 @@ from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
+import xgboost as xgb # Import XGBoost
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -100,18 +101,14 @@ def load_from_firestore(db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
 
-# --- MODIFIED: New robust outlier removal function using IQR ---
 def remove_outliers_iqr(df, column='sales'):
-    """Identifies and removes outliers from a dataframe column using the IQR method."""
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
     upper_bound = Q3 + 1.5 * IQR
-    
     original_rows = len(df)
     cleaned_df = df[df[column] <= upper_bound].copy()
     removed_rows = original_rows - len(cleaned_df)
-    
     return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
@@ -162,58 +159,88 @@ def generate_recurring_local_events(start_date,end_date):
 
 # --- Core Forecasting Model ---
 @st.cache_resource
-def train_and_forecast_component(historical_df,events_df,weather_df,periods,target_col,use_rf_correction):
-    df_train=historical_df.copy();df_train[target_col]=pd.to_numeric(df_train[target_col],errors='coerce');df_train.replace([np.inf,-np.inf],np.nan,inplace=True);df_train.dropna(subset=['date',target_col],inplace=True)
-    if df_train.empty or len(df_train)<15:return pd.DataFrame(),{},pd.DataFrame(),pd.DataFrame()
-    df_prophet=df_train.rename(columns={'date':'ds',target_col:'y'})[['ds','y']]
-    start_date=df_train['date'].min();end_date=df_train['date'].max()+timedelta(days=periods);recurring_events=generate_recurring_local_events(start_date,end_date);all_manual_events=pd.concat([events_df.rename(columns={'date':'ds','event_name':'holiday'}),recurring_events])
+def train_and_forecast_component(historical_df, events_df, weather_df, periods, target_col, corrector_model='None'):
+    df_train = historical_df.copy()
+    df_train[target_col] = pd.to_numeric(df_train[target_col], errors='coerce')
+    df_train.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_train.dropna(subset=['date', target_col], inplace=True)
     
-    prophet_model=Prophet(
+    if df_train.empty or len(df_train) < 15:
+        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
+
+    df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
+    
+    start_date = df_train['date'].min()
+    end_date = df_train['date'].max() + timedelta(days=periods)
+    recurring_events = generate_recurring_local_events(start_date, end_date)
+    all_manual_events = pd.concat([events_df.rename(columns={'date':'ds', 'event_name':'holiday'}), recurring_events])
+    
+    prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
         daily_seasonality=True,
         weekly_seasonality=True,
-        yearly_seasonality=True,
+        yearly_seasonality=False, # Disabled for short data, can be enabled with >1 year of data
         changepoint_prior_scale=0.01,
         changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
-    all_holidays_for_model=prophet_model.holidays
-    future=prophet_model.make_future_dataframe(periods=periods)
-    
-    if weather_df is not None:future_weather=pd.merge(future,weather_df,left_on='ds',right_on='date',how='left').ffill().bfill();df_rf=pd.merge(df_train,weather_df,on='date',how='left')
-    else:future_weather=future.copy();[future_weather.update({col:np.nan})for col in['temp_max','precipitation','wind_speed','weather']];df_rf=df_train.copy()
-    
-    forecast_in_sample=prophet_model.predict(df_prophet)
-    df_rf['residuals']=df_prophet['y'].values-forecast_in_sample['yhat'].values
-    if'weather'not in df_rf.columns:df_rf['weather']='Cloudy'
-    df_rf=pd.get_dummies(df_rf,columns=['weather'],drop_first=True,dummy_na=True)
-    
-    features=[col for col in df_rf.columns if col.startswith('weather_')or col in['add_on_sales','temp_max','precipitation','wind_speed','consecutive_uptrend']]
-    
-    for col in features:
-        if col in df_rf.columns:df_rf[col]=pd.to_numeric(df_rf[col],errors='coerce')
-    X=df_rf[features].fillna(df_rf[features].mean());y=df_rf['residuals']
-    
-    if use_rf_correction:
-        rf_model=RandomForestRegressor(n_estimators=100,random_state=42,min_samples_split=5);rf_model.fit(X,y);future_rf_data=pd.get_dummies(future_weather,columns=['weather'],dummy_na=True)
+    future = prophet_model.make_future_dataframe(periods=periods)
+    prophet_forecast = prophet_model.predict(future)
+
+    # --- Residual Fitting Logic ---
+    if corrector_model != 'None':
+        # Prepare data for the corrector model
+        forecast_in_sample = prophet_model.predict(df_prophet)
+        df_rf = df_train.copy()
+        df_rf['residuals'] = df_prophet['y'].values - forecast_in_sample['yhat'].values
+
+        if weather_df is not None:
+            df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
+        
+        df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
+        features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']]
+        
+        for col in features:
+            if col not in df_rf.columns: df_rf[col] = 0
+        X = df_rf[features].fillna(df_rf[features].mean())
+        y = df_rf['residuals']
+        
+        # --- Initialize and train the chosen corrector model ---
+        if corrector_model == 'Random Forest':
+            model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
+        elif corrector_model == 'XGBoost':
+            model = xgb.XGBRegressor(n_estimators=100, random_state=42, objective='reg:squarederror')
+        
+        model.fit(X, y)
+
+        # Prepare future data for prediction
+        if weather_df is not None:
+            future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
+        else:
+            future_rf_data = future.copy()
+
+        future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
         for col in X.columns:
-            if col not in future_rf_data.columns:future_rf_data[col]=0
+            if col not in future_rf_data.columns: future_rf_data[col] = 0
         
-        future_rf_data['add_on_sales']=0
-        if 'consecutive_uptrend' in X.columns:
-             future_rf_data['consecutive_uptrend'] = 0 
-        
-        future_rf_data=future_rf_data[X.columns].fillna(df_rf[features].mean());future_residuals=rf_model.predict(future_rf_data);prophet_forecast=prophet_model.predict(future);prophet_forecast['yhat']+=future_residuals
-    else:prophet_forecast=prophet_model.predict(future)
+        future_rf_data['add_on_sales'] = 0
+        future_rf_data['consecutive_uptrend'] = 0
+
+        # Predict residuals and add them to the base forecast
+        future_residuals = model.predict(future_rf_data[X.columns])
+        prophet_forecast['yhat'] += future_residuals
+
+    forecast_components = prophet_forecast[['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']]
+    metrics = {'mae': mean_absolute_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']), 'rmse': np.sqrt(mean_squared_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']))}
     
-    forecast_components=prophet_forecast[['ds','trend','holidays','weekly','yearly','yhat']]
-    metrics={'mae':mean_absolute_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']),'rmse':np.sqrt(mean_squared_error(df_prophet['y'],prophet_forecast.loc[:len(df_prophet)-1,'yhat']))}
-    return prophet_forecast[['ds','yhat']],metrics,forecast_components,all_holidays_for_model
+    return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
+
 
 # --- Plotting Functions & Firestore Data I/O ---
+# (These functions remain unchanged)
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
@@ -255,6 +282,7 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
 
+
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -264,36 +292,64 @@ if db:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
             
-            if len(st.session_state.historical_df)<15:st.warning("Provide at least 15 days of data.");st.button("🔄 Generate Component Forecast",type="primary",use_container_width=True,disabled=True)
+            # --- MODIFIED: Added model selector ---
+            model_option = st.selectbox(
+                "Select a Forecast Model:",
+                ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
+                help="Choose a model. Hybrid models use Prophet for the baseline and a second model to refine it."
+            )
+
+            if len(st.session_state.historical_df) < 20: # Increased minimum for stability
+                st.warning("Provide at least 20 days of data for reliable forecasting.")
+                st.button("🔄 Generate Forecast", type="primary", use_container_width=True, disabled=True)
             else:
-                if st.button("🔄 Generate Component Forecast",type="primary",use_container_width=True):
-                    with st.spinner("🛰️ Fetching live weather..."):weather_df=get_weather_forecast()
+                if st.button("🔄 Generate Forecast", type="primary", use_container_width=True):
+                    with st.spinner("🛰️ Fetching live weather..."):
+                        weather_df = get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
-                        
                         base_df = st.session_state.historical_df.copy()
-                        
-                        # --- MODIFIED: Using the robust IQR outlier removal method ---
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
+                        
                         if removed_count > 0:
-                            st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f} to improve accuracy.")
+                            st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
-                        ev_df=st.session_state.events_df.copy()
-                        cust_f,cust_m,cust_c,all_h=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'customers',use_rf_correction=True)
-                        atv_f,atv_m,_,_=train_and_forecast_component(hist_df_final,ev_df,weather_df,15,'atv',use_rf_correction=False)
+                        ev_df = st.session_state.events_df.copy()
+                        
+                        # --- MODIFIED: Set corrector model based on user selection ---
+                        corrector_choice = "None"
+                        if model_option == "Prophet + Random Forest":
+                            corrector_choice = "Random Forest"
+                        elif model_option == "Prophet + XGBoost":
+                            corrector_choice = "XGBoost"
+
+                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
+                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None') # ATV forecast remains simple
                         
                         if not cust_f.empty and not atv_f.empty:
-                            combo_f=pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}),atv_f.rename(columns={'yhat':'forecast_atv'}),on='ds');combo_f['forecast_sales']=combo_f['forecast_customers']*combo_f['forecast_atv']
-                            if weather_df is not None:combo_f=pd.merge(combo_f,weather_df[['date','weather']],left_on='ds',right_on='date',how='left').drop(columns=['date'])
-                            else:combo_f['weather']='Not Available'
-                            st.session_state.forecast_df=combo_f;st.session_state.metrics={'customers':cust_m,'atv':atv_m};st.session_state.forecast_components=cust_c;st.session_state.all_holidays=all_h;st.success("Forecast generated!")
-                        else:st.error("Forecast generation failed.")
-            st.markdown("---");st.download_button("📥 Download Forecast",convert_df_to_csv(st.session_state.forecast_df),"forecast_data.csv","text/csv",use_container_width=True,disabled=st.session_state.forecast_df.empty);st.download_button("📥 Download Historical",convert_df_to_csv(st.session_state.historical_df),"historical_data.csv","text/csv",use_container_width=True)
-        
+                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
+                            combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                            if weather_df is not None:
+                                combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                            else:
+                                combo_f['weather'] = 'Not Available'
+                            st.session_state.forecast_df = combo_f
+                            st.session_state.metrics = {'customers': cust_m, 'atv': atv_m}
+                            st.session_state.forecast_components = cust_c
+                            st.session_state.all_holidays = all_h
+                            st.success(f"Forecast generated with {model_option}!")
+                        else:
+                            st.error("Forecast generation failed.")
+
+            st.markdown("---")
+            st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
+            st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
+
         st.title("🍔 McDonald's AI Sales Forecaster");tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
         with tabs[0]:
+            # (UI code remains unchanged)
             if not st.session_state.forecast_df.empty:
                 st.header("15-Day Component Forecast");today=pd.to_datetime('today').normalize();future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
                 if future_forecast_df.empty:st.warning("Forecast contains no future dates.")
@@ -308,6 +364,7 @@ if db:
                     with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
             else:st.info("Click the 'Generate Component Forecast' button to begin.")
         with tabs[1]:
+            # (UI code remains unchanged)
             st.header("The 'Why' Engine: Understanding Your Forecast");
             if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
             else:
@@ -320,6 +377,7 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
+            # (UI code remains unchanged)
             st.header("Manage Your Data")
             with st.expander("➕ Add New Daily Record",expanded=True):
                 with st.form("new_record_form",clear_on_submit=True):
