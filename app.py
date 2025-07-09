@@ -170,8 +170,6 @@ def generate_recurring_local_events(start_date,end_date):
 @st.cache_resource
 def train_and_forecast_component(historical_df, events_df, weather_df, periods, target_col, corrector_model='None'):
     df_train = historical_df.copy()
-    df_train[target_col] = pd.to_numeric(df_train[target_col], errors='coerce')
-    df_train.replace([np.inf, -np.inf], np.nan, inplace=True)
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty or len(df_train) < 15:
@@ -184,12 +182,14 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     recurring_events = generate_recurring_local_events(start_date, end_date)
     all_manual_events = pd.concat([events_df.rename(columns={'date':'ds', 'event_name':'holiday'}), recurring_events])
     
+    use_yearly_seasonality = len(df_train) >= 365
+
     prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
-        daily_seasonality=True,
+        daily_seasonality=False, # Daily seasonality is not applicable for daily data
         weekly_seasonality=True,
-        yearly_seasonality=False, 
+        yearly_seasonality=use_yearly_seasonality, 
         changepoint_prior_scale=0.01,
         changepoint_range=0.8
     )
@@ -229,6 +229,12 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
             future_rf_data = future.copy()
         
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
+        
+        if use_last_year_features:
+            hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
+            hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
+            hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
+            future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
         
         for col in X.columns:
             if col not in future_rf_data.columns: future_rf_data[col] = 0.0
@@ -317,31 +323,44 @@ if db:
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
-                help="Choose a model. Hybrid models use Prophet for the baseline and a second model to refine it."
+                help="Hybrid models require at least one year of data to be effective."
             )
 
-            if len(st.session_state.historical_df) < 20: 
-                st.warning("Provide at least 20 days of data for reliable forecasting.")
-                st.button("🔄 Generate Forecast", type="primary", use_container_width=True, disabled=True)
-            else:
-                if st.button("🔄 Generate Forecast", type="primary", use_container_width=True):
+            if st.button("🔄 Generate Forecast", type="primary", use_container_width=True):
+                if len(st.session_state.historical_df) < 20: 
+                    st.error("Please provide at least 20 days of data for reliable forecasting.")
+                else:
                     with st.spinner("🛰️ Fetching live weather..."):
                         weather_df = get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         base_df = st.session_state.historical_df.copy()
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
+                        
                         if removed_count > 0:
                             st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
+
                         hist_df_with_atv = calculate_atv(cleaned_df)
-                        hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
+                        hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
+                        
+                        # --- MODIFIED: Safety check for year-over-year features ---
+                        use_last_year_features = len(hist_with_trends) >= 365
+                        if use_last_year_features:
+                            hist_df_final = engineer_last_year_features(hist_with_trends)
+                        else:
+                            hist_df_final = hist_with_trends
+                        
                         ev_df = st.session_state.events_df.copy()
+                        
                         corrector_choice = "None"
-                        if model_option == "Prophet + Random Forest":
-                            corrector_choice = "Random Forest"
-                        elif model_option == "Prophet + XGBoost":
-                            corrector_choice = "XGBoost"
+                        if model_option != "Prophet Only":
+                            if not use_last_year_features:
+                                st.warning(f"'{model_option}' requires 1 year of data. Using 'Prophet Only'.")
+                            else:
+                                corrector_choice = model_option.split(" + ")[1]
+                        
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
+                        
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -390,10 +409,8 @@ if db:
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
             st.header("Manage Your Data")
-            # --- RESTORED: Database Migration Tool ---
             with st.container(border=True):
                 st.subheader("Database Migration Tool")
-                # Check if data already exists to prevent duplicate migration
                 if not load_from_firestore(db,'historical_data').empty:
                     st.success("✅ Data source is now Firestore. CSV files are no longer used for forecasting.")
                 else:
@@ -403,13 +420,11 @@ if db:
                             try:
                                 for file_name, collection_name in [('sample_historical_data.csv', 'historical_data'), ('sample_future_events.csv', 'future_events')]:
                                     df_csv = pd.read_csv(file_name)
-                                    # Ensure date columns are in the correct format
                                     if 'date' in df_csv.columns:
                                         df_csv['date'] = pd.to_datetime(df_csv['date'])
                                     for _, row in df_csv.iterrows():
                                         add_to_firestore(db, collection_name, row.to_dict())
                                     st.write(f"✅ Migrated {collection_name} successfully.")
-                                # Refresh data from Firestore and rerun the app
                                 st.session_state.historical_df = load_from_firestore(db, 'historical_data')
                                 st.session_state.events_df = load_from_firestore(db, 'future_events')
                                 st.success("Migration complete! The app will now use Firestore.")
@@ -437,8 +452,6 @@ if db:
                     month_periods=df['date'].dt.to_period('M').unique();month_options=sorted([p.strftime('%B %Y')for p in month_periods],reverse=True)
                     if month_options:
                         selected_month_str=st.selectbox("Select Month",options=month_options);selected_period=pd.Period(selected_month_str);filtered_df=df[df['date'].dt.to_period('M')==selected_period].copy().reset_index(drop=True)
-                        # The data editor is now disabled by default to prevent accidental changes to Firestore data
-                        # To enable editing, you would use st.data_editor here.
                         st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                     else:st.write("No historical data to display.")
                 else:st.write("No historical data to display.")
