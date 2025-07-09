@@ -212,8 +212,8 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend', 'last_year_sales', 'last_year_customers']]
         
         for col in features:
-            if col not in df_rf.columns: df_rf[col] = 0
-        X = df_rf[features].fillna(df_rf[features].mean())
+            if col not in df_rf.columns: df_rf[col] = 0.0 # Use float for consistency
+        X = df_rf[features].fillna(0) # Use a simple fillna(0)
         y = df_rf['residuals']
         
         if corrector_model == 'Random Forest':
@@ -231,15 +231,13 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
         
         for col in X.columns:
-            if col not in future_rf_data.columns: future_rf_data[col] = 0
+            if col not in future_rf_data.columns: future_rf_data[col] = 0.0
         
-        future_rf_data['add_on_sales'] = 0
-        future_rf_data['consecutive_uptrend'] = 0
+        future_rf_data.fillna(0, inplace=True) # Fill any potential NaNs in future data
 
-        future_residuals = model.predict(future_rf_data[X.columns].fillna(0))
+        future_residuals = model.predict(future_rf_data[X.columns])
         prophet_forecast['yhat'] += future_residuals
     
-    # --- MODIFIED: Dynamically get component columns that exist ---
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
     existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
     forecast_components = prophet_forecast[existing_cols]
@@ -248,18 +246,21 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
-# --- Plotting Functions & Firestore Data I/O ---
+# --- MODIFIED AND RESTORED: Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     else: return
+    
+    # Ensure all numeric fields are correctly formatted as python floats
     all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
     for col in all_cols:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            data[col] = 0.0
+            data[col] = 0.0 # Ensure missing fields are added as 0.0
+            
     db_client.collection(collection_name).add(data)
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
@@ -327,7 +328,6 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
-
 
 # --- Main Application UI ---
 apply_custom_styling()
