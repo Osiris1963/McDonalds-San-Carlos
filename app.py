@@ -229,13 +229,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
             future_rf_data = future.copy()
         
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
-
-        # This logic for future year-over-year data is disabled due to short history
-        # but is kept here for when more data is available.
-        # hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
-        # hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
-        # hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
-        # future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
         
         for col in X.columns:
             if col not in future_rf_data.columns: future_rf_data[col] = 0
@@ -245,13 +238,17 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
 
         future_residuals = model.predict(future_rf_data[X.columns].fillna(0))
         prophet_forecast['yhat'] += future_residuals
+    
+    # --- MODIFIED: Dynamically get component columns that exist ---
+    potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
+    existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
+    forecast_components = prophet_forecast[existing_cols]
 
-    forecast_components = prophet_forecast[['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']]
     metrics = {'mae': mean_absolute_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']), 'rmse': np.sqrt(mean_squared_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']))}
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
-# --- RESTORED: Plotting Functions & Firestore Data I/O ---
+# --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
@@ -286,16 +283,51 @@ def plot_full_comparison_chart(hist,fcst,metrics,target):
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
-    holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}";x_data=['Baseline Trend','Day of Week Effect','Seasonal Effect',holiday_text,'Final Forecast'];y_data=[day_data['trend'],day_data['weekly'],day_data['yearly'],day_data['holidays'],day_data['yhat']]
-    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=["absolute","relative","relative","relative","total"],x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=[y_data[0],y_data[1],y_data[2],y_data[3],y_data[4]],connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+    
+    x_data = ['Baseline Trend']
+    y_data = [day_data['trend']]
+    measure_data = ["absolute"]
+
+    if 'weekly' in day_data and pd.notna(day_data['weekly']):
+        x_data.append('Day of Week Effect')
+        y_data.append(day_data['weekly'])
+        measure_data.append('relative')
+    if 'daily' in day_data and pd.notna(day_data['daily']):
+        x_data.append('Time of Day Effect')
+        y_data.append(day_data['daily'])
+        measure_data.append('relative')
+    if 'yearly' in day_data and pd.notna(day_data['yearly']):
+        x_data.append('Time of Year Effect')
+        y_data.append(day_data['yearly'])
+        measure_data.append('relative')
+    if 'holidays' in day_data and pd.notna(day_data['holidays']):
+        holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
+        x_data.append(holiday_text)
+        y_data.append(day_data['holidays'])
+        measure_data.append('relative')
+
+    x_data.append('Final Forecast')
+    y_data.append(day_data['yhat'])
+    measure_data.append('total')
+
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
-    effects={'Day of the Week':day_data['weekly'],'Time of Year':day_data['yearly'],'Holidays/Events':day_data['holidays']};significant_effects={k:v for k,v in effects.items()if abs(v)>1}
-    if not significant_effects:return f"For **{selected_date.strftime('%A,%B %d')}**,the forecast of **{day_data['yhat']:.0f} customers** is driven primarily by the baseline trend of **{day_data['trend']:.0f}**."
-    pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0};summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data['trend']:.0f} customers**.\n\n"
+    effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
+    significant_effects={k:v for k,v in effects.items()if abs(v)>1}
+    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
+    if not significant_effects:
+        summary += f"The final forecast of **{day_data['yhat']:.0f} customers** is driven primarily by this trend."
+        return summary
+    
+    pos_drivers={k:v for k,v in significant_effects.items()if v>0}
+    neg_drivers={k:v for k,v in significant_effects.items()if v<0}
+    
     if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
+    
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
+
 
 # --- Main Application UI ---
 apply_custom_styling()
