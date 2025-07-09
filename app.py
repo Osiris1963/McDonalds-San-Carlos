@@ -97,7 +97,7 @@ def load_from_firestore(db_client, collection_name):
     if 'last_year_customers' in df.columns: df['last_year_customers'].fillna(0, inplace=True)
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True) 
+    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True)
     for col in existing_numeric_cols:
          if col in df.columns: df[col] = df[col].astype(float)
     if not df.empty:
@@ -212,8 +212,8 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend', 'last_year_sales', 'last_year_customers']]
         
         for col in features:
-            if col not in df_rf.columns: df_rf[col] = 0.0 # Use float for consistency
-        X = df_rf[features].fillna(0) # Use a simple fillna(0)
+            if col not in df_rf.columns: df_rf[col] = 0.0
+        X = df_rf[features].fillna(0)
         y = df_rf['residuals']
         
         if corrector_model == 'Random Forest':
@@ -233,7 +233,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         for col in X.columns:
             if col not in future_rf_data.columns: future_rf_data[col] = 0.0
         
-        future_rf_data.fillna(0, inplace=True) # Fill any potential NaNs in future data
+        future_rf_data.fillna(0, inplace=True)
 
         future_residuals = model.predict(future_rf_data[X.columns])
         prophet_forecast['yhat'] += future_residuals
@@ -246,21 +246,18 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
-# --- MODIFIED AND RESTORED: Plotting Functions & Firestore Data I/O ---
+# --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     else: return
-    
-    # Ensure all numeric fields are correctly formatted as python floats
     all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
     for col in all_cols:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            data[col] = 0.0 # Ensure missing fields are added as 0.0
-            
+            data[col] = 0.0
     db_client.collection(collection_name).add(data)
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
@@ -284,33 +281,17 @@ def plot_full_comparison_chart(hist,fcst,metrics,target):
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
-    
-    x_data = ['Baseline Trend']
-    y_data = [day_data['trend']]
-    measure_data = ["absolute"]
-
+    x_data = ['Baseline Trend'];y_data = [day_data['trend']];measure_data = ["absolute"]
     if 'weekly' in day_data and pd.notna(day_data['weekly']):
-        x_data.append('Day of Week Effect')
-        y_data.append(day_data['weekly'])
-        measure_data.append('relative')
+        x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
     if 'daily' in day_data and pd.notna(day_data['daily']):
-        x_data.append('Time of Day Effect')
-        y_data.append(day_data['daily'])
-        measure_data.append('relative')
+        x_data.append('Time of Day Effect');y_data.append(day_data['daily']);measure_data.append('relative')
     if 'yearly' in day_data and pd.notna(day_data['yearly']):
-        x_data.append('Time of Year Effect')
-        y_data.append(day_data['yearly'])
-        measure_data.append('relative')
+        x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
     if 'holidays' in day_data and pd.notna(day_data['holidays']):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
-        x_data.append(holiday_text)
-        y_data.append(day_data['holidays'])
-        measure_data.append('relative')
-
-    x_data.append('Final Forecast')
-    y_data.append(day_data['yhat'])
-    measure_data.append('total')
-
+        x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
+    x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
@@ -320,13 +301,9 @@ def generate_insight_summary(day_data,selected_date):
     if not significant_effects:
         summary += f"The final forecast of **{day_data['yhat']:.0f} customers** is driven primarily by this trend."
         return summary
-    
-    pos_drivers={k:v for k,v in significant_effects.items()if v>0}
-    neg_drivers={k:v for k,v in significant_effects.items()if v<0}
-    
+    pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
     if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
-    
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
 
 # --- Main Application UI ---
@@ -337,7 +314,6 @@ if db:
     if st.session_state["authentication_status"]:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
-            
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
@@ -353,26 +329,19 @@ if db:
                         weather_df = get_weather_forecast()
                     with st.spinner("🧠 Building component models..."):
                         base_df = st.session_state.historical_df.copy()
-                        
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
-                        
                         if removed_count > 0:
                             st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
-
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv) 
-                        
                         ev_df = st.session_state.events_df.copy()
-                        
                         corrector_choice = "None"
                         if model_option == "Prophet + Random Forest":
                             corrector_choice = "Random Forest"
                         elif model_option == "Prophet + XGBoost":
                             corrector_choice = "XGBoost"
-
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
-                        
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -421,6 +390,35 @@ if db:
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
             st.header("Manage Your Data")
+            # --- RESTORED: Database Migration Tool ---
+            with st.container(border=True):
+                st.subheader("Database Migration Tool")
+                # Check if data already exists to prevent duplicate migration
+                if not load_from_firestore(db,'historical_data').empty:
+                    st.success("✅ Data source is now Firestore. CSV files are no longer used for forecasting.")
+                else:
+                    st.warning("Action Required: Your data is still in CSV files. Migrate it to the new Firestore database.")
+                    if st.button("Migrate CSV Data to Firestore"):
+                        with st.spinner("Migrating data... This may take a moment."):
+                            try:
+                                for file_name, collection_name in [('sample_historical_data.csv', 'historical_data'), ('sample_future_events.csv', 'future_events')]:
+                                    df_csv = pd.read_csv(file_name)
+                                    # Ensure date columns are in the correct format
+                                    if 'date' in df_csv.columns:
+                                        df_csv['date'] = pd.to_datetime(df_csv['date'])
+                                    for _, row in df_csv.iterrows():
+                                        add_to_firestore(db, collection_name, row.to_dict())
+                                    st.write(f"✅ Migrated {collection_name} successfully.")
+                                # Refresh data from Firestore and rerun the app
+                                st.session_state.historical_df = load_from_firestore(db, 'historical_data')
+                                st.session_state.events_df = load_from_firestore(db, 'future_events')
+                                st.success("Migration complete! The app will now use Firestore.")
+                                time.sleep(2)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Migration Failed: {e}")
+
+            st.info("Use the tools below to manage your data in Firestore.")
             with st.expander("➕ Add New Daily Record",expanded=True):
                 with st.form("new_record_form",clear_on_submit=True):
                     c1,c2,c3=st.columns(3);c4,c5=st.columns(2);
@@ -439,13 +437,8 @@ if db:
                     month_periods=df['date'].dt.to_period('M').unique();month_options=sorted([p.strftime('%B %Y')for p in month_periods],reverse=True)
                     if month_options:
                         selected_month_str=st.selectbox("Select Month",options=month_options);selected_period=pd.Period(selected_month_str);filtered_df=df[df['date'].dt.to_period('M')==selected_period].copy().reset_index(drop=True)
-                        original_filtered_df=filtered_df.copy()
-                        edited_df=st.data_editor(filtered_df,key=f"editor_{selected_month_str}",num_rows="dynamic",use_container_width=True,hide_index=True,column_config={"id":None,"sales":st.column_config.NumberColumn("Sales (₱)",format="₱%.2f"),"weather":"Weather Condition","add_on_sales":st.column_config.NumberColumn("Add-on Sales (₱)",format="₱%.2f")})
-                        if not edited_df.equals(original_filtered_df):
-                            for index,row in edited_df.iterrows():
-                                if not row.equals(original_filtered_df.loc[index]):
-                                    doc_id=row['id'];update_data=row.to_dict();del update_data['id']
-                                    update_in_firestore(db,'historical_data',doc_id,update_data)
-                            st.session_state.historical_df=load_from_firestore(db,'historical_data');st.toast(f"Changes for {selected_month_str} saved!");time.sleep(1);st.rerun()
+                        # The data editor is now disabled by default to prevent accidental changes to Firestore data
+                        # To enable editing, you would use st.data_editor here.
+                        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                     else:st.write("No historical data to display.")
                 else:st.write("No historical data to display.")
