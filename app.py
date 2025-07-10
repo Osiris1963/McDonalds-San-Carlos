@@ -290,7 +290,6 @@ def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
     fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
-# --- MODIFIED: Visualization functions now safely access components ---
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
@@ -355,8 +354,9 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
+                        # MODIFIED: Logic to handle feature engineering based on data length
                         if len(hist_with_trends) >= 365:
-                            st.sidebar.info("Year-over-year data is being used to improve the forecast.")
+                            st.sidebar.info("Year-over-year data is active.")
                             hist_df_final = engineer_last_year_features(hist_with_trends)
                         else:
                             hist_df_final = hist_with_trends
@@ -364,8 +364,10 @@ if db:
                         ev_df = st.session_state.events_df.copy()
                         
                         corrector_choice = "None"
-                        if model_option != "Prophet Only":
-                            corrector_choice = model_option.split(" + ")[1]
+                        if model_option == "Prophet + Random Forest":
+                            corrector_choice = "Random Forest"
+                        elif model_option == "Prophet + XGBoost":
+                            corrector_choice = "XGBoost"
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
