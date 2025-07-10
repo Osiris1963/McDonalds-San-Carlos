@@ -73,16 +73,21 @@ def init_firestore():
 # --- App State Management ---
 def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
+    # These will now use the cached function
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
+    
     defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': True, 'forecast_components': pd.DataFrame(), 'migration_done': False}
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
-def load_from_firestore(db_client, collection_name):
-    if db_client is None: return pd.DataFrame()
-    docs = db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
+# MODIFIED: Added caching to greatly reduce database reads
+@st.cache_data(ttl="6h")
+def load_from_firestore(_db_client, collection_name):
+    """This function now caches its results for 6 hours."""
+    if _db_client is None: return pd.DataFrame()
+    docs = _db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
     if not records: return pd.DataFrame()
     df = pd.DataFrame(records)
     if 'date' in df.columns:
@@ -187,7 +192,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
-        daily_seasonality=False, # Daily seasonality is not applicable for daily data
+        daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
         changepoint_prior_scale=0.01,
@@ -230,7 +235,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
         
-        if use_last_year_features:
+        if use_yearly_seasonality:
             hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
             hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
             hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
@@ -326,7 +331,14 @@ if db:
                 help="Hybrid models require at least one year of data to be effective."
             )
 
-            if st.button("🔄 Generate Forecast", type="primary", use_container_width=True):
+            # Add a manual refresh button
+            if st.button("🔄 Refresh Data from Firestore"):
+                st.cache_data.clear()
+                st.success("Data cache cleared. Rerunning to get latest data.")
+                time.sleep(1)
+                st.rerun()
+
+            if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
                 if len(st.session_state.historical_df) < 20: 
                     st.error("Please provide at least 20 days of data for reliable forecasting.")
                 else:
@@ -342,7 +354,6 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
-                        # --- MODIFIED: Safety check for year-over-year features ---
                         use_last_year_features = len(hist_with_trends) >= 365
                         if use_last_year_features:
                             hist_df_final = engineer_last_year_features(hist_with_trends)
@@ -354,12 +365,12 @@ if db:
                         corrector_choice = "None"
                         if model_option != "Prophet Only":
                             if not use_last_year_features:
-                                st.warning(f"'{model_option}' requires 1 year of data. Using 'Prophet Only'.")
+                                st.warning(f"'{model_option}' requires 1 year of data. Defaulting to 'Prophet Only'.")
                             else:
                                 corrector_choice = model_option.split(" + ")[1]
                         
-                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
-                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
+                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(db, hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
+                        atv_f, atv_m, _, _ = train_and_forecast_component(db, hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
@@ -425,8 +436,7 @@ if db:
                                     for _, row in df_csv.iterrows():
                                         add_to_firestore(db, collection_name, row.to_dict())
                                     st.write(f"✅ Migrated {collection_name} successfully.")
-                                st.session_state.historical_df = load_from_firestore(db, 'historical_data')
-                                st.session_state.events_df = load_from_firestore(db, 'future_events')
+                                st.cache_data.clear()
                                 st.success("Migration complete! The app will now use Firestore.")
                                 time.sleep(2)
                                 st.rerun()
@@ -444,7 +454,11 @@ if db:
                     with c5:new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                     if st.form_submit_button("💾 Save Record"):
                         new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
-                        add_to_firestore(db,'historical_data',new_rec);st.session_state.historical_df=load_from_firestore(db,'historical_data');st.success("Record added to Firestore!");st.rerun()
+                        add_to_firestore(db,'historical_data',new_rec)
+                        st.cache_data.clear()
+                        st.success("Record added to Firestore!");
+                        time.sleep(1)
+                        st.rerun()
             with st.expander("📝 Manage Historical Data by Month"):
                 df=st.session_state.historical_df.copy()
                 if not df.empty and'date'in df.columns:
