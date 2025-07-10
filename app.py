@@ -210,7 +210,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
         
-        # Define the features to use
         base_features = ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']
         if use_yearly_seasonality:
             base_features.extend(['last_year_sales', 'last_year_customers'])
@@ -259,7 +258,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
 # --- Plotting Functions & Firestore Data I/O ---
-# (These functions remain unchanged and are included for completeness)
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
@@ -292,9 +290,10 @@ def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
     fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
+# --- MODIFIED: Visualization functions now safely access components ---
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
-    x_data = ['Baseline Trend'];y_data = [day_data['trend']];measure_data = ["absolute"]
+    x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
     if 'weekly' in day_data and pd.notna(day_data['weekly']):
         x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
     if 'daily' in day_data and pd.notna(day_data['daily']):
@@ -312,12 +311,12 @@ def generate_insight_summary(day_data,selected_date):
     significant_effects={k:v for k,v in effects.items()if abs(v)>1}
     summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
     if not significant_effects:
-        summary += f"The final forecast of **{day_data['yhat']:.0f} customers** is driven primarily by this trend."
+        summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."
         return summary
     pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
     if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
-    summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
+    summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
 
 # --- Main Application UI ---
@@ -328,7 +327,6 @@ if db:
     if st.session_state["authentication_status"]:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
-            
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
@@ -357,7 +355,6 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
-                        # --- MODIFIED: Flexible feature engineering ---
                         if len(hist_with_trends) >= 365:
                             st.sidebar.info("Year-over-year data is being used to improve the forecast.")
                             hist_df_final = engineer_last_year_features(hist_with_trends)
@@ -367,10 +364,8 @@ if db:
                         ev_df = st.session_state.events_df.copy()
                         
                         corrector_choice = "None"
-                        if model_option == "Prophet + Random Forest":
-                            corrector_choice = "Random Forest"
-                        elif model_option == "Prophet + XGBoost":
-                            corrector_choice = "XGBoost"
+                        if model_option != "Prophet Only":
+                            corrector_choice = model_option.split(" + ")[1]
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
