@@ -73,19 +73,15 @@ def init_firestore():
 # --- App State Management ---
 def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
-    # These will now use the cached function
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
-    
     defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': True, 'forecast_components': pd.DataFrame(), 'migration_done': False}
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
-# MODIFIED: Added caching to greatly reduce database reads
 @st.cache_data(ttl="6h")
 def load_from_firestore(_db_client, collection_name):
-    """This function now caches its results for 6 hours."""
     if _db_client is None: return pd.DataFrame()
     docs = _db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
     if not records: return pd.DataFrame()
@@ -328,10 +324,9 @@ if db:
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
-                help="Hybrid models require at least one year of data to be effective."
+                help="Hybrid models are more accurate with at least one year of data."
             )
 
-            # Add a manual refresh button
             if st.button("🔄 Refresh Data from Firestore"):
                 st.cache_data.clear()
                 st.success("Data cache cleared. Rerunning to get latest data.")
@@ -352,25 +347,19 @@ if db:
                             st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
-                        hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
-                        
-                        use_last_year_features = len(hist_with_trends) >= 365
-                        if use_last_year_features:
-                            hist_df_final = engineer_last_year_features(hist_with_trends)
-                        else:
-                            hist_df_final = hist_with_trends
+                        hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv)
                         
                         ev_df = st.session_state.events_df.copy()
                         
                         corrector_choice = "None"
-                        if model_option != "Prophet Only":
-                            if not use_last_year_features:
-                                st.warning(f"'{model_option}' requires 1 year of data. Defaulting to 'Prophet Only'.")
-                            else:
-                                corrector_choice = model_option.split(" + ")[1]
-                        
-                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(db, hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
-                        atv_f, atv_m, _, _ = train_and_forecast_component(db, hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
+                        if model_option == "Prophet + Random Forest":
+                            corrector_choice = "Random Forest"
+                        elif model_option == "Prophet + XGBoost":
+                            corrector_choice = "XGBoost"
+
+                        # --- MODIFIED: The incorrect 'db' argument has been removed ---
+                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
+                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
