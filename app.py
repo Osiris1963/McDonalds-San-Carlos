@@ -96,7 +96,6 @@ def load_from_firestore(_db_client, collection_name):
         df[col] = pd.to_numeric(df[col], errors='coerce')
     if 'last_year_sales' in df.columns: df['last_year_sales'].fillna(0, inplace=True)
     if 'last_year_customers' in df.columns: df['last_year_customers'].fillna(0, inplace=True)
-
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True)
     for col in existing_numeric_cols:
@@ -210,7 +209,13 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
             df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
         
         df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
-        features = [col for col in df_rf.columns if col.startswith('weather_') or col in ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend', 'last_year_sales', 'last_year_customers']]
+        
+        # Define the features to use
+        base_features = ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']
+        if use_yearly_seasonality:
+            base_features.extend(['last_year_sales', 'last_year_customers'])
+        
+        features = [col for col in df_rf.columns if col.startswith('weather_') or col in base_features]
         
         for col in features:
             if col not in df_rf.columns: df_rf[col] = 0.0
@@ -254,6 +259,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
 # --- Plotting Functions & Firestore Data I/O ---
+# (These functions remain unchanged and are included for completeness)
 def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
@@ -313,6 +319,7 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data['yhat']:.0f} customers**.";return summary
 
+
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -321,6 +328,7 @@ if db:
     if st.session_state["authentication_status"]:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
+            
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
@@ -347,7 +355,14 @@ if db:
                             st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
-                        hist_df_final = engineer_consecutive_trend_feature(hist_df_with_atv)
+                        hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
+                        
+                        # --- MODIFIED: Flexible feature engineering ---
+                        if len(hist_with_trends) >= 365:
+                            st.sidebar.info("Year-over-year data is being used to improve the forecast.")
+                            hist_df_final = engineer_last_year_features(hist_with_trends)
+                        else:
+                            hist_df_final = hist_with_trends
                         
                         ev_df = st.session_state.events_df.copy()
                         
@@ -356,8 +371,7 @@ if db:
                             corrector_choice = "Random Forest"
                         elif model_option == "Prophet + XGBoost":
                             corrector_choice = "XGBoost"
-
-                        # --- MODIFIED: The incorrect 'db' argument has been removed ---
+                        
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
                         
