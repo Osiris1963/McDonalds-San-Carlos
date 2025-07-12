@@ -552,51 +552,43 @@ if db:
                     st.session_state.show_recent_entries = not st.session_state.show_recent_entries
                 
                 if st.session_state.show_recent_entries:
+                    st.subheader("🗓️ Recent Entries")
                     recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
                     
                     if not recent_df.empty:
-                        records = recent_df.to_dict('records')
-                        for i in range(0, len(records), 3):
-                            cols = st.columns(3)
-                            row_records = records[i:i+3]
-                            for j, record in enumerate(row_records):
-                                with cols[j]:
-                                    with st.container(border=True):
-                                        doc_id = record['doc_id']
-                                        date_str = pd.to_datetime(record['date']).strftime('%b %d, %Y')
-                                        with st.expander(f"**{date_str}**"):
-                                            st.markdown(f"**Sales:** ₱{record.get('sales', 0):,.2f}")
-                                            st.markdown(f"**Customers:** {record.get('customers', 0)}")
-                                            st.markdown(f"**Add-ons:** ₱{record.get('add_on_sales', 0):,.2f}")
-                                            st.markdown(f"**Weather:** {record.get('weather', 'N/A')}")
-                                            
-                                            with st.form(key=f"update_hist_grid_{doc_id}", border=False):
-                                                st.markdown("###### Edit Record")
-                                                updated_sales = st.number_input("Total Sales (₱)", value=float(record.get('sales', 0)), format="%.2f", key=f"sales_hist_{doc_id}")
-                                                updated_customers = st.number_input("Customers", value=int(record.get('customers', 0)), key=f"cust_hist_{doc_id}")
-                                                updated_addons = st.number_input("Add-on Sales (₱)", value=float(record.get('add_on_sales', 0)), format="%.2f", key=f"addon_hist_{doc_id}")
-                                                updated_weather = st.selectbox("Weather", ["Sunny","Cloudy","Rainy","Storm"], index=["Sunny","Cloudy","Rainy","Storm"].index(record.get('weather', 'Sunny')), key=f"weather_hist_{doc_id}")
-                                                
-                                                update_col, delete_col = st.columns(2)
-                                                if update_col.form_submit_button("💾", help="Update Record", use_container_width=True):
-                                                    update_data = {
-                                                        "sales": updated_sales,
-                                                        "customers": updated_customers,
-                                                        "add_on_sales": updated_addons,
-                                                        "weather": updated_weather
-                                                    }
-                                                    update_historical_record_in_firestore(db, doc_id, update_data)
-                                                    st.success("Record updated!")
-                                                    st.cache_data.clear()
-                                                    time.sleep(1)
-                                                    st.rerun()
+                        for _, row in recent_df.iterrows():
+                            doc_id = row['doc_id']
+                            date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
+                            summary_line = f"**{date_str}** | Sales: ₱{row.get('sales', 0):,.2f} | Customers: {row.get('customers', 0)} | Add-ons: ₱{row.get('add_on_sales', 0):,.2f}"
+                            with st.expander(summary_line):
+                                with st.form(key=f"update_hist_{doc_id}", border=False):
+                                    st.markdown("##### Edit Record")
+                                    cols = st.columns(3)
+                                    updated_sales = cols[0].number_input("Total Sales (₱)", value=float(row.get('sales', 0)), format="%.2f")
+                                    updated_customers = cols[1].number_input("Customers", value=int(row.get('customers', 0)))
+                                    updated_addons = cols[2].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f")
+                                    updated_weather = st.selectbox("Weather", ["Sunny","Cloudy","Rainy","Storm"], index=["Sunny","Cloudy","Rainy","Storm"].index(row.get('weather', 'Sunny')))
+                                    
+                                    update_col, delete_col, _ = st.columns([1,1,3])
+                                    if update_col.form_submit_button("💾 Update", use_container_width=True):
+                                        update_data = {
+                                            "sales": updated_sales,
+                                            "customers": updated_customers,
+                                            "add_on_sales": updated_addons,
+                                            "weather": updated_weather
+                                        }
+                                        update_historical_record_in_firestore(db, doc_id, update_data)
+                                        st.success("Record updated!")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
 
-                                                if delete_col.form_submit_button("🗑️", help="Delete Record", use_container_width=True):
-                                                    delete_from_firestore(db, 'historical_data', doc_id)
-                                                    st.warning("Record deleted.")
-                                                    st.cache_data.clear()
-                                                    time.sleep(1)
-                                                    st.rerun()
+                                    if delete_col.form_submit_button("🗑️ Delete", use_container_width=True):
+                                        delete_from_firestore(db, 'historical_data', doc_id)
+                                        st.warning("Record deleted.")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
                     else:
                         st.info("No recent data to display.")
         
