@@ -17,7 +17,10 @@ import json
 import logging
 
 # --- FIX: Suppress Prophet's informational messages ---
+# This will hide the verbose output that appears in the sidebar during forecasting
 logging.getLogger('prophet').setLevel(logging.ERROR)
+logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+
 
 # --- Page Configuration ---
 st.set_page_config(
