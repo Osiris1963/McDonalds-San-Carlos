@@ -111,22 +111,21 @@ def apply_custom_styling():
             border: 1px solid #444 !important;
             box-shadow: none;
             border-radius: 10px;
-            background-color: #252525;
-            margin-bottom: 1rem; /* Space between month expanders */
+            background-color: #333333; /* Slightly lighter than card for depth */
         }
         .st-expander header {
-            font-size: 1.1rem; /* Larger font for month */
-            font-weight: 700;
-            color: #ffffff;
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #d3d3d3;
         }
         
         /* --- Custom Activity Card Style (Compact) --- */
         .activity-card {
-            background-color: #333333;
+            background-color: #252525;
             border-radius: 10px;
             padding: 0.8rem 1rem;
             margin-bottom: 0.75rem;
-            border: 1px solid #555;
+            border: 1px solid #444;
         }
         .activity-card h3 {
             font-size: 1rem;
@@ -411,43 +410,45 @@ def render_activity_card(row, db_client):
     doc_id = row['doc_id']
     activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
     
-    st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
-    
-    st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
-    st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
-    
-    status = row['remarks']
-    if status == 'Confirmed': color = '#22C55E' # Green
-    elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
-    elif status == 'Tentative': color = '#38BDF8' # Light Blue
-    else: color = '#EF4444' # Red
-    st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
-    
-    with st.expander("Edit / Manage"):
-        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+    # Each activity is a self-contained card with an expander inside it.
+    with st.container():
+        st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
+        st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
+        st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+        
+        status = row['remarks']
+        if status == 'Confirmed': color = '#22C55E' # Green
+        elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
+        elif status == 'Tentative': color = '#38BDF8' # Light Blue
+        else: color = '#EF4444' # Red
+        st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
+        
+        with st.expander("Edit / Manage"):
+            status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+            current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
 
-        with st.form(key=f"update_form_{doc_id}", border=False):
-            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
-            
-            update_col, delete_col = st.columns(2)
-            with update_col:
-                if st.form_submit_button("💾 Update", use_container_width=True):
-                    update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                    update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
-                    st.success("Activity updated!")
-                    st.cache_data.clear()
-                    time.sleep(1)
-                    st.rerun()
-            with delete_col:
-                if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                    delete_from_firestore(db_client, 'future_activities', doc_id)
-                    st.warning("Activity deleted.")
-                    st.cache_data.clear()
-                    time.sleep(1)
-                    st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+            with st.form(key=f"update_form_{doc_id}", border=False):
+                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+                updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+                
+                update_col, delete_col = st.columns(2)
+                with update_col:
+                    if st.form_submit_button("💾 Update", use_container_width=True):
+                        update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                        update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                        st.success("Activity updated!")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+                with delete_col:
+                    if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                        delete_from_firestore(db_client, 'future_activities', doc_id)
+                        st.warning("Activity deleted.")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
 
 def display_activities(df, db_client, group_by_month=False):
     if df.empty:
@@ -455,17 +456,17 @@ def display_activities(df, db_client, group_by_month=False):
         return
 
     if group_by_month:
-        df['month_year'] = df['date'].dt.to_period('M')
+        df['month_year'] = df['date'].dt.strftime('%B %Y')
         df_sorted = df.sort_values('date')
-
-        for month_period, month_group in df_sorted.groupby('month_year'):
-            month_name = month_period.strftime('%B %Y')
-            with st.expander(month_name):
-                # Inside the month expander, just list the activities
-                for _, row in month_group.iterrows():
-                    render_activity_card(row, db_client)
+        
+        current_month_year = ""
+        for index, row in df_sorted.iterrows():
+            month_year = row['month_year']
+            if month_year != current_month_year:
+                current_month_year = month_year
+                st.subheader(month_year)
+            render_activity_card(row, db_client)
     else:
-        # For the main dashboard view
         for _, row in df.iterrows():
             render_activity_card(row, db_client)
 
