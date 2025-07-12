@@ -48,9 +48,12 @@ def apply_custom_styling():
             border-right: 1px solid #444;
         }
         
-        /* --- FIX: Disable Sidebar Resizing --- */
-        [data-testid="stSidebar"] + div {
-            display: none; /* Hides the drag handle completely */
+        /* --- FIX: Lock Sidebar Width and Disable Resizing --- */
+        [data-testid="stSidebar"] {
+            width: 320px !important; /* Set a fixed width */
+        }
+        [data-testid="stSidebar-resize-handler"] {
+            display: none; /* Hide the resize handle */
         }
         
         /* --- Primary Button (Generate Forecast) --- */
