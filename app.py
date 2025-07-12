@@ -48,6 +48,11 @@ def apply_custom_styling():
             border-right: 1px solid #444;
         }
         
+        /* --- FIX: Disable Sidebar Resizing --- */
+        [data-testid="stSidebar"] + div {
+            display: none; /* Hides the drag handle completely */
+        }
+        
         /* --- Primary Button (Generate Forecast) --- */
         .stButton > button {
             border: none;
