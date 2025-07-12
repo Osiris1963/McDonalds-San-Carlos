@@ -235,6 +235,7 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
         
+        # --- MODIFIED: This logic now correctly prepares future data for the hybrid models ---
         if use_yearly_seasonality:
             hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
             hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
@@ -317,7 +318,6 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
-
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -354,8 +354,8 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         hist_with_trends = engineer_consecutive_trend_feature(hist_df_with_atv) 
                         
-                        # MODIFIED: Logic to handle feature engineering based on data length
-                        if len(hist_with_trends) >= 365:
+                        use_last_year_features = len(hist_with_trends) >= 365
+                        if use_last_year_features:
                             st.sidebar.info("Year-over-year data is active.")
                             hist_df_final = engineer_last_year_features(hist_with_trends)
                         else:
@@ -364,10 +364,11 @@ if db:
                         ev_df = st.session_state.events_df.copy()
                         
                         corrector_choice = "None"
-                        if model_option == "Prophet + Random Forest":
-                            corrector_choice = "Random Forest"
-                        elif model_option == "Prophet + XGBoost":
-                            corrector_choice = "XGBoost"
+                        if model_option != "Prophet Only":
+                            if not use_last_year_features:
+                                st.warning(f"'{model_option}' requires 1 year of data. Defaulting to 'Prophet Only'.")
+                            else:
+                                corrector_choice = model_option.split(" + ")[1]
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
