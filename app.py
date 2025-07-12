@@ -178,7 +178,8 @@ def get_user(db_client, username):
     return None
 
 def verify_password(plain_password, hashed_password):
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password)
+    # The hashed_password from Firestore is a string, it must be encoded to bytes
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
@@ -771,7 +772,7 @@ if db:
                                 hashed_password = hash_password(new_password)
                                 db.collection('users').add({
                                     'username': new_username,
-                                    'password': hashed_password,
+                                    'password': hashed_password.decode('utf-8'), # Store as a string
                                     'access_level': new_access_level
                                 })
                                 st.success("User added successfully")
@@ -800,4 +801,3 @@ if db:
                                 db.collection('users').document(row['doc_id']).delete()
                                 st.success("User deleted")
                                 st.rerun()
-
