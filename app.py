@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from prophet import Prophet
+import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import numpy as np
 import plotly.graph_objs as go
@@ -240,7 +241,7 @@ def calculate_atv(df):
 def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
-        # --- THIS IS THE FIX: Let the API choose the best model for the location ---
+        # Let the API choose the best model for the location
         params={
             "latitude":10.48,
             "longitude":123.42,
@@ -257,7 +258,7 @@ def get_weather_forecast(days=16):
         return None
 
 def map_weather_code(code):
-    # --- THIS IS THE FIX: More descriptive weather mapping ---
+    # More descriptive weather mapping
     if code in [0, 1]: return "Sunny"
     if code == 2: return "Partly Cloudy"
     if code == 3: return "Cloudy"
@@ -275,14 +276,28 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
-# --- Core Forecasting Model ---
+# --- Core Forecasting Models ---
+
+def create_time_features(df):
+    """Creates time series features from a datetime index."""
+    df['date'] = pd.to_datetime(df['date'])
+    df['hour'] = df['date'].dt.hour
+    df['dayofweek'] = df['date'].dt.dayofweek
+    df['quarter'] = df['date'].dt.quarter
+    df['month'] = df['date'].dt.month
+    df['year'] = df['date'].dt.year
+    df['dayofyear'] = df['date'].dt.dayofyear
+    df['dayofmonth'] = df['date'].dt.day
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    return df
+
 @st.cache_resource
-def train_and_forecast_component(historical_df, events_df, periods, target_col):
+def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame()
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
@@ -309,15 +324,58 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     prophet_model.fit(df_prophet)
     
     future = prophet_model.make_future_dataframe(periods=periods)
-    prophet_forecast = prophet_model.predict(future)
-
-    potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
-    existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
-    forecast_components = prophet_forecast[existing_cols]
-
-    metrics = {'mae': mean_absolute_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']), 'rmse': np.sqrt(mean_squared_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']))}
+    forecast = prophet_model.predict(future)
     
-    return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
+    return forecast[['ds', 'yhat']], prophet_model
+
+@st.cache_resource
+def train_and_forecast_xgboost(historical_df, events_df, periods, target_col):
+    df_train = historical_df.copy()
+    df_train.dropna(subset=['date', target_col], inplace=True)
+    
+    if df_train.empty:
+        return pd.DataFrame()
+
+    # Create features for the model
+    df_featured = create_time_features(df_train.rename(columns={'date': 'date'}))
+    
+    # Create future dates to predict
+    last_date = df_featured['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
+    future_df = pd.DataFrame({'date': future_dates})
+    future_df_featured = create_time_features(future_df)
+
+    features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']
+    target = target_col
+
+    X_train, y_train = df_featured[features], df_featured[target]
+    X_future = future_df_featured[features]
+
+    reg = xgb.XGBRegressor(
+        n_estimators=1000,
+        early_stopping_rounds=50,
+        learning_rate=0.01,
+        objective='reg:squarederror'
+    )
+    
+    reg.fit(X_train, y_train,
+            eval_set=[(X_train, y_train)],
+            verbose=False)
+            
+    # Predict on future dates
+    future_predictions = reg.predict(X_future)
+    
+    # Combine historical and future predictions
+    full_prediction_df = df_featured[['date']].copy()
+    full_prediction_df['yhat'] = reg.predict(X_train)
+    
+    future_df['yhat'] = future_predictions
+    
+    final_df = pd.concat([full_prediction_df, future_df], ignore_index=True)
+    final_df = final_df.rename(columns={'date': 'ds'})
+    
+    return final_df
+
 
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
@@ -565,7 +623,7 @@ if db:
     else:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-            st.info("Forecasting with Prophet Model")
+            st.info("Forecasting with an Ensemble Model (Prophet + XGBoost)")
 
             if st.button("🔄 Refresh Data from Firestore"):
                 st.cache_data.clear()
@@ -577,7 +635,7 @@ if db:
                 if len(st.session_state.historical_df) < 20: 
                     st.error("Please provide at least 20 days of data for reliable forecasting.")
                 else:
-                    with st.spinner("🧠 Building forecast model..."):
+                    with st.spinner("🧠 Building forecast models (Prophet + XGBoost)..."):
                         base_df = st.session_state.historical_df.copy()
                         
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
@@ -591,11 +649,26 @@ if db:
                         
                         ev_df = st.session_state.events_df.copy()
                         
-                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_with_atv, ev_df, 15, 'customers')
-                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_with_atv, ev_df, 15, 'atv')
-                        
-                        if not cust_f.empty and not atv_f.empty:
-                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
+                        # --- TRAIN AND COMBINE MODELS ---
+                        # 1. Prophet
+                        prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'customers')
+                        prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'atv')
+
+                        # 2. XGBoost
+                        xgb_cust_f = train_and_forecast_xgboost(hist_df_with_atv, ev_df, 15, 'customers')
+                        xgb_atv_f = train_and_forecast_xgboost(hist_df_with_atv, ev_df, 15, 'atv')
+
+                        # 3. Ensemble (blend) the forecasts
+                        if not prophet_cust_f.empty and not xgb_cust_f.empty:
+                            # Merge forecasts on date
+                            cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
+                            atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
+
+                            # Calculate the blended forecast (50/50 average)
+                            cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
+                            atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
+                            
+                            combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
                             with st.spinner("🛰️ Fetching live weather..."):
@@ -606,12 +679,15 @@ if db:
                                 combo_f['weather'] = 'Not Available'
                                 
                             st.session_state.forecast_df = combo_f
-                            st.session_state.metrics = {'customers': cust_m, 'atv': atv_m}
-                            st.session_state.forecast_components = cust_c
-                            st.session_state.all_holidays = all_h
-                            st.success(f"Forecast generated successfully!")
+                            
+                            # For insights, we'll use the Prophet model's components
+                            prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
+                            st.session_state.forecast_components = prophet_forecast_components
+                            st.session_state.all_holidays = prophet_model_cust.holidays
+                            
+                            st.success(f"Ensemble forecast generated successfully!")
                         else:
-                            st.error("Forecast generation failed.")
+                            st.error("Forecast generation failed. One of the models could not be trained.")
 
             st.markdown("---")
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
@@ -643,6 +719,7 @@ if db:
                     with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
             else:st.info("Click the 'Generate Component Forecast' button to begin.")
         with tabs[1]:
+            st.info("The breakdown below is generated by the Prophet model component of the forecast.")
             if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
             else:
                 future_components=st.session_state.forecast_components[st.session_state.forecast_components['ds']>=pd.to_datetime('today').normalize()].copy()
