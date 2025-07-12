@@ -237,12 +237,6 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # --- Logistic Growth Setup ---
-    # Set a cap (maximum capacity) for the forecast to prevent unrealistic growth.
-    # We'll set it to 120% of the historical maximum for some headroom.
-    cap = df_prophet['y'].max() * 1.2
-    df_prophet['cap'] = cap
-
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
@@ -251,34 +245,27 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     use_yearly_seasonality = len(df_train) >= 365
 
     prophet_model = Prophet(
-        growth='logistic',  # Use logistic growth to respect the 'cap'
+        growth='linear',
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.05, # Standard value for more regular trend
+        changepoint_prior_scale=0.01,
         changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
     future = prophet_model.make_future_dataframe(periods=periods)
-    future['cap'] = cap # The future dataframe also needs the cap
     prophet_forecast = prophet_model.predict(future)
 
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
     existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
     forecast_components = prophet_forecast[existing_cols]
 
-    # Calculate metrics on the historical portion of the forecast
-    forecast_on_hist = prophet_forecast.loc[:len(df_prophet)-1]
-    metrics = {
-        'mae': mean_absolute_error(df_prophet['y'], forecast_on_hist['yhat']),
-        'rmse': np.sqrt(mean_squared_error(df_prophet['y'], forecast_on_hist['yhat']))
-    }
+    metrics = {'mae': mean_absolute_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']), 'rmse': np.sqrt(mean_squared_error(df_prophet['y'], prophet_forecast.loc[:len(df_prophet)-1, 'yhat']))}
     
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
-
 
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
@@ -524,7 +511,7 @@ if db:
                         selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
 
                         # Filter dataframe for the selected year and month
-                        filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=_True)
+                        filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=True)
 
                         # Display the data
                         st.dataframe(filtered_df, use_container_width=True, hide_index=True)
