@@ -17,7 +17,7 @@ import json
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="McDonald's AI Sales Forecaster",
+    page_title="Sales Forecaster",
     page_icon="🍔",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -33,8 +33,20 @@ def apply_custom_styling():
             font-family: 'Poppins', sans-serif;
         }
         .main > div {
-            background-color: #1a1a1a; /* Softer dark background */
+            background-color: #1a1a1a;
         }
+        
+        /* --- Clean Layout Adjustments --- */
+        /* Reduce top padding of the main content area */
+        .block-container {
+            padding-top: 2rem !important;
+        }
+        /* Target the tabs container to pull it up */
+        div[data-testid="stTabs"] {
+            margin-top: -55px;
+            margin-bottom: 2rem;
+        }
+
 
         /* --- Sidebar --- */
         .st-emotion-cache-16txtl3 {
@@ -352,8 +364,9 @@ if db:
             st.markdown("---")
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
             st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
-
-        st.title("🍔 McDonald's AI Sales Forecaster");tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
+        
+        # REMOVED the st.title call from here
+        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
         with tabs[0]:
             if not st.session_state.forecast_df.empty:
                 st.header("15-Day Component Forecast");today=pd.to_datetime('today').normalize();future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
