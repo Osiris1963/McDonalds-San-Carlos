@@ -210,7 +210,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
         
-        # MODIFIED: Corrected typo 'add_on_sales' to 'add_on_sales'
         base_features = ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']
         if use_yearly_seasonality:
             base_features.extend(['last_year_sales', 'last_year_customers'])
@@ -365,9 +364,10 @@ if db:
                         
                         corrector_choice = "None"
                         if model_option != "Prophet Only":
-                            if not use_last_year_features and model_option in ["Prophet + Random Forest", "Prophet + XGBoost"]:
-                                st.warning(f"'{model_option}' requires 1 year of data for best results. Running without year-over-year features.")
-                            corrector_choice = model_option.split(" + ")[1]
+                            if not use_last_year_features:
+                                st.warning(f"'{model_option}' requires 1 year of data. Defaulting to 'Prophet Only'.")
+                            else:
+                                corrector_choice = model_option.split(" + ")[1]
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
