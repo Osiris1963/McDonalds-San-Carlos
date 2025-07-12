@@ -553,7 +553,7 @@ if db:
                 
                 if st.session_state.show_recent_entries:
                     st.subheader("🗓️ Recent Entries")
-                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(7)
+                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
                     
                     if not recent_df.empty:
                         for _, row in recent_df.iterrows():
