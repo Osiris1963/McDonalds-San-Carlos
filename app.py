@@ -25,24 +25,78 @@ st.set_page_config(
 
 # --- Custom McDonald's Inspired CSS ---
 def apply_custom_styling():
-    st.markdown("""<style>
-        html, body, [class*="st-"] { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; }
-        .main > div { background-color: #1e1e1e; }
-        .st-emotion-cache-16txtl3 { background-color: #2a2a2a; border-right: 1px solid #444; }
-        .st-emotion-cache-10trblm { color: #ffffff; }
-        .stButton > button {
-            border: 2px solid #c8102e; border-radius: 20px; color: #ffffff;
-            background-color: #c8102e; transition: all 0.2s ease-in-out;
+    st.markdown("""
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        /* --- Main Font & Colors --- */
+        html, body, [class*="st-"] {
+            font-family: 'Poppins', sans-serif;
         }
-        .stButton > button:hover { border-color: #ffc72c; background-color: #a80d26; color: #ffc72c; }
-        .stButton > button:active { border-color: #ffc72c !important; background-color: #ffc72c !important; color: #1e1e1e !important; }
-        .stTabs [data-baseweb="tab"] { background-color: transparent; border-radius: 8px; color: #d3d3d3; }
-        .stTabs [data-baseweb="tab"]:hover { background-color: #3a3a3a; }
-        .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: white; font-weight: bold; }
-        .st-emotion-cache-p5msec { border: 1px solid #444; border-radius: 10px; background-color: #2a2a2a; }
-        .st-emotion-cache-p5msec .st-emotion-cache-17x134l,
-        .st-emotion-cache-1r4qj8v, .st-emotion-cache-1xw8zdv { color: #ffc72c; }
-    </style>""", unsafe_allow_html=True)
+        .main > div {
+            background-color: #1a1a1a; /* Softer dark background */
+        }
+
+        /* --- Sidebar --- */
+        .st-emotion-cache-16txtl3 {
+            background-color: #252525;
+            border-right: 1px solid #444;
+        }
+        
+        /* --- Primary Button (Generate Forecast) --- */
+        .stButton > button {
+            border: none;
+            border-radius: 12px;
+            color: #1e1e1e;
+            font-weight: 600;
+            background: linear-gradient(45deg, #ffc72c, #ffd24d); /* Yellow gradient */
+            transition: all 0.2s ease-in-out;
+            box-shadow: 0 4px 15px 0 rgba(255, 199, 44, 0.3);
+        }
+        .stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px 0 rgba(255, 199, 44, 0.4);
+        }
+        
+        /* Special case for Refresh button */
+        .stButton:has(button:contains("Refresh Data")) > button {
+             border: 2px solid #ffc72c;
+             background: transparent;
+             color: #ffc72c;
+        }
+        .stButton:has(button:contains("Refresh Data")) > button:hover {
+            background: #ffc72c;
+            color: #1e1e1e;
+        }
+
+
+        /* --- Tabs --- */
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 10px;
+            background-color: transparent;
+            color: #d3d3d3;
+            padding: 10px 15px;
+        }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            background-color: #ffc72c;
+            color: #1e1e1e;
+            font-weight: 600;
+        }
+
+        /* --- Expanders as Cards --- */
+        .st-expander {
+            border: none !important;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            border-radius: 15px;
+            background-color: #252525;
+            margin-bottom: 1rem;
+        }
+        .st-expander header {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
 # --- Firestore Initialization ---
 @st.cache_resource
@@ -258,7 +312,7 @@ if db:
                 time.sleep(1)
                 st.rerun()
 
-            if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
+            if st.button("📈 Generate Forecast", use_container_width=True):
                 if len(st.session_state.historical_df) < 20: 
                     st.error("Please provide at least 20 days of data for reliable forecasting.")
                 else:
@@ -280,7 +334,6 @@ if db:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
-                            # Get weather for display purposes
                             with st.spinner("🛰️ Fetching live weather..."):
                                 weather_df = get_weather_forecast()
                             if weather_df is not None:
@@ -353,7 +406,7 @@ if db:
                                 st.error(f"Migration Failed: {e}")
 
             st.info("Use the tools below to manage your data in Firestore.")
-            with st.expander("➕ Add New Daily Record",expanded=True):
+            with st.expander("✍️ Add New Daily Record",expanded=True):
                 with st.form("new_record_form",clear_on_submit=True):
                     c1,c2,c3=st.columns(3);c4,c5=st.columns(2);
                     with c1:new_date=st.date_input("Date")
@@ -361,14 +414,14 @@ if db:
                     with c3:new_customers=st.number_input("Customer Count",min_value=0)
                     with c4:new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
                     with c5:new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                    if st.form_submit_button("💾 Save Record"):
+                    if st.form_submit_button("✅ Save Record"):
                         new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
                         add_to_firestore(db,'historical_data',new_rec)
                         st.cache_data.clear()
                         st.success("Record added to Firestore!");
                         time.sleep(1)
                         st.rerun()
-            with st.expander("📝 Manage Historical Data by Month"):
+            with st.expander("📅 Manage Historical Data"):
                 df=st.session_state.historical_df.copy()
                 if not df.empty and'date'in df.columns:
                     df['date']=pd.to_datetime(df['date'],errors='coerce');df.dropna(subset=['date'],inplace=True)
