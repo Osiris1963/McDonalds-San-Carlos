@@ -108,24 +108,25 @@ def apply_custom_styling():
 
         /* --- Expanders for Editing --- */
         .st-expander {
-            border: none !important;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            border-radius: 12px;
+            border: 1px solid #444 !important;
+            box-shadow: none;
+            border-radius: 10px;
             background-color: #252525;
+            margin-bottom: 0.5rem;
         }
         .st-expander header {
-            font-size: 0.9rem;
+            font-size: 1rem;
             font-weight: 600;
-            color: #d3d3d3;
+            color: #ffffff;
         }
         
         /* --- Custom Activity Card Style (Compact) --- */
         .activity-card {
-            background-color: #252525;
+            background-color: #333333;
             border-radius: 10px;
             padding: 0.8rem 1rem;
             margin-bottom: 0.75rem;
-            border: 1px solid #444;
+            border: 1px solid #555;
         }
         .activity-card h3 {
             font-size: 1rem;
@@ -454,17 +455,21 @@ def display_activities(df, db_client, group_by_month=False):
         return
 
     if group_by_month:
-        df['month_year'] = df['date'].dt.strftime('%B %Y')
-        
-        current_month_year = ""
-        for index, row in df.iterrows():
-            month_year = row['month_year']
-            if month_year != current_month_year:
-                current_month_year = month_year
-                st.markdown(f"<h5 style='margin-top: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #444; padding-bottom: 0.5rem;'>{month_year}</h5>", unsafe_allow_html=True)
-            render_activity_card(row, db_client)
+        df['month_year'] = df['date'].dt.to_period('M')
+        df_sorted = df.sort_values('date')
+
+        for month_period, month_group in df_sorted.groupby('month_year'):
+            month_name = month_period.strftime('%B %Y')
+            with st.expander(month_name):
+                month_group['day_date_str'] = month_group['date'].dt.strftime('%A, %B %d, %Y')
+                for day_str, day_group in month_group.groupby('day_date_str', sort=False):
+                    activity_count = len(day_group)
+                    activity_label = "activity" if activity_count == 1 else "activities"
+                    with st.expander(f"{day_str} ({activity_count} {activity_label})"):
+                        for _, row in day_group.iterrows():
+                            render_activity_card(row, db_client)
     else:
-        for index, row in df.iterrows():
+        for _, row in df.iterrows():
             render_activity_card(row, db_client)
 
 
