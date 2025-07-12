@@ -446,7 +446,7 @@ if db:
                     new_customers=st.number_input("Customer Count",min_value=0)
                     new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                     new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
-                    if st.form_submit_button("✅ Save Record", use_container_width=True):
+                    if st.form_submit_button("✅ Save Record"):
                         new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
                         add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
                         st.cache_data.clear()
@@ -455,7 +455,7 @@ if db:
                         st.rerun()
             
             with display_col:
-                if st.button("🗓️ Show/Hide Recent Entries", use_container_width=True):
+                if st.button("🗓️ Show/Hide Recent Entries"):
                     st.session_state.show_recent_entries = not st.session_state.show_recent_entries
                 
                 if st.session_state.show_recent_entries:
