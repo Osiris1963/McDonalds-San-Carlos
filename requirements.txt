@@ -10,3 +10,4 @@ firebase-admin==6.5.0
 xgboost
 tensorflow
 scikit-learn
+optuna
