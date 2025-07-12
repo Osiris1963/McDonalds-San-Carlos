@@ -151,7 +151,7 @@ def init_firestore():
 def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
-    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
+    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
     defaults = {
         'forecast_df': pd.DataFrame(), 
         'metrics': {}, 
@@ -173,7 +173,7 @@ def load_from_firestore(_db_client, collection_name):
     records = []
     for doc in docs:
         record = doc.to_dict()
-        record['doc_id'] = doc.id
+        record['doc_id'] = doc.id # BUG FIX: Added doc_id for all collections
         records.append(record)
 
     if not records: return pd.DataFrame()
