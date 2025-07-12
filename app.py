@@ -79,13 +79,13 @@ def apply_custom_styling():
         }
         
         /* Special case for Refresh button and Show Recent Entries */
-        .stButton:has(button:contains("Refresh Data")),
+        .stButton:has(button:contains("Refresh")),
         .stButton:has(button:contains("Recent Entries")) > button {
              border: 2px solid #c8102e;
              background: transparent;
              color: #c8102e;
         }
-        .stButton:has(button:contains("Refresh Data")):hover > button,
+        .stButton:has(button:contains("Refresh")):hover > button,
         .stButton:has(button:contains("Recent Entries")):hover > button {
             background: #c8102e;
             color: #ffffff;
@@ -184,6 +184,43 @@ def load_from_firestore(_db_client, collection_name):
     if not df.empty:
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
+
+@st.cache_data(ttl="1h")
+def load_activities_from_firestore(_db_client, collection_name):
+    """
+    Loads data from a specified Firestore collection and includes the document ID.
+    Specifically tailored for the 'future_activities' collection.
+    """
+    if _db_client is None: return pd.DataFrame()
+    
+    docs = _db_client.collection(collection_name).stream()
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+        
+    if not records: return pd.DataFrame()
+    
+    df = pd.DataFrame(records)
+    
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        if pd.api.types.is_datetime64_any_dtype(df['date']):
+            df['date'] = df['date'].dt.tz_localize(None)
+        df.dropna(subset=['date'], inplace=True)
+        
+    # Handle numeric columns including the new potential_sales
+    numeric_cols = ['potential_sales']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    if not df.empty:
+        df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+        
+    return df
+
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -408,7 +445,7 @@ if db:
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
             st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
         
-        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📜 Historical Data"])
+        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"])
         
         with tabs[0]:
             if not st.session_state.forecast_df.empty:
@@ -480,40 +517,98 @@ if db:
                             )
                         else:
                             st.info("No recent data to display.")
-
+        
         with tabs[3]:
+            st.subheader("📅 Manage Future Activities & Events")
+            
+            col1, col2 = st.columns([2, 3], gap="large")
+
+            with col1:
+                st.markdown("##### Add New Activity")
+                with st.form("new_activity_form", clear_on_submit=True, border=False):
+                    activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
+                    activity_date = st.date_input("Date of Activity", min_value=date.today())
+                    potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
+                    remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
+                    
+                    submitted = st.form_submit_button("✅ Save Activity")
+                    if submitted:
+                        if activity_name and activity_date:
+                            new_activity = {
+                                "activity_name": activity_name,
+                                "date": pd.to_datetime(activity_date).to_pydatetime(),
+                                "potential_sales": float(potential_sales),
+                                "remarks": remarks
+                            }
+                            db.collection('future_activities').add(new_activity)
+                            st.success(f"Activity '{activity_name}' saved!")
+                            st.cache_data.clear() # Clear cache to reload data
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("Activity name and date are required.")
+
+            with col2:
+                st.markdown("##### Upcoming Scheduled Activities")
+                
+                if st.button("🔄 Refresh List", key='refresh_activities'):
+                    st.cache_data.clear()
+                    st.rerun()
+
+                activities_df = load_activities_from_firestore(db, 'future_activities')
+
+                if not activities_df.empty:
+                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+                    
+                    if not upcoming_df.empty:
+                        st.markdown("---")
+                        for index, row in upcoming_df.iterrows():
+                            doc_id = row['doc_id']
+                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+                            
+                            card_cols = st.columns([0.6, 0.3, 0.1])
+                            with card_cols[0]:
+                                st.markdown(f"**{row['activity_name']}**")
+                                st.markdown(f"<small>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</small>", unsafe_allow_html=True)
+                            with card_cols[1]:
+                                st.info(f"{row['remarks']}")
+                            with card_cols[2]:
+                                if st.button("🗑️", key=f"delete_{doc_id}", help="Delete this activity"):
+                                    delete_from_firestore(db, 'future_activities', doc_id)
+                                    st.cache_data.clear()
+                                    st.rerun()
+                            st.markdown("---")
+                    else:
+                        st.info("No upcoming activities scheduled.")
+                else:
+                    st.info("No activities have been added yet.")
+
+        with tabs[4]:
             st.subheader("View Historical Data")
             df = st.session_state.historical_df.copy()
             if not df.empty and 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], errors='coerce')
                 df.dropna(subset=['date'], inplace=True)
 
-                # Get unique years, sort them in descending order
                 all_years = sorted(df['date'].dt.year.unique(), reverse=True)
 
                 if all_years:
-                    # Create two columns for the selectors
                     col1, col2 = st.columns(2)
                     with col1:
                         selected_year = st.selectbox("Select Year to View:", options=all_years)
 
-                    # Filter dataframe for the selected year to find available months
                     df_year_filtered = df[df['date'].dt.year == selected_year]
                     
-                    # Get unique month names and sort them chronologically descending
                     all_months = sorted(df_year_filtered['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
 
                     if all_months:
                         with col2:
                             selected_month_str = st.selectbox("Select Month to View:", options=all_months)
 
-                        # Convert month name to month number for filtering
                         selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
 
-                        # Filter dataframe for the selected year and month
                         filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=True)
 
-                        # Display the data
                         st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                     else:
                         st.write(f"No data available for the year {selected_year}.")
