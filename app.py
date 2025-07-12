@@ -25,7 +25,7 @@ logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 # --- Page Configuration ---
 st.set_page_config(
     page_title="Sales Forecaster",
-    page_icon="🍔",
+    page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -272,9 +272,7 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
 
-    # --- THIS IS THE FIX ---
-    # 1. Correctly rename 'activity_name' to 'holiday'
-    # 2. Drop any rows with missing dates or holiday names to prevent errors
+    # Correctly rename 'activity_name' to 'holiday' for the model
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
@@ -503,7 +501,7 @@ if db:
     
     else:
         with st.sidebar:
-            st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
+            st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
             st.info("Forecasting with Prophet Model")
 
             if st.button("🔄 Refresh Data from Firestore"):
@@ -734,7 +732,7 @@ if db:
 
 
         with tabs[4]:
-            st.subheader("View Historical Data")
+            st.subheader("View & Edit Historical Data")
             df = st.session_state.historical_df.copy()
             if not df.empty and 'date' in df.columns:
                 df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -759,7 +757,53 @@ if db:
 
                         filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=True)
 
-                        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+                        if filtered_df.empty:
+                            st.info("No data for the selected month and year.")
+                        else:
+                            for index, row in filtered_df.iterrows():
+                                date_str = row['date'].strftime('%B %d, %Y')
+                                expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+                                
+                                with st.expander(expander_title):
+                                    st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
+                                    st.write(f"**Weather:** {row.get('weather', 'N/A')}")
+                                    
+                                    if st.session_state['access_level'] <= 2:
+                                        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+                                            st.write("---")
+                                            st.markdown("**Edit Record**")
+                                            
+                                            edit_cols = st.columns(2)
+                                            updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), format="%.2f", key=f"sales_{row['doc_id']}")
+                                            updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
+                                            
+                                            edit_cols2 = st.columns(2)
+                                            updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
+                                            
+                                            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
+                                            current_weather_index = weather_options.index(row['weather']) if row.get('weather') in weather_options else 0
+                                            updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+                                            
+                                            btn_cols = st.columns(2)
+                                            if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
+                                                update_data = {
+                                                    'sales': updated_sales,
+                                                    'customers': updated_customers,
+                                                    'add_on_sales': updated_addons,
+                                                    'weather': updated_weather
+                                                }
+                                                update_historical_record_in_firestore(db, row['doc_id'], update_data)
+                                                st.success(f"Record for {date_str} updated!")
+                                                st.cache_data.clear()
+                                                time.sleep(1)
+                                                st.rerun()
+
+                                            if btn_cols[1].form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
+                                                delete_from_firestore(db, 'historical_data', row['doc_id'])
+                                                st.warning(f"Record for {date_str} deleted.")
+                                                st.cache_data.clear()
+                                                time.sleep(1)
+                                                st.rerun()
                     else:
                         st.write(f"No data available for the year {selected_year}.")
                 else:
