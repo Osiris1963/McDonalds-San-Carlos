@@ -5,7 +5,6 @@ import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from xgboost.callback import EarlyStopping
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -364,10 +363,12 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'random_state': 42
         }
         
+        # --- THIS IS THE FIX: Use early_stopping_rounds in the fit method ---
         model = xgb.XGBRegressor(**params)
-        # --- THIS IS THE FIX: Use callbacks for early stopping ---
-        early_stopping_callback = EarlyStopping(rounds=50, save_best=True)
-        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], callbacks=[early_stopping_callback], verbose=False)
+        model.fit(X_train, y_train, 
+                  eval_set=[(X_test, y_test)], 
+                  early_stopping_rounds=50, 
+                  verbose=False)
         
         preds = model.predict(X_test)
         mae = mean_absolute_error(y_test, preds)
