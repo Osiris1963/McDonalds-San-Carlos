@@ -120,29 +120,6 @@ def apply_custom_styling():
             font-weight: 600;
             color: #d3d3d3;
         }
-        
-        /* --- Custom Activity Card Style (for Grid View) --- */
-        .activity-card {
-            background-color: #252525;
-            border-radius: 12px;
-            padding: 1rem;
-            border: 1px solid #444;
-            min-height: 230px; 
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        }
-        .activity-card h3 {
-            font-size: 1.1rem;
-            font-weight: 600;
-            color: #ffffff;
-            margin-bottom: 0.25rem;
-        }
-        .activity-card p {
-            font-size: 0.85rem;
-            color: #d3d3d3;
-            margin-bottom: 0.5rem;
-        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -451,20 +428,20 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                         time.sleep(1)
                         st.rerun()
     else: # 'grid' view
-        # Full card view for the "All Activities" page
-        activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
-        with st.container():
-            st.markdown('<div class="activity-card">', unsafe_allow_html=True)
+        # Use st.container(border=True) to create a visual box for each activity.
+        with st.container(border=True):
+            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
             
             # Card Content
-            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
-            st.markdown(f"<p>📅 {activity_date_formatted}<br>💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+            st.markdown(f"**{row['activity_name']}**")
+            st.markdown(f"<small>📅 {activity_date_formatted}</small>", unsafe_allow_html=True)
+            st.markdown(f"💰 ₱{row['potential_sales']:,.2f}")
             status = row['remarks']
             if status == 'Confirmed': color = '#22C55E'
             elif status == 'Needs Follow-up': color = '#F59E0B'
             elif status == 'Tentative': color = '#38BDF8'
             else: color = '#EF4444'
-            st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
+            st.markdown(f"Status: <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
             
             # Form inside an expander
             with st.expander("Edit / Manage"):
@@ -490,7 +467,6 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                             st.cache_data.clear()
                             time.sleep(1)
                             st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Main Application UI ---
 apply_custom_styling()
