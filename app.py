@@ -37,9 +37,9 @@ def apply_custom_styling():
         }
         
         /* --- Clean Layout Adjustments --- */
-        /* Reduce top padding of the main content area for a cleaner look */
+        /* Adjust top padding to position the tabs lower */
         .block-container {
-            padding-top: 2rem !important;
+            padding-top: 3.5rem !important;
         }
         
         /* --- Sidebar --- */
