@@ -116,29 +116,32 @@ def apply_custom_styling():
             margin-bottom: 0.5rem;
         }
         .st-expander header {
-            font-size: 0.9rem; /* Compact font for dashboard expander */
+            font-size: 0.9rem;
             font-weight: 600;
             color: #d3d3d3;
         }
         
-        /* --- Custom Activity Card Style (for "All Activities" view) --- */
+        /* --- Custom Activity Card Style (for Grid View) --- */
         .activity-card {
-            background-color: #333333;
-            border-radius: 10px;
-            padding: 0.8rem 1rem;
-            margin-bottom: 0.75rem;
-            border: 1px solid #555;
+            background-color: #252525;
+            border-radius: 12px;
+            padding: 1rem;
+            border: 1px solid #444;
+            min-height: 230px; 
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
         .activity-card h3 {
-            font-size: 1rem;
+            font-size: 1.1rem;
             font-weight: 600;
             color: #ffffff;
-            margin-bottom: 0.1rem;
+            margin-bottom: 0.25rem;
         }
         .activity-card p {
             font-size: 0.85rem;
             color: #d3d3d3;
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.5rem;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -408,10 +411,10 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
-def render_activity_card(row, db_client, is_compact=False):
+def render_activity_card(row, db_client, view_type='compact_list'):
     doc_id = row['doc_id']
     
-    if is_compact:
+    if view_type == 'compact_list':
         # Compact, one-line summary for the main dashboard
         date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
         summary_line = f"**{date_str}** | {row['activity_name']}"
@@ -447,14 +450,15 @@ def render_activity_card(row, db_client, is_compact=False):
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
-    else:
+    else: # 'grid' view
         # Full card view for the "All Activities" page
         activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
         with st.container():
-            st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
-            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
-            st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+            st.markdown('<div class="activity-card">', unsafe_allow_html=True)
             
+            # Card Content
+            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<p>📅 {activity_date_formatted}<br>💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
             status = row['remarks']
             if status == 'Confirmed': color = '#22C55E'
             elif status == 'Needs Follow-up': color = '#F59E0B'
@@ -462,6 +466,7 @@ def render_activity_card(row, db_client, is_compact=False):
             else: color = '#EF4444'
             st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
             
+            # Form inside an expander
             with st.expander("Edit / Manage"):
                 status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
                 current_status_index = status_options.index(status) if status in status_options else 0
@@ -641,8 +646,14 @@ if db:
                             with tab:
                                 month_name = month_tabs_list[i]
                                 month_df = sorted_months_df[sorted_months_df['month_year'] == month_name]
-                                for _, row in month_df.iterrows():
-                                    render_activity_card(row, db, is_compact=False)
+                                
+                                activities = month_df.to_dict('records')
+                                for i in range(0, len(activities), 4):
+                                    cols = st.columns(4)
+                                    row_activities = activities[i:i+4]
+                                    for j, activity in enumerate(row_activities):
+                                        with cols[j]:
+                                            render_activity_card(activity, db, view_type='grid')
 
             else:
                 # --- DEFAULT OVERVIEW ---
@@ -692,7 +703,7 @@ if db:
                         st.info("No upcoming activities scheduled.")
                     else:
                         for _, row in upcoming_df.iterrows():
-                            render_activity_card(row, db, is_compact=True)
+                            render_activity_card(row, db, view_type='compact_list')
 
 
         with tabs[4]:
