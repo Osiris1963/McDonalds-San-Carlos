@@ -16,7 +16,7 @@ from firebase_admin import credentials, firestore
 import json
 import logging
 
-# --- FIX: Suppress Prophet's informational messages ---
+# --- Suppress Prophet's informational messages ---
 # This will hide the verbose output that appears in the sidebar during forecasting
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
@@ -265,7 +265,6 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
         current_date = pd.to_datetime(data['date'])
         last_year_date = current_date - timedelta(days=364)
         
-        # Create a clean date column for comparison, ignoring time
         hist_copy = historical_df.copy()
         hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
         
@@ -451,7 +450,7 @@ if db:
                     recent_df = st.session_state.historical_df.copy()
                     if not recent_df.empty:
                         recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
-                        display_cols = ['date', 'sales', 'customers', 'last_year_sales', 'last_year_customers', 'weather']
+                        display_cols = ['date', 'sales', 'customers', 'weather']
                         cols_to_show = [col for col in display_cols if col in recent_df.columns]
                         
                         st.dataframe(
@@ -462,8 +461,6 @@ if db:
                                 "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
                                 "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
                                 "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                                "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱%.2f"),
-                                "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%d"),
                                 "weather": "Weather"
                             }
                         )
