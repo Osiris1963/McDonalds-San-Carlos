@@ -556,44 +556,51 @@ if db:
                 activities_df = load_activities_from_firestore(db, 'future_activities')
 
                 if not activities_df.empty:
-                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+                    # Filter for today and future dates, then take the top 15
+                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(15)
                     
                     if not upcoming_df.empty:
                         for index, row in upcoming_df.iterrows():
                             doc_id = row['doc_id']
-                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%B %d, %Y')
-                            expander_title = f"{row['activity_name']} - {activity_date_formatted}"
+                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
                             
-                            with st.expander(expander_title):
-                                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                                current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+                            with st.container(border=True):
+                                info_col, edit_col = st.columns([4, 1])
 
-                                with st.form(key=f"update_form_{doc_id}", border=False):
-                                    st.markdown(f"**Edit Activity Details**")
-                                    updated_sales = st.number_input("Potential Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-                                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+                                with info_col:
+                                    st.markdown(f"**{row['activity_name']}**")
+                                    st.markdown(f"📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}")
                                     
-                                    col_update, col_delete = st.columns([1, 1])
-
-                                    with col_update:
-                                        if st.form_submit_button("💾 Update Activity", use_container_width=True):
-                                            update_data = {
-                                                "potential_sales": updated_sales,
-                                                "remarks": updated_remarks
-                                            }
-                                            update_activity_in_firestore(db, 'future_activities', doc_id, update_data)
-                                            st.success("Activity updated successfully!")
-                                            st.cache_data.clear()
-                                            time.sleep(1)
-                                            st.rerun()
+                                    status = row['remarks']
+                                    if status == 'Confirmed': color = 'lightgreen'
+                                    elif status == 'Needs Follow-up': color = 'orange'
+                                    elif status == 'Tentative': color = 'lightblue'
+                                    else: color = '#ff4b4b' # Cancelled
+                                    st.markdown(f"Status: <span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
                                 
-                                with col_delete:
-                                    if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                                        delete_from_firestore(db, 'future_activities', doc_id)
-                                        st.warning("Activity deleted.")
-                                        st.cache_data.clear()
-                                        time.sleep(1)
-                                        st.rerun()
+                                with edit_col:
+                                    with st.expander("Edit ✏️", expanded=False):
+                                        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                                        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+
+                                        with st.form(key=f"update_form_{doc_id}", border=False):
+                                            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+                                            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+                                            
+                                            if st.form_submit_button("💾 Update", use_container_width=True):
+                                                update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                                                update_activity_in_firestore(db, 'future_activities', doc_id, update_data)
+                                                st.success("Activity updated!")
+                                                st.cache_data.clear()
+                                                time.sleep(1)
+                                                st.rerun()
+                                            
+                                            if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                                                delete_from_firestore(db, 'future_activities', doc_id)
+                                                st.warning("Activity deleted.")
+                                                st.cache_data.clear()
+                                                time.sleep(1)
+                                                st.rerun()
 
                     else:
                         st.info("No upcoming activities scheduled.")
