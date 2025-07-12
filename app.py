@@ -210,7 +210,6 @@ def load_activities_from_firestore(_db_client, collection_name):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
         
-    # Handle numeric columns including the new potential_sales
     numeric_cols = ['potential_sales']
     for col in numeric_cols:
         if col in df.columns:
@@ -342,14 +341,13 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     db_client.collection(collection_name).add(data)
 
 
-def update_in_firestore(db_client, collection_name, doc_id, data):
+def update_activity_in_firestore(db_client, collection_name, doc_id, data):
+    """A specific function to update an activity document in Firestore."""
     if db_client is None: return
-    if 'date' in data and pd.notna(data['date']):
-        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
-        if col in data and data[col] is not None:
-            data[col] = float(pd.to_numeric(data[col], errors='coerce'))
-    db_client.collection(collection_name).document(doc_id).set(data)
+    # Ensure potential_sales is stored as a float
+    if 'potential_sales' in data:
+        data['potential_sales'] = float(data['potential_sales'])
+    db_client.collection(collection_name).document(doc_id).update(data)
 
 def delete_from_firestore(db_client, collection_name, doc_id):
     if db_client is None: return
@@ -542,7 +540,7 @@ if db:
                             }
                             db.collection('future_activities').add(new_activity)
                             st.success(f"Activity '{activity_name}' saved!")
-                            st.cache_data.clear() # Clear cache to reload data
+                            st.cache_data.clear()
                             time.sleep(1)
                             st.rerun()
                         else:
@@ -561,23 +559,42 @@ if db:
                     upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
                     
                     if not upcoming_df.empty:
-                        st.markdown("---")
                         for index, row in upcoming_df.iterrows():
                             doc_id = row['doc_id']
-                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%B %d, %Y')
+                            expander_title = f"{row['activity_name']} - {activity_date_formatted}"
                             
-                            card_cols = st.columns([0.6, 0.3, 0.1])
-                            with card_cols[0]:
-                                st.markdown(f"**{row['activity_name']}**")
-                                st.markdown(f"<small>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</small>", unsafe_allow_html=True)
-                            with card_cols[1]:
-                                st.info(f"{row['remarks']}")
-                            with card_cols[2]:
-                                if st.button("🗑️", key=f"delete_{doc_id}", help="Delete this activity"):
-                                    delete_from_firestore(db, 'future_activities', doc_id)
-                                    st.cache_data.clear()
-                                    st.rerun()
-                            st.markdown("---")
+                            with st.expander(expander_title):
+                                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                                current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+
+                                with st.form(key=f"update_form_{doc_id}", border=False):
+                                    st.markdown(f"**Edit Activity Details**")
+                                    updated_sales = st.number_input("Potential Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+                                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+                                    
+                                    col_update, col_delete = st.columns([1, 1])
+
+                                    with col_update:
+                                        if st.form_submit_button("💾 Update Activity", use_container_width=True):
+                                            update_data = {
+                                                "potential_sales": updated_sales,
+                                                "remarks": updated_remarks
+                                            }
+                                            update_activity_in_firestore(db, 'future_activities', doc_id, update_data)
+                                            st.success("Activity updated successfully!")
+                                            st.cache_data.clear()
+                                            time.sleep(1)
+                                            st.rerun()
+                                
+                                with col_delete:
+                                    if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                                        delete_from_firestore(db, 'future_activities', doc_id)
+                                        st.warning("Activity deleted.")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
+
                     else:
                         st.info("No upcoming activities scheduled.")
                 else:
