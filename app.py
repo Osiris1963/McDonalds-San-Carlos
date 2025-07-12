@@ -200,7 +200,6 @@ def load_from_firestore(_db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    # --- THIS IS THE FIX ---
     # Only perform date operations if a 'date' column exists
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
@@ -473,22 +472,29 @@ if db:
     initialize_state_firestore(db)
     
     if not st.session_state["authentication_status"]:
-        st.title("Login")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
-            user = get_user(db, username)
-            if user:
-                user_data = user.to_dict()
-                if verify_password(password, user_data['password']):
-                    st.session_state['authentication_status'] = True
-                    st.session_state['username'] = username
-                    st.session_state['access_level'] = user_data['access_level']
-                    st.rerun()
-                else:
-                    st.error("Incorrect password")
-            else:
-                st.error("User not found")
+        # --- THIS IS THE FIX ---
+        # Center the login form to make it narrower
+        st.markdown("<style>div[data-testid='stHorizontalBlock'] { margin-top: 5%; }</style>", unsafe_allow_html=True) # Add some space from the top
+        col1, col2, col3 = st.columns([1.5, 1, 1.5])
+        
+        with col2:
+            with st.container(border=True):
+                st.title("Login")
+                username = st.text_input("Username", key="login_username")
+                password = st.text_input("Password", type="password", key="login_password")
+                if st.button("Login", use_container_width=True):
+                    user = get_user(db, username)
+                    if user:
+                        user_data = user.to_dict()
+                        if verify_password(password, user_data['password']):
+                            st.session_state['authentication_status'] = True
+                            st.session_state['username'] = username
+                            st.session_state['access_level'] = user_data['access_level']
+                            st.rerun()
+                        else:
+                            st.error("Incorrect password")
+                    else:
+                        st.error("User not found")
     
     else:
         with st.sidebar:
