@@ -553,26 +553,44 @@ if db:
                 
                 if st.session_state.show_recent_entries:
                     st.subheader("🗓️ Recent Entries")
-                    with st.container(border=True):
-                        recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
-                        if not recent_df.empty:
-                            display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
-                            cols_to_show = [col for col in display_cols if col in recent_df.columns]
-                            
-                            st.dataframe(
-                                recent_df[cols_to_show],
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                                    "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                                    "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                                    "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
-                                    "weather": "Weather"
-                                }
-                            )
-                        else:
-                            st.info("No recent data to display.")
+                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
+                    
+                    if not recent_df.empty:
+                        for _, row in recent_df.iterrows():
+                            doc_id = row['doc_id']
+                            date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
+                            summary_line = f"**{date_str}** | Sales: ₱{row.get('sales', 0):,.2f} | Customers: {row.get('customers', 0)} | Add-ons: ₱{row.get('add_on_sales', 0):,.2f}"
+                            with st.expander(summary_line):
+                                with st.form(key=f"update_hist_{doc_id}", border=False):
+                                    st.markdown("##### Edit Record")
+                                    cols = st.columns(3)
+                                    updated_sales = cols[0].number_input("Total Sales (₱)", value=float(row.get('sales', 0)), format="%.2f")
+                                    updated_customers = cols[1].number_input("Customers", value=int(row.get('customers', 0)))
+                                    updated_addons = cols[2].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f")
+                                    updated_weather = st.selectbox("Weather", ["Sunny","Cloudy","Rainy","Storm"], index=["Sunny","Cloudy","Rainy","Storm"].index(row.get('weather', 'Sunny')))
+                                    
+                                    update_col, delete_col, _ = st.columns([1,1,3])
+                                    if update_col.form_submit_button("💾 Update", use_container_width=True):
+                                        update_data = {
+                                            "sales": updated_sales,
+                                            "customers": updated_customers,
+                                            "add_on_sales": updated_addons,
+                                            "weather": updated_weather
+                                        }
+                                        update_historical_record_in_firestore(db, doc_id, update_data)
+                                        st.success("Record updated!")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
+
+                                    if delete_col.form_submit_button("🗑️ Delete", use_container_width=True):
+                                        delete_from_firestore(db, 'historical_data', doc_id)
+                                        st.warning("Record deleted.")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
+                    else:
+                        st.info("No recent data to display.")
         
         with tabs[3]:
             def set_view_all(): st.session_state.show_all_activities = True
