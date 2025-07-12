@@ -78,13 +78,15 @@ def apply_custom_styling():
             box-shadow: 0 6px 20px 0 rgba(200, 16, 46, 0.5);
         }
         
-        /* Special case for Refresh button */
-        .stButton:has(button:contains("Refresh Data")) > button {
+        /* Special case for Refresh button and Show Recent Entries */
+        .stButton:has(button:contains("Refresh Data")),
+        .stButton:has(button:contains("Recent Entries")) > button {
              border: 2px solid #c8102e;
              background: transparent;
              color: #c8102e;
         }
-        .stButton:has(button:contains("Refresh Data")) > button:hover {
+        .stButton:has(button:contains("Refresh Data")):hover > button,
+        .stButton:has(button:contains("Recent Entries")):hover > button {
             background: #c8102e;
             color: #ffffff;
         }
@@ -148,7 +150,15 @@ def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
-    defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': True, 'forecast_components': pd.DataFrame(), 'migration_done': False}
+    defaults = {
+        'forecast_df': pd.DataFrame(), 
+        'metrics': {}, 
+        'name': "Store 688", 
+        'authentication_status': True, 
+        'forecast_components': pd.DataFrame(), 
+        'migration_done': False,
+        'show_recent_entries': False
+    }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
@@ -445,27 +455,31 @@ if db:
                         st.rerun()
             
             with display_col:
-                st.subheader("🗓️ Recent Entries")
-                with st.container(border=True):
-                    recent_df = st.session_state.historical_df.copy()
-                    if not recent_df.empty:
-                        recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
-                        display_cols = ['date', 'sales', 'customers', 'weather']
-                        cols_to_show = [col for col in display_cols if col in recent_df.columns]
-                        
-                        st.dataframe(
-                            recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                                "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                                "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                                "weather": "Weather"
-                            }
-                        )
-                    else:
-                        st.info("No recent data to display.")
+                if st.button("🗓️ Show/Hide Recent Entries", use_container_width=True):
+                    st.session_state.show_recent_entries = not st.session_state.show_recent_entries
+                
+                if st.session_state.show_recent_entries:
+                    st.subheader("🗓️ Recent Entries")
+                    with st.container(border=True):
+                        recent_df = st.session_state.historical_df.copy()
+                        if not recent_df.empty:
+                            recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
+                            display_cols = ['date', 'sales', 'customers', 'weather']
+                            cols_to_show = [col for col in display_cols if col in recent_df.columns]
+                            
+                            st.dataframe(
+                                recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                                    "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                                    "customers": st.column_config.NumberColumn("Customers", format="%d"),
+                                    "weather": "Weather"
+                                }
+                            )
+                        else:
+                            st.info("No recent data to display.")
 
         with tabs[3]:
             st.subheader("View Historical Data")
