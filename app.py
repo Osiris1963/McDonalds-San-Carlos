@@ -215,46 +215,60 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         if use_yearly_seasonality:
             base_features.extend(['last_year_sales', 'last_year_customers'])
         
-        features = [col for col in df_rf.columns if col.startswith('weather_') or col in base_features]
-        
         # --- FIX STARTS HERE ---
-        # Ensure there are valid features to train on before fitting the corrector model.
-        # If the 'features' list is empty or the resulting dataframe slice is empty,
-        # skip the corrector model and fall back to the Prophet-only forecast.
-        X = df_rf[features].copy().fillna(0)
-        if X.empty or (X.shape[1] == 0):
+        # 1. Identify all potential features that exist as columns in the historical dataframe
+        available_features = [col for col in df_rf.columns if col.startswith('weather_') or col in base_features]
+        
+        if not available_features:
             st.warning(f"No features available for {corrector_model} model. Falling back to Prophet-only forecast.")
         else:
-            y = df_rf['residuals']
-            
-            if corrector_model == 'Random Forest':
-                model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
-            elif corrector_model == 'XGBoost':
-                model = xgb.XGBRegressor(n_estimators=100, random_state=42, objective='reg:squarederror')
-            
-            model.fit(X, y)
+            X_train = df_rf[available_features].copy()
+            # 2. Drop any column that is entirely empty (all NaN). This removes weather features from the training set if they have no historical data.
+            X_train.dropna(axis=1, how='all', inplace=True)
 
-            if weather_df is not None:
-                future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
+            # 3. Check if any valid feature columns remain after cleaning.
+            if X_train.empty or X_train.shape[1] == 0:
+                st.warning(f"No valid historical feature data found for {corrector_model}. Falling back to Prophet-only forecast.")
             else:
-                future_rf_data = future.copy()
-            
-            if 'weather' in future_rf_data.columns:
-                future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
-            
-            if use_yearly_seasonality:
-                hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
-                hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
-                hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
-                future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
-            
-            for col in X.columns:
-                if col not in future_rf_data.columns: future_rf_data[col] = 0.0
-            
-            future_rf_data.fillna(0, inplace=True)
+                # 4. If we have valid features, proceed with training.
+                final_training_columns = X_train.columns.tolist()
+                st.info(f"Training {corrector_model} with features: {', '.join(final_training_columns)}")
+                
+                X_train.fillna(0, inplace=True)
+                y_train = df_rf['residuals']
+                
+                if corrector_model == 'Random Forest':
+                    model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
+                elif corrector_model == 'XGBoost':
+                    model = xgb.XGBRegressor(n_estimators=100, random_state=42, objective='reg:squarederror')
+                
+                model.fit(X_train, y_train)
 
-            future_residuals = model.predict(future_rf_data[X.columns])
-            prophet_forecast['yhat'] += future_residuals
+                # Prepare future data for prediction
+                if weather_df is not None:
+                    future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
+                else:
+                    future_rf_data = future.copy()
+                
+                if 'weather' in future_rf_data.columns:
+                    future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
+                
+                if use_yearly_seasonality:
+                    hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
+                    hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
+                    hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
+                    future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
+                
+                # Ensure all columns used for training are present in the future data, fill with 0 if not
+                for col in final_training_columns:
+                    if col not in future_rf_data.columns:
+                        future_rf_data[col] = 0.0
+                
+                # Use the exact same columns in the same order for prediction
+                X_future = future_rf_data[final_training_columns].fillna(0)
+
+                future_residuals = model.predict(X_future)
+                prophet_forecast['yhat'] += future_residuals
         # --- FIX ENDS HERE ---
 
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
@@ -390,7 +404,7 @@ if db:
                             st.session_state.metrics = {'customers': cust_m, 'atv': atv_m}
                             st.session_state.forecast_components = cust_c
                             st.session_state.all_holidays = all_h
-                            st.success(f"Forecast generated with {model_option}!")
+                            st.success(f"Forecast generated!")
                         else:
                             st.error("Forecast generation failed.")
 
