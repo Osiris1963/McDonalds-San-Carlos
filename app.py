@@ -402,45 +402,43 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            with st.container(border=True):
-                st.subheader("Database Migration Tool")
-                if not load_from_firestore(db,'historical_data').empty:
-                    st.success("✅ Data source is now Firestore. CSV files are no longer used for forecasting.")
-                else:
-                    st.warning("Action Required: Your data is still in CSV files. Migrate it to the new Firestore database.")
-                    if st.button("Migrate CSV Data to Firestore"):
-                        with st.spinner("Migrating data... This may take a moment."):
-                            try:
-                                for file_name, collection_name in [('sample_historical_data.csv', 'historical_data'), ('sample_future_events.csv', 'future_events')]:
-                                    df_csv = pd.read_csv(file_name)
-                                    if 'date' in df_csv.columns:
-                                        df_csv['date'] = pd.to_datetime(df_csv['date'])
-                                    for _, row in df_csv.iterrows():
-                                        add_to_firestore(db, collection_name, row.to_dict())
-                                    st.write(f"✅ Migrated {collection_name} successfully.")
-                                st.cache_data.clear()
-                                st.success("Migration complete! The app will now use Firestore.")
-                                time.sleep(2)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Migration Failed: {e}")
+            form_col, display_col = st.columns([1, 1])
 
-            st.info("Use the tools below to manage your data in Firestore.")
-            with st.expander("✍️ Add New Daily Record",expanded=True):
-                with st.form("new_record_form",clear_on_submit=True):
-                    c1,c2,c3=st.columns(3);c4,c5=st.columns(2);
-                    with c1:new_date=st.date_input("Date")
-                    with c2:new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
-                    with c3:new_customers=st.number_input("Customer Count",min_value=0)
-                    with c4:new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
-                    with c5:new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                    if st.form_submit_button("✅ Save Record"):
-                        new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
-                        add_to_firestore(db,'historical_data',new_rec)
-                        st.cache_data.clear()
-                        st.success("Record added to Firestore!");
-                        time.sleep(1)
-                        st.rerun()
+            with form_col:
+                with st.expander("✍️ Add New Daily Record",expanded=True):
+                    with st.form("new_record_form",clear_on_submit=True):
+                        new_date=st.date_input("Date")
+                        new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+                        new_customers=st.number_input("Customer Count",min_value=0)
+                        new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
+                        new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                        if st.form_submit_button("✅ Save Record"):
+                            new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
+                            add_to_firestore(db,'historical_data',new_rec)
+                            st.cache_data.clear()
+                            st.success("Record added to Firestore!");
+                            time.sleep(1)
+                            st.rerun()
+            
+            with display_col:
+                st.subheader("🗓️ Recent Entries")
+                recent_df = st.session_state.historical_df.copy()
+                if not recent_df.empty:
+                    recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
+                    st.dataframe(
+                        recent_df.sort_values(by="date", ascending=False).head(7),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                            "customers": st.column_config.NumberColumn("Customers"),
+                        }
+                    )
+                else:
+                    st.info("No recent data to display.")
+
+
         with tabs[3]:
             st.subheader("View Historical Data")
             df=st.session_state.historical_df.copy()
