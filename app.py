@@ -271,7 +271,13 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
-    all_manual_events = pd.concat([events_df.rename(columns={'date':'ds', 'event_name':'holiday'}), recurring_events])
+
+    # --- THIS IS THE FIX ---
+    # 1. Correctly rename 'activity_name' to 'holiday'
+    # 2. Drop any rows with missing dates or holiday names to prevent errors
+    manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
+    all_manual_events = pd.concat([manual_events_renamed, recurring_events])
+    all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
     
     use_yearly_seasonality = len(df_train) >= 365
 
@@ -472,7 +478,6 @@ if db:
     initialize_state_firestore(db)
     
     if not st.session_state["authentication_status"]:
-        # --- THIS IS THE FIX ---
         # Center the login form to make it narrower
         st.markdown("<style>div[data-testid='stHorizontalBlock'] { margin-top: 5%; }</style>", unsafe_allow_html=True) # Add some space from the top
         col1, col2, col3 = st.columns([1.5, 1, 1.5])
