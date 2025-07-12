@@ -227,61 +227,40 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
+    # Create 'base_sales' column to make the function self-contained and robust.
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
+    
     sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0); 
     customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
-def map_weather_code(code):
-    if code in [0, 1]: return "Sunny"
-    if code in [2, 3]: return "Cloudy"
-    if code in [51, 53, 55, 61, 63, 65, 80, 81, 82]: return "Rainy"
-    if code in [95, 96, 99]: return "Storm"
-    return "Cloudy"
-
 @st.cache_data(ttl=3600)
-def get_combined_weather_data(start_date, end_date):
-    """Fetches both historical and forecast weather data and combines them."""
+def get_weather_forecast(days=16):
     try:
-        # Historical API call
-        hist_url = "https://archive-api.open-meteo.com/v1/archive"
-        hist_params = {
-            "latitude": 10.48, "longitude": 123.42,
-            "start_date": start_date.strftime('%Y-%m-%d'),
-            "end_date": date.today().strftime('%Y-%m-%d'),
-            "daily": "weather_code", "timezone": "Asia/Manila"
+        url="https://api.open-meteo.com/v1/forecast"
+        # --- THIS IS THE FIX: Request a more accurate model ---
+        params={
+            "latitude":10.48,
+            "longitude":123.42,
+            "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
+            "timezone":"Asia/Manila",
+            "forecast_days":days,
+            "models": "ecmwf_ifs" # Explicitly request the high-accuracy ECMWF model
         }
-        hist_response = requests.get(hist_url, params=hist_params)
-        hist_response.raise_for_status()
-        hist_data = hist_response.json()
-        hist_df = pd.DataFrame(hist_data['daily'])
-        hist_df.rename(columns={'time': 'date'}, inplace=True)
+        response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
+        df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
+        df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
+        return df
+    except requests.exceptions.RequestException:return None
 
-        # Forecast API call
-        fcst_url = "https://api.open-meteo.com/v1/forecast"
-        fcst_params = {
-            "latitude": 10.48, "longitude": 123.42,
-            "daily": "weather_code", "timezone": "Asia/Manila", "forecast_days": 16
-        }
-        fcst_response = requests.get(fcst_url, params=fcst_params)
-        fcst_response.raise_for_status()
-        fcst_data = fcst_response.json()
-        fcst_df = pd.DataFrame(fcst_data['daily'])
-        fcst_df.rename(columns={'time': 'date'}, inplace=True)
-        
-        # Combine and process
-        combined_df = pd.concat([hist_df, fcst_df], ignore_index=True)
-        combined_df['date'] = pd.to_datetime(combined_df['date'])
-        combined_df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-        combined_df['weather'] = combined_df['weather_code'].apply(map_weather_code)
-        
-        return combined_df[['date', 'weather']]
-    except requests.exceptions.RequestException as e:
-        st.warning(f"Could not fetch weather data: {e}")
-        return pd.DataFrame()
-
+def map_weather_code(code):
+    if code in[0,1]:return"Sunny"
+    if code in[2,3]:return"Cloudy"
+    if code in[51,53,55,61,63,65,80,81,82]:return"Rainy"
+    if code in[95,96,99]:return"Storm"
+    return"Cloudy"
 
 def generate_recurring_local_events(start_date,end_date):
     local_events=[];current_date=start_date
@@ -293,7 +272,7 @@ def generate_recurring_local_events(start_date,end_date):
 
 # --- Core Forecasting Model ---
 @st.cache_resource
-def train_and_forecast_component(historical_df, events_df, weather_df, periods, target_col):
+def train_and_forecast_component(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     
@@ -302,14 +281,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # Merge weather data into the training dataframe
-    df_prophet = df_prophet.merge(weather_df.rename(columns={'date':'ds'}), on='ds', how='left')
-    df_prophet['weather'].fillna('Cloudy', inplace=True) # Fill missing weather with a neutral value
-
-    # One-hot encode weather to use as regressors
-    weather_dummies = pd.get_dummies(df_prophet['weather'], prefix='weather').astype(int)
-    df_prophet = pd.concat([df_prophet, weather_dummies], axis=1)
-
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
@@ -329,31 +300,13 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         changepoint_prior_scale=0.05,
         changepoint_range=0.8
     )
-
-    # Add weather regressors
-    if 'weather_Rainy' in df_prophet.columns:
-        prophet_model.add_regressor('weather_Rainy')
-    if 'weather_Storm' in df_prophet.columns:
-        prophet_model.add_regressor('weather_Storm')
-
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
     future = prophet_model.make_future_dataframe(periods=periods)
-    
-    # Add weather data to the future dataframe for prediction
-    future = future.merge(weather_df.rename(columns={'date':'ds'}), on='ds', how='left')
-    future['weather'].fillna('Cloudy', inplace=True)
-    future_dummies = pd.get_dummies(future['weather'], prefix='weather').astype(int)
-    future = pd.concat([future, future_dummies], axis=1)
-    
-    # Ensure all regressor columns exist in the future dataframe
-    if 'weather_Rainy' not in future.columns: future['weather_Rainy'] = 0
-    if 'weather_Storm' not in future.columns: future['weather_Storm'] = 0
-    
     prophet_forecast = prophet_model.predict(future)
 
-    potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat', 'weather_Rainy', 'weather_Storm']
+    potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
     existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
     forecast_components = prophet_forecast[existing_cols]
 
@@ -424,25 +377,18 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
     if 'weekly' in day_data and pd.notna(day_data['weekly']):
         x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
+    if 'daily' in day_data and pd.notna(day_data['daily']):
+        x_data.append('Time of Day Effect');y_data.append(day_data['daily']);measure_data.append('relative')
     if 'yearly' in day_data and pd.notna(day_data['yearly']):
         x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
     if 'holidays' in day_data and pd.notna(day_data['holidays']):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
         x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
-    # Add weather effects to breakdown
-    if 'weather_Rainy' in day_data and pd.notna(day_data['weather_Rainy']) and day_data['weather_Rainy'] != 0:
-        x_data.append('Rainy Day Effect');y_data.append(day_data['weather_Rainy']);measure_data.append('relative')
-    if 'weather_Storm' in day_data and pd.notna(day_data['weather_Storm']) and day_data['weather_Storm'] != 0:
-        x_data.append('Stormy Day Effect');y_data.append(day_data['weather_Storm']);measure_data.append('relative')
-
     x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
     effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
-    if 'weather_Rainy' in day_data: effects['Rainy Day'] = day_data.get('weather_Rainy', 0)
-    if 'weather_Storm' in day_data: effects['Stormy Day'] = day_data.get('weather_Storm', 0)
-
     significant_effects={k:v for k,v in effects.items()if abs(v)>1}
     summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
     if not significant_effects:
@@ -640,21 +586,20 @@ if db:
                         
                         ev_df = st.session_state.events_df.copy()
                         
-                        # Fetch combined historical and future weather data
-                        start_date = hist_df_with_atv['date'].min()
-                        end_date = hist_df_with_atv['date'].max() + timedelta(days=15)
-                        weather_data = get_combined_weather_data(start_date, end_date)
-
-                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_with_atv, ev_df, weather_data, 15, 'customers')
-                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_with_atv, ev_df, weather_data, 15, 'atv')
+                        cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_with_atv, ev_df, 15, 'customers')
+                        atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_with_atv, ev_df, 15, 'atv')
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
-                            # Merge the weather information for display
-                            combo_f = pd.merge(combo_f, weather_data.rename(columns={'date':'ds'}), on='ds', how='left')
-                            
+                            with st.spinner("🛰️ Fetching live weather..."):
+                                weather_df = get_weather_forecast()
+                            if weather_df is not None:
+                                combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                            else:
+                                combo_f['weather'] = 'Not Available'
+                                
                             st.session_state.forecast_df = combo_f
                             st.session_state.metrics = {'customers': cust_m, 'atv': atv_m}
                             st.session_state.forecast_components = cust_c
