@@ -112,7 +112,8 @@ def apply_custom_styling():
             border: 1px solid #444 !important;
             box-shadow: none;
             border-radius: 10px;
-            background-color: #333333;
+            background-color: #252525;
+            margin-bottom: 0.5rem;
         }
         .st-expander header {
             font-size: 0.9rem;
@@ -120,13 +121,13 @@ def apply_custom_styling():
             color: #d3d3d3;
         }
         
-        /* --- Custom Activity Card Style (Compact) --- */
+        /* --- Custom Activity Card Style (for "All Activities" view) --- */
         .activity-card {
-            background-color: #252525;
+            background-color: #333333;
             border-radius: 10px;
             padding: 0.8rem 1rem;
             margin-bottom: 0.75rem;
-            border: 1px solid #444;
+            border: 1px solid #555;
         }
         .activity-card h3 {
             font-size: 1rem;
@@ -407,30 +408,28 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
-def render_activity_card(row, db_client):
+def render_activity_card(row, db_client, is_compact=False):
     doc_id = row['doc_id']
-    activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
     
-    # Each activity is a self-contained card with an expander inside it.
-    with st.container():
-        st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
-        st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
-        st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
-        
+    if is_compact:
+        # Compact, one-line summary for the main dashboard
+        date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
         status = row['remarks']
-        if status == 'Confirmed': color = '#22C55E' # Green
-        elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
-        elif status == 'Tentative': color = '#38BDF8' # Light Blue
-        else: color = '#EF4444' # Red
-        st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
         
-        with st.expander("Edit / Manage"):
-            status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-            current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
-
-            with st.form(key=f"update_form_{doc_id}", border=False):
-                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-                updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+        if status == 'Confirmed': color = '#22C55E'
+        elif status == 'Needs Follow-up': color = '#F59E0B'
+        elif status == 'Tentative': color = '#38BDF8'
+        else: color = '#EF4444'
+            
+        summary_line = f"**{date_str}** | {row['activity_name']} | <span style='color:{color}; font-weight:600;'>{status}</span>"
+        
+        with st.expander(summary_line):
+            st.markdown(f"**Potential Sales:** ₱{row['potential_sales']:,.2f}")
+            with st.form(key=f"compact_update_form_{doc_id}", border=False):
+                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                current_status_index = status_options.index(status) if status in status_options else 0
+                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"compact_sales_{doc_id}")
+                updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"compact_remarks_{doc_id}")
                 
                 update_col, delete_col = st.columns(2)
                 with update_col:
@@ -448,7 +447,45 @@ def render_activity_card(row, db_client):
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        # Full card view for the "All Activities" page
+        activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+        with st.container():
+            st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
+            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+            
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E'
+            elif status == 'Needs Follow-up': color = '#F59E0B'
+            elif status == 'Tentative': color = '#38BDF8'
+            else: color = '#EF4444'
+            st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
+            
+            with st.expander("Edit / Manage"):
+                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                current_status_index = status_options.index(status) if status in status_options else 0
+                with st.form(key=f"full_update_form_{doc_id}", border=False):
+                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"full_sales_{doc_id}")
+                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"full_remarks_{doc_id}")
+                    
+                    update_col, delete_col = st.columns(2)
+                    with update_col:
+                        if st.form_submit_button("💾 Update", use_container_width=True):
+                            update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                            update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                            st.success("Activity updated!")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                    with delete_col:
+                        if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                            delete_from_firestore(db_client, 'future_activities', doc_id)
+                            st.warning("Activity deleted.")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -595,7 +632,6 @@ if db:
                     st.info("No upcoming activities scheduled.")
                 else:
                     all_upcoming_df['month_year'] = all_upcoming_df['date'].dt.strftime('%B %Y')
-                    # Get unique months and sort them chronologically
                     sorted_months_df = all_upcoming_df.sort_values('date')
                     month_tabs_list = sorted_months_df['month_year'].unique().tolist()
                     
@@ -606,7 +642,7 @@ if db:
                                 month_name = month_tabs_list[i]
                                 month_df = sorted_months_df[sorted_months_df['month_year'] == month_name]
                                 for _, row in month_df.iterrows():
-                                    render_activity_card(row, db)
+                                    render_activity_card(row, db, is_compact=False)
 
             else:
                 # --- DEFAULT OVERVIEW ---
@@ -656,7 +692,7 @@ if db:
                         st.info("No upcoming activities scheduled.")
                     else:
                         for _, row in upcoming_df.iterrows():
-                            render_activity_card(row, db)
+                            render_activity_card(row, db, is_compact=True)
 
 
         with tabs[4]:
