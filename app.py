@@ -268,19 +268,24 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
+    # --- THIS IS THE FIX: LOGISTIC GROWTH ---
+    # 1. Calculate a realistic "cap" for the forecast.
+    cap = df_prophet['y'].max() * 1.15 # Max historical value + 15% buffer
+    df_prophet['cap'] = cap
+
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
 
-    # Correctly rename 'activity_name' to 'holiday' for the model
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
     
     use_yearly_seasonality = len(df_train) >= 365
 
+    # 2. Change the growth model from 'linear' to 'logistic'
     prophet_model = Prophet(
-        growth='linear',
+        growth='logistic', # Use logistic growth
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
@@ -291,7 +296,10 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
+    # 3. The future dataframe must also contain the 'cap' column
     future = prophet_model.make_future_dataframe(periods=periods)
+    future['cap'] = cap
+    
     prophet_forecast = prophet_model.predict(future)
 
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
@@ -469,7 +477,6 @@ def render_activity_card(row, db_client, view_type='compact_list', access_level=
                                 time.sleep(1)
                                 st.rerun()
 
-# --- NEW HELPER FUNCTION for Historical Data Tab ---
 def render_historical_record(row, db_client):
     """Renders a single historical record with an editable form inside an expander."""
     date_str = row['date'].strftime('%B %d, %Y')
@@ -807,7 +814,7 @@ if db:
                         if filtered_df.empty:
                             st.info("No data for the selected month and year.")
                         else:
-                            # --- THIS IS THE NEW LAYOUT LOGIC ---
+                            # --- Two-Column Layout Logic ---
                             df_first_half = filtered_df[filtered_df['date'].dt.day <= 15]
                             df_second_half = filtered_df[filtered_df['date'].dt.day > 15]
 
