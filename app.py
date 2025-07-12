@@ -469,6 +469,53 @@ def render_activity_card(row, db_client, view_type='compact_list', access_level=
                                 time.sleep(1)
                                 st.rerun()
 
+# --- NEW HELPER FUNCTION for Historical Data Tab ---
+def render_historical_record(row, db_client):
+    """Renders a single historical record with an editable form inside an expander."""
+    date_str = row['date'].strftime('%B %d, %Y')
+    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    
+    with st.expander(expander_title):
+        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
+        st.write(f"**Weather:** {row.get('weather', 'N/A')}")
+        
+        if st.session_state['access_level'] <= 2:
+            with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+                st.write("---")
+                st.markdown("**Edit Record**")
+                
+                edit_cols = st.columns(2)
+                updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), format="%.2f", key=f"sales_{row['doc_id']}")
+                updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
+                
+                edit_cols2 = st.columns(2)
+                updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
+                
+                weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
+                current_weather_index = weather_options.index(row['weather']) if row.get('weather') in weather_options else 0
+                updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+                
+                btn_cols = st.columns(2)
+                if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
+                    update_data = {
+                        'sales': updated_sales,
+                        'customers': updated_customers,
+                        'add_on_sales': updated_addons,
+                        'weather': updated_weather
+                    }
+                    update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
+                    st.success(f"Record for {date_str} updated!")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+
+                if btn_cols[1].form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
+                    delete_from_firestore(db_client, 'historical_data', row['doc_id'])
+                    st.warning(f"Record for {date_str} deleted.")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -741,8 +788,8 @@ if db:
                 all_years = sorted(df['date'].dt.year.unique(), reverse=True)
 
                 if all_years:
-                    col1, col2 = st.columns(2)
-                    with col1:
+                    filter_cols = st.columns(2)
+                    with filter_cols[0]:
                         selected_year = st.selectbox("Select Year to View:", options=all_years)
 
                     df_year_filtered = df[df['date'].dt.year == selected_year]
@@ -750,60 +797,33 @@ if db:
                     all_months = sorted(df_year_filtered['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
 
                     if all_months:
-                        with col2:
+                        with filter_cols[1]:
                             selected_month_str = st.selectbox("Select Month to View:", options=all_months)
 
                         selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
 
-                        filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=True)
+                        filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy()
 
                         if filtered_df.empty:
                             st.info("No data for the selected month and year.")
                         else:
-                            for index, row in filtered_df.iterrows():
-                                date_str = row['date'].strftime('%B %d, %Y')
-                                expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
-                                
-                                with st.expander(expander_title):
-                                    st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
-                                    st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-                                    
-                                    if st.session_state['access_level'] <= 2:
-                                        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
-                                            st.write("---")
-                                            st.markdown("**Edit Record**")
-                                            
-                                            edit_cols = st.columns(2)
-                                            updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), format="%.2f", key=f"sales_{row['doc_id']}")
-                                            updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
-                                            
-                                            edit_cols2 = st.columns(2)
-                                            updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
-                                            
-                                            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
-                                            current_weather_index = weather_options.index(row['weather']) if row.get('weather') in weather_options else 0
-                                            updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
-                                            
-                                            btn_cols = st.columns(2)
-                                            if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
-                                                update_data = {
-                                                    'sales': updated_sales,
-                                                    'customers': updated_customers,
-                                                    'add_on_sales': updated_addons,
-                                                    'weather': updated_weather
-                                                }
-                                                update_historical_record_in_firestore(db, row['doc_id'], update_data)
-                                                st.success(f"Record for {date_str} updated!")
-                                                st.cache_data.clear()
-                                                time.sleep(1)
-                                                st.rerun()
+                            # --- THIS IS THE NEW LAYOUT LOGIC ---
+                            df_first_half = filtered_df[filtered_df['date'].dt.day <= 15]
+                            df_second_half = filtered_df[filtered_df['date'].dt.day > 15]
 
-                                            if btn_cols[1].form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
-                                                delete_from_firestore(db, 'historical_data', row['doc_id'])
-                                                st.warning(f"Record for {date_str} deleted.")
-                                                st.cache_data.clear()
-                                                time.sleep(1)
-                                                st.rerun()
+                            col1, col2 = st.columns(2)
+
+                            with col1:
+                                st.markdown("##### Days 1-15")
+                                st.markdown("---")
+                                for index, row in df_first_half.iterrows():
+                                    render_historical_record(row, db)
+                            
+                            with col2:
+                                st.markdown("##### Days 16-31")
+                                st.markdown("---")
+                                for index, row in df_second_half.iterrows():
+                                    render_historical_record(row, db)
                     else:
                         st.write(f"No data available for the year {selected_year}.")
                 else:
