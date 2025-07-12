@@ -436,7 +436,7 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            form_col, display_col = st.columns([1, 1], gap="large")
+            form_col, display_col = st.columns([2, 3], gap="large")
 
             with form_col:
                 st.subheader("✍️ Add New Daily Record")
