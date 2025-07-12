@@ -116,7 +116,7 @@ def apply_custom_styling():
             margin-bottom: 0.5rem;
         }
         .st-expander header {
-            font-size: 0.9rem;
+            font-size: 0.9rem; /* Compact font for dashboard expander */
             font-weight: 600;
             color: #d3d3d3;
         }
@@ -414,17 +414,17 @@ def render_activity_card(row, db_client, is_compact=False):
     if is_compact:
         # Compact, one-line summary for the main dashboard
         date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
-        status = row['remarks']
-        
-        if status == 'Confirmed': color = '#22C55E'
-        elif status == 'Needs Follow-up': color = '#F59E0B'
-        elif status == 'Tentative': color = '#38BDF8'
-        else: color = '#EF4444'
-            
-        summary_line = f"**{date_str}** | {row['activity_name']} | <span style='color:{color}; font-weight:600;'>{status}</span>"
+        summary_line = f"**{date_str}** | {row['activity_name']}"
         
         with st.expander(summary_line):
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E'
+            elif status == 'Needs Follow-up': color = '#F59E0B'
+            elif status == 'Tentative': color = '#38BDF8'
+            else: color = '#EF4444'
+            st.markdown(f"**Status:** <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
             st.markdown(f"**Potential Sales:** ₱{row['potential_sales']:,.2f}")
+
             with st.form(key=f"compact_update_form_{doc_id}", border=False):
                 status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
                 current_status_index = status_options.index(status) if status in status_options else 0
