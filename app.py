@@ -5,6 +5,7 @@ import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
+from xgboost.callback import EarlyStopping
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -364,24 +365,24 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
         
         model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50, verbose=False)
+        # --- THIS IS THE FIX: Use callbacks for early stopping ---
+        early_stopping_callback = EarlyStopping(rounds=50, save_best=True)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], callbacks=[early_stopping_callback], verbose=False)
+        
         preds = model.predict(X_test)
         mae = mean_absolute_error(y_test, preds)
         return mae
 
     study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50) # Run 50 trials to find best params
+    study.optimize(objective, n_trials=50) 
 
-    # Train final model with best parameters
     best_params = study.best_params
     final_model = xgb.XGBRegressor(**best_params)
-    final_model.fit(X, y) # Train on all data
+    final_model.fit(X, y)
 
-    # Predict on future dates
     X_future = future_df_featured[features]
     future_predictions = final_model.predict(X_future)
     
-    # Combine historical and future predictions
     full_prediction_df = df_featured[['date']].copy()
     full_prediction_df['yhat'] = final_model.predict(X)
     
