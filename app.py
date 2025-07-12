@@ -227,7 +227,9 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
-    sales = pd.to_numeric(df['sales'], errors='coerce').fillna(0); customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
+    # Use 'base_sales' for a more accurate ATV of regular business
+    sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0); 
+    customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
@@ -278,21 +280,20 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     
     use_yearly_seasonality = len(df_train) >= 365
 
-    # --- REVERTED TO LINEAR GROWTH ---
+    # --- THIS IS THE FIX: More flexible trend ---
     prophet_model = Prophet(
-        growth='linear', # Using linear growth for testing
+        growth='linear',
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.01,
+        changepoint_prior_scale=0.05,  # Increased from 0.01 to make trend more flexible
         changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     
     future = prophet_model.make_future_dataframe(periods=periods)
-    
     prophet_forecast = prophet_model.predict(future)
 
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
@@ -563,10 +564,14 @@ if db:
                 else:
                     with st.spinner("🧠 Building forecast model..."):
                         base_df = st.session_state.historical_df.copy()
-                        cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='sales')
+                        
+                        # --- THIS IS THE FIX: Analyze 'base_sales' ---
+                        base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
+                        
+                        cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
                         
                         if removed_count > 0:
-                            st.warning(f"Removed {removed_count} outlier day(s) with sales over ₱{upper_bound:,.2f}.")
+                            st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         
