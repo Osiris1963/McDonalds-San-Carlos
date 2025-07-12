@@ -208,11 +208,9 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         if weather_df is not None:
             df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
         
-        # --- FIX STARTS HERE ---
         # Check if 'weather' column exists before creating dummies to prevent KeyError
         if 'weather' in df_rf.columns:
             df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
-        # --- FIX ENDS HERE ---
         
         base_features = ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']
         if use_yearly_seasonality:
@@ -363,16 +361,20 @@ if db:
                             st.sidebar.info("Year-over-year data is active.")
                             hist_df_final = engineer_last_year_features(hist_with_trends)
                         else:
+                            st.sidebar.warning("Less than 1 year of data found. Year-over-year features will not be used.")
                             hist_df_final = hist_with_trends
                         
                         ev_df = st.session_state.events_df.copy()
                         
+                        # --- FIX STARTS HERE ---
+                        # Allow user to select any model. The training function is robust enough
+                        # to include/exclude yearly features based on the data it receives.
                         corrector_choice = "None"
-                        if model_option != "Prophet Only":
-                            if not use_last_year_features:
-                                st.warning(f"'{model_option}' requires 1 year of data. Defaulting to 'Prophet Only'.")
-                            else:
-                                corrector_choice = model_option.split(" + ")[1]
+                        if model_option == "Prophet + Random Forest":
+                            corrector_choice = "Random Forest"
+                        elif model_option == "Prophet + XGBoost":
+                            corrector_choice = "XGBoost"
+                        # --- FIX ENDS HERE ---
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
