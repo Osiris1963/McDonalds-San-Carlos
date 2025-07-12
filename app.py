@@ -599,12 +599,13 @@ if db:
                             st.info("No recent data to display.")
         
         with tabs[3]:
+            def set_view_all(): st.session_state.show_all_activities = True
+            def set_overview(): st.session_state.show_all_activities = False
+
             if st.session_state.get('show_all_activities'):
                 # --- ALL ACTIVITIES VIEW ---
                 st.markdown("#### All Upcoming Activities")
-                if st.button("⬅️ Back to Overview"):
-                    st.session_state.show_all_activities = False
-                    st.rerun()
+                st.button("⬅️ Back to Overview", on_click=set_overview)
                 
                 activities_df = load_activities_from_firestore(db, 'future_activities')
                 all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
@@ -675,12 +676,8 @@ if db:
                     st.markdown("##### Next 10 Upcoming Activities")
                     
                     btn_cols = st.columns(2)
-                    if btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True):
-                        st.cache_data.clear()
-                        st.rerun()
-                    if btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True):
-                        st.session_state.show_all_activities = True
-                        st.rerun()
+                    btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True, on_click=st.rerun)
+                    btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
                     
                     st.markdown("---",)
                     activities_df = load_activities_from_firestore(db, 'future_activities')
