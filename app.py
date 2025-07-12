@@ -151,7 +151,7 @@ def init_firestore():
 def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
-    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
+    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
     defaults = {
         'forecast_df': pd.DataFrame(), 
         'metrics': {}, 
@@ -187,7 +187,6 @@ def load_from_firestore(_db_client, collection_name):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
     
-    # Process all potential numeric columns
     numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
