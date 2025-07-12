@@ -46,26 +46,26 @@ def apply_custom_styling():
         .stButton > button {
             border: none;
             border-radius: 12px;
-            color: #1e1e1e;
+            color: #ffffff; /* White text on red button */
             font-weight: 600;
-            background: linear-gradient(45deg, #ffc72c, #ffd24d); /* Yellow gradient */
+            background: linear-gradient(45deg, #c8102e, #e01a37); /* Red gradient */
             transition: all 0.2s ease-in-out;
-            box-shadow: 0 4px 15px 0 rgba(255, 199, 44, 0.3);
+            box-shadow: 0 4px 15px 0 rgba(200, 16, 46, 0.4); /* Red glow */
         }
         .stButton > button:hover {
             transform: translateY(-2px);
-            box-shadow: 0 6px 20px 0 rgba(255, 199, 44, 0.4);
+            box-shadow: 0 6px 20px 0 rgba(200, 16, 46, 0.5);
         }
         
         /* Special case for Refresh button */
         .stButton:has(button:contains("Refresh Data")) > button {
-             border: 2px solid #ffc72c;
+             border: 2px solid #c8102e;
              background: transparent;
-             color: #ffc72c;
+             color: #c8102e;
         }
         .stButton:has(button:contains("Refresh Data")) > button:hover {
-            background: #ffc72c;
-            color: #1e1e1e;
+            background: #c8102e;
+            color: #ffffff;
         }
 
 
@@ -77,8 +77,8 @@ def apply_custom_styling():
             padding: 10px 15px;
         }
         .stTabs [data-baseweb="tab"][aria-selected="true"] {
-            background-color: #ffc72c;
-            color: #1e1e1e;
+            background-color: #c8102e; /* Use classic red for selected tab */
+            color: #ffffff;
             font-weight: 600;
         }
 
