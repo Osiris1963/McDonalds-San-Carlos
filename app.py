@@ -374,7 +374,7 @@ if db:
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
             st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
         
-        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
+        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📜 Historical Data"])
         
         with tabs[0]:
             if not st.session_state.forecast_df.empty:
@@ -441,13 +441,14 @@ if db:
                         st.success("Record added to Firestore!");
                         time.sleep(1)
                         st.rerun()
-            with st.expander("📅 Manage Historical Data"):
-                df=st.session_state.historical_df.copy()
-                if not df.empty and'date'in df.columns:
-                    df['date']=pd.to_datetime(df['date'],errors='coerce');df.dropna(subset=['date'],inplace=True)
-                    month_periods=df['date'].dt.to_period('M').unique();month_options=sorted([p.strftime('%B %Y')for p in month_periods],reverse=True)
-                    if month_options:
-                        selected_month_str=st.selectbox("Select Month",options=month_options);selected_period=pd.Period(selected_month_str);filtered_df=df[df['date'].dt.to_period('M')==selected_period].copy().reset_index(drop=True)
-                        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
-                    else:st.write("No historical data to display.")
+        with tabs[3]:
+            st.subheader("View Historical Data")
+            df=st.session_state.historical_df.copy()
+            if not df.empty and'date'in df.columns:
+                df['date']=pd.to_datetime(df['date'],errors='coerce');df.dropna(subset=['date'],inplace=True)
+                month_periods=df['date'].dt.to_period('M').unique();month_options=sorted([p.strftime('%B %Y')for p in month_periods],reverse=True)
+                if month_options:
+                    selected_month_str=st.selectbox("Select Month to View:",options=month_options);selected_period=pd.Period(selected_month_str);filtered_df=df[df['date'].dt.to_period('M')==selected_period].copy().reset_index(drop=True)
+                    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                 else:st.write("No historical data to display.")
+            else:st.write("No historical data to display.")
