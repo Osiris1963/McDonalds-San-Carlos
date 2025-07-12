@@ -112,11 +112,11 @@ def apply_custom_styling():
             box-shadow: none;
             border-radius: 10px;
             background-color: #252525;
-            margin-bottom: 0.5rem;
+            margin-bottom: 1rem; /* Space between month expanders */
         }
         .st-expander header {
-            font-size: 1rem;
-            font-weight: 600;
+            font-size: 1.1rem; /* Larger font for month */
+            font-weight: 700;
             color: #ffffff;
         }
         
@@ -138,17 +138,6 @@ def apply_custom_styling():
             font-size: 0.85rem;
             color: #d3d3d3;
             margin-bottom: 0.25rem;
-        }
-        
-        /* --- Month Subheaders --- */
-        .stSubheader {
-            font-size: 1.25rem;
-            font-weight: 700;
-            color: #ffffff;
-            border-bottom: 2px solid #c8102e;
-            padding-bottom: 0.5rem;
-            margin-top: 2rem;
-            margin-bottom: 1.5rem;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -466,17 +455,17 @@ def display_activities(df, db_client, group_by_month=False):
         return
 
     if group_by_month:
-        df['month_year'] = df['date'].dt.strftime('%B %Y')
+        df['month_year'] = df['date'].dt.to_period('M')
         df_sorted = df.sort_values('date')
-        
-        current_month_year = ""
-        for index, row in df_sorted.iterrows():
-            month_year = row['month_year']
-            if month_year != current_month_year:
-                current_month_year = month_year
-                st.subheader(month_year)
-            render_activity_card(row, db_client)
+
+        for month_period, month_group in df_sorted.groupby('month_year'):
+            month_name = month_period.strftime('%B %Y')
+            with st.expander(month_name):
+                # Inside the month expander, just list the activities
+                for _, row in month_group.iterrows():
+                    render_activity_card(row, db_client)
     else:
+        # For the main dashboard view
         for _, row in df.iterrows():
             render_activity_card(row, db_client)
 
