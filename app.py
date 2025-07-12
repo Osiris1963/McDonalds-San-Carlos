@@ -360,14 +360,15 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'max_depth': trial.suggest_int('max_depth', 3, 10),
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'random_state': 42
+            'random_state': 42,
+            # --- THIS IS THE FIX: Add early_stopping_rounds to the constructor ---
+            'early_stopping_rounds': 50
         }
         
-        # --- THIS IS THE FIX: Use early_stopping_rounds in the fit method ---
         model = xgb.XGBRegressor(**params)
+        # Pass the evaluation set directly to fit
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
-                  early_stopping_rounds=50, 
                   verbose=False)
         
         preds = model.predict(X_test)
@@ -378,6 +379,9 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     study.optimize(objective, n_trials=50) 
 
     best_params = study.best_params
+    # We need to remove our custom parameter before creating the final model
+    best_params.pop('early_stopping_rounds', None)
+    
     final_model = xgb.XGBRegressor(**best_params)
     final_model.fit(X, y)
 
