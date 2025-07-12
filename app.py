@@ -343,11 +343,12 @@ def plot_forecast_dashboard(df):
     fig.add_trace(go.Scatter(x=df['ds'],y=df['forecast_customers'],mode='lines',name='Customer Forecast',yaxis='y2',line=dict(color='#FFC72C', dash='dot')))
     fig.update_layout(
         title={'text': '15-Day Sales & Customer Forecast', 'y':0.9, 'x':0.5, 'xanchor': 'center', 'yanchor': 'top', 'font': {'size': 20, 'color': 'white'}},
-        xaxis_title='Date', yaxis=dict(title='Predicted Sales (₱)',color='#0078F2'),
+        xaxis_title='Date',
+        yaxis=dict(title='Predicted Sales (₱)',color='#0078F2', gridcolor='#2D2D2D'),
         yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#FFC72C'),
         legend=dict(x=0.01,y=0.99,orientation='h', bgcolor='rgba(0,0,0,0.5)'), height=500,
         paper_bgcolor='#1E1E1E', plot_bgcolor='#1E1E1E', font_color='#E0E0E0',
-        xaxis=dict(gridcolor='#2D2D2D'), yaxis=dict(gridcolor='#2D2D2D')
+        xaxis=dict(gridcolor='#2D2D2D')
     )
     return fig
 
