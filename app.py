@@ -98,8 +98,9 @@ def apply_custom_styling():
             border-radius: 8px;
             background-color: transparent;
             color: #d3d3d3;
-            padding: 10px 15px;
+            padding: 8px 14px; /* Compact padding */
             font-weight: 600;
+            font-size: 0.9rem; /* Smaller font for tabs */
         }
         .stTabs [data-baseweb="tab"][aria-selected="true"] {
             background-color: #c8102e;
@@ -111,7 +112,7 @@ def apply_custom_styling():
             border: 1px solid #444 !important;
             box-shadow: none;
             border-radius: 10px;
-            background-color: #333333; /* Slightly lighter than card for depth */
+            background-color: #333333;
         }
         .st-expander header {
             font-size: 0.9rem;
@@ -449,28 +450,6 @@ def render_activity_card(row, db_client):
                         st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
-
-def display_activities(df, db_client, group_by_month=False):
-    if df.empty:
-        st.info("No upcoming activities scheduled.")
-        return
-
-    if group_by_month:
-        df['month_year'] = df['date'].dt.strftime('%B %Y')
-        df_sorted = df.sort_values('date')
-        
-        current_month_year = ""
-        for index, row in df_sorted.iterrows():
-            month_year = row['month_year']
-            if month_year != current_month_year:
-                current_month_year = month_year
-                st.subheader(month_year)
-            render_activity_card(row, db_client)
-    else:
-        for _, row in df.iterrows():
-            render_activity_card(row, db_client)
-
-
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -611,7 +590,23 @@ if db:
                 
                 activities_df = load_activities_from_firestore(db, 'future_activities')
                 all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
-                display_activities(all_upcoming_df, db, group_by_month=True)
+                
+                if all_upcoming_df.empty:
+                    st.info("No upcoming activities scheduled.")
+                else:
+                    all_upcoming_df['month_year'] = all_upcoming_df['date'].dt.strftime('%B %Y')
+                    # Get unique months and sort them chronologically
+                    sorted_months_df = all_upcoming_df.sort_values('date')
+                    month_tabs_list = sorted_months_df['month_year'].unique().tolist()
+                    
+                    if month_tabs_list:
+                        month_tabs = st.tabs(month_tabs_list)
+                        for i, tab in enumerate(month_tabs):
+                            with tab:
+                                month_name = month_tabs_list[i]
+                                month_df = sorted_months_df[sorted_months_df['month_year'] == month_name]
+                                for _, row in month_df.iterrows():
+                                    render_activity_card(row, db)
 
             else:
                 # --- DEFAULT OVERVIEW ---
@@ -656,7 +651,13 @@ if db:
                     st.markdown("---",)
                     activities_df = load_activities_from_firestore(db, 'future_activities')
                     upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
-                    display_activities(upcoming_df, db)
+                    
+                    if upcoming_df.empty:
+                        st.info("No upcoming activities scheduled.")
+                    else:
+                        for _, row in upcoming_df.iterrows():
+                            render_activity_card(row, db)
+
 
         with tabs[4]:
             st.subheader("View Historical Data")
