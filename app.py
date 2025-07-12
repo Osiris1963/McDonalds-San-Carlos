@@ -556,9 +556,9 @@ if db:
                     
                     if not recent_df.empty:
                         records = recent_df.to_dict('records')
-                        for i in range(0, len(records), 5):
-                            cols = st.columns(5)
-                            row_records = records[i:i+5]
+                        for i in range(0, len(records), 3):
+                            cols = st.columns(3)
+                            row_records = records[i:i+3]
                             for j, record in enumerate(row_records):
                                 with cols[j]:
                                     with st.container(border=True):
