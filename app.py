@@ -157,7 +157,8 @@ def initialize_state_firestore(db_client):
         'authentication_status': True, 
         'forecast_components': pd.DataFrame(), 
         'migration_done': False,
-        'show_recent_entries': False
+        'show_recent_entries': False,
+        'show_all_activities': False
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -386,6 +387,52 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
+def display_activities(df, db_client):
+    if not df.empty:
+        for index, row in df.iterrows():
+            doc_id = row['doc_id']
+            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+            
+            with st.container(border=True):
+                info_col, edit_col = st.columns([4, 1])
+
+                with info_col:
+                    st.markdown(f"**{row['activity_name']}**")
+                    st.markdown(f"📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}")
+                    
+                    status = row['remarks']
+                    if status == 'Confirmed': color = 'lightgreen'
+                    elif status == 'Needs Follow-up': color = 'orange'
+                    elif status == 'Tentative': color = 'lightblue'
+                    else: color = '#ff4b4b' # Cancelled
+                    st.markdown(f"Status: <span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
+                
+                with edit_col:
+                    with st.expander("Edit ✏️", expanded=False):
+                        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+
+                        with st.form(key=f"update_form_{doc_id}", border=False):
+                            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+                            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+                            
+                            if st.form_submit_button("💾 Update", use_container_width=True):
+                                update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                                update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                                st.success("Activity updated!")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+                            
+                            if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                                delete_from_firestore(db_client, 'future_activities', doc_id)
+                                st.warning("Activity deleted.")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+    else:
+        st.info("No upcoming activities scheduled.")
+
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
@@ -518,94 +565,61 @@ if db:
         
         with tabs[3]:
             st.subheader("📅 Manage Future Activities & Events")
-            
-            col1, col2 = st.columns([2, 3], gap="large")
 
-            with col1:
-                st.markdown("##### Add New Activity")
-                with st.form("new_activity_form", clear_on_submit=True, border=False):
-                    activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
-                    activity_date = st.date_input("Date of Activity", min_value=date.today())
-                    potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
-                    remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
-                    
-                    submitted = st.form_submit_button("✅ Save Activity")
-                    if submitted:
-                        if activity_name and activity_date:
-                            new_activity = {
-                                "activity_name": activity_name,
-                                "date": pd.to_datetime(activity_date).to_pydatetime(),
-                                "potential_sales": float(potential_sales),
-                                "remarks": remarks
-                            }
-                            db.collection('future_activities').add(new_activity)
-                            st.success(f"Activity '{activity_name}' saved!")
-                            st.cache_data.clear()
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.warning("Activity name and date are required.")
-
-            with col2:
-                st.markdown("##### Upcoming Scheduled Activities")
-                
-                if st.button("🔄 Refresh List", key='refresh_activities'):
-                    st.cache_data.clear()
+            if st.session_state.get('show_all_activities'):
+                # --- ALL ACTIVITIES VIEW ---
+                st.markdown("#### All Upcoming Activities")
+                if st.button("⬅️ Back to Overview"):
+                    st.session_state.show_all_activities = False
                     st.rerun()
-
+                
                 activities_df = load_activities_from_firestore(db, 'future_activities')
+                all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+                display_activities(all_upcoming_df, db)
 
-                if not activities_df.empty:
-                    # Filter for today and future dates, then take the top 15
-                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(15)
+            else:
+                # --- DEFAULT OVERVIEW ---
+                col1, col2 = st.columns([1, 2], gap="large")
+
+                with col1:
+                    st.markdown("##### Add New Activity")
+                    with st.form("new_activity_form", clear_on_submit=True, border=False):
+                        activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
+                        activity_date = st.date_input("Date of Activity", min_value=date.today())
+                        potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
+                        remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
+                        
+                        submitted = st.form_submit_button("✅ Save Activity")
+                        if submitted:
+                            if activity_name and activity_date:
+                                new_activity = {
+                                    "activity_name": activity_name,
+                                    "date": pd.to_datetime(activity_date).to_pydatetime(),
+                                    "potential_sales": float(potential_sales),
+                                    "remarks": remarks
+                                }
+                                db.collection('future_activities').add(new_activity)
+                                st.success(f"Activity '{activity_name}' saved!")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.warning("Activity name and date are required.")
+
+                with col2:
+                    st.markdown("##### Next 15 Upcoming Activities")
                     
-                    if not upcoming_df.empty:
-                        for index, row in upcoming_df.iterrows():
-                            doc_id = row['doc_id']
-                            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
-                            
-                            with st.container(border=True):
-                                info_col, edit_col = st.columns([4, 1])
-
-                                with info_col:
-                                    st.markdown(f"**{row['activity_name']}**")
-                                    st.markdown(f"📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}")
-                                    
-                                    status = row['remarks']
-                                    if status == 'Confirmed': color = 'lightgreen'
-                                    elif status == 'Needs Follow-up': color = 'orange'
-                                    elif status == 'Tentative': color = 'lightblue'
-                                    else: color = '#ff4b4b' # Cancelled
-                                    st.markdown(f"Status: <span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
-                                
-                                with edit_col:
-                                    with st.expander("Edit ✏️", expanded=False):
-                                        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                                        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
-
-                                        with st.form(key=f"update_form_{doc_id}", border=False):
-                                            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-                                            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
-                                            
-                                            if st.form_submit_button("💾 Update", use_container_width=True):
-                                                update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                                                update_activity_in_firestore(db, 'future_activities', doc_id, update_data)
-                                                st.success("Activity updated!")
-                                                st.cache_data.clear()
-                                                time.sleep(1)
-                                                st.rerun()
-                                            
-                                            if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                                                delete_from_firestore(db, 'future_activities', doc_id)
-                                                st.warning("Activity deleted.")
-                                                st.cache_data.clear()
-                                                time.sleep(1)
-                                                st.rerun()
-
-                    else:
-                        st.info("No upcoming activities scheduled.")
-                else:
-                    st.info("No activities have been added yet.")
+                    btn_cols = st.columns(2)
+                    if btn_cols[0].button("🔄 Refresh List", key='refresh_activities'):
+                        st.cache_data.clear()
+                        st.rerun()
+                    if btn_cols[1].button("📂 View All Upcoming Activities"):
+                        st.session_state.show_all_activities = True
+                        st.rerun()
+                    
+                    activities_df = load_activities_from_firestore(db, 'future_activities')
+                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(15)
+                    display_activities(upcoming_df, db)
 
         with tabs[4]:
             st.subheader("View Historical Data")
