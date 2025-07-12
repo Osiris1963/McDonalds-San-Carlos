@@ -200,19 +200,20 @@ def load_from_firestore(_db_client, collection_name):
     
     df = pd.DataFrame(records)
     
+    # --- THIS IS THE FIX ---
+    # Only perform date operations if a 'date' column exists
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    
+        if not df.empty:
+            df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+
     numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    if not df.empty:
-        df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
         
     return df
 
