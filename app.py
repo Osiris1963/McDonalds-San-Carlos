@@ -139,6 +139,17 @@ def apply_custom_styling():
             color: #d3d3d3;
             margin-bottom: 0.25rem;
         }
+        
+        /* --- Month Subheaders --- */
+        .stSubheader {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #ffffff;
+            border-bottom: 2px solid #c8102e;
+            padding-bottom: 0.5rem;
+            margin-top: 2rem;
+            margin-bottom: 1.5rem;
+        }
     </style>
     """, unsafe_allow_html=True)
 
@@ -455,19 +466,16 @@ def display_activities(df, db_client, group_by_month=False):
         return
 
     if group_by_month:
-        df['month_year'] = df['date'].dt.to_period('M')
+        df['month_year'] = df['date'].dt.strftime('%B %Y')
         df_sorted = df.sort_values('date')
-
-        for month_period, month_group in df_sorted.groupby('month_year'):
-            month_name = month_period.strftime('%B %Y')
-            with st.expander(month_name):
-                month_group['day_date_str'] = month_group['date'].dt.strftime('%A, %B %d, %Y')
-                for day_str, day_group in month_group.groupby('day_date_str', sort=False):
-                    activity_count = len(day_group)
-                    activity_label = "activity" if activity_count == 1 else "activities"
-                    with st.expander(f"{day_str} ({activity_count} {activity_label})"):
-                        for _, row in day_group.iterrows():
-                            render_activity_card(row, db_client)
+        
+        current_month_year = ""
+        for index, row in df_sorted.iterrows():
+            month_year = row['month_year']
+            if month_year != current_month_year:
+                current_month_year = month_year
+                st.subheader(month_year)
+            render_activity_card(row, db_client)
     else:
         for _, row in df.iterrows():
             render_activity_card(row, db_client)
