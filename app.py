@@ -14,6 +14,10 @@ from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
+import logging
+
+# --- FIX: Suppress Prophet's informational messages ---
+logging.getLogger('prophet').setLevel(logging.ERROR)
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -48,7 +52,7 @@ def apply_custom_styling():
             border-right: 1px solid #444;
         }
         
-        /* --- FIX: Lock Sidebar Width and Disable Resizing --- */
+        /* --- Lock Sidebar Width and Disable Resizing --- */
         [data-testid="stSidebar"] {
             width: 320px !important; /* Set a fixed width */
         }
