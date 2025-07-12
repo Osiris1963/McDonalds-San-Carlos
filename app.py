@@ -39,11 +39,9 @@ def apply_custom_styling():
         /* --- Clean Layout Adjustments --- */
         /* Reduce top padding of the main content area for a cleaner look */
         .block-container {
-            padding-top: 2rem !important;
+            padding-top: 1rem !important;
         }
         
-        /* REMOVED the problematic negative margin rule that was hiding the tabs */
-
         /* --- Sidebar --- */
         .st-emotion-cache-16txtl3 {
             background-color: #252525;
@@ -364,7 +362,7 @@ if db:
         tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights","🗂️ Data Management"])
         
         with tabs[0]:
-            st.header("Forecast Dashboard")
+            # REMOVED st.header("Forecast Dashboard")
             if not st.session_state.forecast_df.empty:
                 today=pd.to_datetime('today').normalize();future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
                 if future_forecast_df.empty:st.warning("Forecast contains no future dates.")
@@ -379,7 +377,7 @@ if db:
                     with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
             else:st.info("Click the 'Generate Component Forecast' button to begin.")
         with tabs[1]:
-            st.header("Forecast Insights");
+            # REMOVED st.header("Forecast Insights")
             if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
             else:
                 future_components=st.session_state.forecast_components[st.session_state.forecast_components['ds']>=pd.to_datetime('today').normalize()].copy()
@@ -391,7 +389,7 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            st.header("Data Management")
+            # REMOVED st.header("Data Management")
             with st.container(border=True):
                 st.subheader("Database Migration Tool")
                 if not load_from_firestore(db,'historical_data').empty:
