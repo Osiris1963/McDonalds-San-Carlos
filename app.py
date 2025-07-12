@@ -265,9 +265,11 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
         current_date = pd.to_datetime(data['date'])
         last_year_date = current_date - timedelta(days=364)
         
-        historical_df['date_only'] = pd.to_datetime(historical_df['date']).dt.date
+        # Create a clean date column for comparison, ignoring time
+        hist_copy = historical_df.copy()
+        hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
         
-        last_year_record = historical_df[historical_df['date_only'] == last_year_date.date()]
+        last_year_record = hist_copy[hist_copy['date_only'] == last_year_date.date()]
         
         if not last_year_record.empty:
             data['last_year_sales'] = last_year_record['sales'].iloc[0]
@@ -458,10 +460,10 @@ if db:
                             hide_index=True,
                             column_config={
                                 "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                                "sales": st.column_config.NumberColumn("Sales (₱)", format="₱ {:,.2f}"),
-                                "customers": st.column_config.NumberColumn("Customers", format="{:,}"),
-                                "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱ {:,.2f}"),
-                                "last_year_customers": st.column_config.NumberColumn("LY Customers", format="{:,}"),
+                                "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                                "customers": st.column_config.NumberColumn("Customers", format="%d"),
+                                "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱%.2f"),
+                                "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%d"),
                                 "weather": "Weather"
                             }
                         )
