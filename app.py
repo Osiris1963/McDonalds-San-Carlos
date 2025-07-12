@@ -208,7 +208,6 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         if weather_df is not None:
             df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
         
-        # Check if 'weather' column exists before creating dummies to prevent KeyError
         if 'weather' in df_rf.columns:
             df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
         
@@ -218,40 +217,46 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         
         features = [col for col in df_rf.columns if col.startswith('weather_') or col in base_features]
         
-        for col in features:
-            if col not in df_rf.columns: df_rf[col] = 0.0
-        X = df_rf[features].fillna(0)
-        y = df_rf['residuals']
-        
-        if corrector_model == 'Random Forest':
-            model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
-        elif corrector_model == 'XGBoost':
-            model = xgb.XGBRegressor(n_estimators=100, random_state=42, objective='reg:squarederror')
-        
-        model.fit(X, y)
-
-        if weather_df is not None:
-            future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
+        # --- FIX STARTS HERE ---
+        # Ensure there are valid features to train on before fitting the corrector model.
+        # If the 'features' list is empty or the resulting dataframe slice is empty,
+        # skip the corrector model and fall back to the Prophet-only forecast.
+        X = df_rf[features].copy().fillna(0)
+        if X.empty or (X.shape[1] == 0):
+            st.warning(f"No features available for {corrector_model} model. Falling back to Prophet-only forecast.")
         else:
-            future_rf_data = future.copy()
-        
-        if 'weather' in future_rf_data.columns:
-            future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
-        
-        if use_yearly_seasonality:
-            hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
-            hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
-            hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
-            future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
-        
-        for col in X.columns:
-            if col not in future_rf_data.columns: future_rf_data[col] = 0.0
-        
-        future_rf_data.fillna(0, inplace=True)
+            y = df_rf['residuals']
+            
+            if corrector_model == 'Random Forest':
+                model = RandomForestRegressor(n_estimators=100, random_state=42, min_samples_split=5)
+            elif corrector_model == 'XGBoost':
+                model = xgb.XGBRegressor(n_estimators=100, random_state=42, objective='reg:squarederror')
+            
+            model.fit(X, y)
 
-        future_residuals = model.predict(future_rf_data[X.columns])
-        prophet_forecast['yhat'] += future_residuals
-    
+            if weather_df is not None:
+                future_rf_data = pd.merge(future, weather_df, left_on='ds', right_on='date', how='left').ffill().bfill()
+            else:
+                future_rf_data = future.copy()
+            
+            if 'weather' in future_rf_data.columns:
+                future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
+            
+            if use_yearly_seasonality:
+                hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
+                hist_for_future.rename(columns={'sales': 'last_year_sales', 'customers': 'last_year_customers'}, inplace=True)
+                hist_for_future['ds'] = hist_for_future['date'] + pd.to_timedelta(364, 'D')
+                future_rf_data = pd.merge(future_rf_data, hist_for_future[['ds', 'last_year_sales', 'last_year_customers']], on='ds', how='left')
+            
+            for col in X.columns:
+                if col not in future_rf_data.columns: future_rf_data[col] = 0.0
+            
+            future_rf_data.fillna(0, inplace=True)
+
+            future_residuals = model.predict(future_rf_data[X.columns])
+            prophet_forecast['yhat'] += future_residuals
+        # --- FIX ENDS HERE ---
+
     potential_cols = ['ds', 'trend', 'holidays', 'weekly', 'yearly', 'daily', 'yhat']
     existing_cols = [col for col in potential_cols if col in prophet_forecast.columns]
     forecast_components = prophet_forecast[existing_cols]
@@ -331,7 +336,7 @@ if db:
             model_option = st.selectbox(
                 "Select a Forecast Model:",
                 ("Prophet Only", "Prophet + Random Forest", "Prophet + XGBoost"),
-                help="Hybrid models are more accurate with at least one year of data."
+                help="Hybrid models use weather and trend data if available."
             )
 
             if st.button("🔄 Refresh Data from Firestore"):
@@ -361,20 +366,15 @@ if db:
                             st.sidebar.info("Year-over-year data is active.")
                             hist_df_final = engineer_last_year_features(hist_with_trends)
                         else:
-                            st.sidebar.warning("Less than 1 year of data found. Year-over-year features will not be used.")
                             hist_df_final = hist_with_trends
                         
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- FIX STARTS HERE ---
-                        # Allow user to select any model. The training function is robust enough
-                        # to include/exclude yearly features based on the data it receives.
                         corrector_choice = "None"
                         if model_option == "Prophet + Random Forest":
                             corrector_choice = "Random Forest"
                         elif model_option == "Prophet + XGBoost":
                             corrector_choice = "XGBoost"
-                        # --- FIX ENDS HERE ---
                         
                         cust_f, cust_m, cust_c, all_h = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'customers', corrector_model=corrector_choice)
                         atv_f, atv_m, _, _ = train_and_forecast_component(hist_df_final, ev_df, weather_df, 15, 'atv', corrector_model='None')
@@ -476,4 +476,3 @@ if db:
                         st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                     else:st.write("No historical data to display.")
                 else:st.write("No historical data to display.")
-
