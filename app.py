@@ -238,49 +238,34 @@ def calculate_atv(df):
 
 @st.cache_data(ttl=3600)
 def get_weather_forecast(days=16):
-    # --- THIS IS THE FIX: Waterfall approach for resilient weather forecasting ---
-    base_url = "https://api.open-meteo.com/v1/forecast"
-    base_params = {
-        "latitude": 10.48,
-        "longitude": 123.42,
-        "daily": "weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
-        "timezone": "Asia/Manila",
-        "forecast_days": days,
-    }
-    
-    # Prioritized list of models to try
-    model_priority = ["cma_gfs", "ecmwf_ifs", "gfs_seamless"]
-
-    for model in model_priority:
-        try:
-            params = base_params.copy()
-            params["models"] = model
-            response = requests.get(base_url, params=params)
-            response.raise_for_status()  # Will raise an error for bad responses (4xx or 5xx)
-            data = response.json()
-            
-            # If we get here, the request was successful
-            st.success(f"Successfully fetched weather data using the '{model}' model.")
-            df = pd.DataFrame(data['daily'])
-            df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
-            df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
-            return df
-
-        except requests.exceptions.RequestException as e:
-            st.warning(f"Could not fetch weather using model '{model}'. Trying next model... Error: {e}")
-            continue # Go to the next model in the list
-
-    # If all models fail
-    st.error("All weather forecast models are currently unavailable. Please try again later.")
-    return None
-
+    try:
+        url="https://api.open-meteo.com/v1/forecast"
+        # --- THIS IS THE FIX: Let the API choose the best model for the location ---
+        params={
+            "latitude":10.48,
+            "longitude":123.42,
+            "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
+            "timezone":"Asia/Manila",
+            "forecast_days":days,
+        }
+        response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
+        df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
+        df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
+        return df
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not fetch weather data. Please try again later. Error: {e}")
+        return None
 
 def map_weather_code(code):
-    if code in[0,1]:return"Sunny"
-    if code in[2,3]:return"Cloudy"
-    if code in[51,53,55,61,63,65,80,81,82]:return"Rainy"
-    if code in[95,96,99]:return"Storm"
-    return"Cloudy"
+    # --- THIS IS THE FIX: More descriptive weather mapping ---
+    if code in [0, 1]: return "Sunny"
+    if code == 2: return "Partly Cloudy"
+    if code == 3: return "Cloudy"
+    if code in [45, 48]: return "Foggy"
+    if code in [51, 53, 55, 61, 63, 65]: return "Rainy"
+    if code in [80, 81, 82]: return "Rain Showers"
+    if code in [95, 96, 99]: return "Thunderstorm"
+    return "Cloudy" # Default fallback
 
 def generate_recurring_local_events(start_date,end_date):
     local_events=[];current_date=start_date
