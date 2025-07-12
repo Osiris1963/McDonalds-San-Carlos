@@ -208,7 +208,11 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         if weather_df is not None:
             df_rf = pd.merge(df_rf, weather_df, on='date', how='left')
         
-        df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
+        # --- FIX STARTS HERE ---
+        # Check if 'weather' column exists before creating dummies to prevent KeyError
+        if 'weather' in df_rf.columns:
+            df_rf = pd.get_dummies(df_rf, columns=['weather'], drop_first=True, dummy_na=True)
+        # --- FIX ENDS HERE ---
         
         base_features = ['add_on_sales', 'temp_max', 'precipitation', 'wind_speed', 'consecutive_uptrend']
         if use_yearly_seasonality:
@@ -233,7 +237,8 @@ def train_and_forecast_component(historical_df, events_df, weather_df, periods, 
         else:
             future_rf_data = future.copy()
         
-        future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
+        if 'weather' in future_rf_data.columns:
+            future_rf_data = pd.get_dummies(future_rf_data, columns=['weather'], dummy_na=True)
         
         if use_yearly_seasonality:
             hist_for_future = historical_df[['date', 'sales', 'customers']].copy()
@@ -469,3 +474,4 @@ if db:
                         st.dataframe(filtered_df, use_container_width=True, hide_index=True)
                     else:st.write("No historical data to display.")
                 else:st.write("No historical data to display.")
+
