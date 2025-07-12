@@ -10,7 +10,7 @@ import io
 import time
 import os
 import requests
-from datetime import timedelta
+from datetime import timedelta, date
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
@@ -164,7 +164,7 @@ def load_from_firestore(_db_client, collection_name):
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales'] if col in df.columns]
+    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
     for col in existing_numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -258,24 +258,49 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     return prophet_forecast[['ds', 'yhat']], metrics, forecast_components, prophet_model.holidays
 
 # --- Plotting Functions & Firestore Data I/O ---
-def add_to_firestore(db_client, collection_name, data):
+def add_to_firestore(db_client, collection_name, data, historical_df):
     if db_client is None: return
+    
+    # --- FIX: Auto-populate last year's data ---
     if 'date' in data and pd.notna(data['date']):
-        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    else: return
-    all_cols = ['sales', 'customers', 'add_on_sales']
+        current_date = pd.to_datetime(data['date'])
+        last_year_date = current_date - timedelta(days=364) # Use 364 for day-of-week alignment
+        
+        # Ensure historical_df['date'] is datetime
+        historical_df['date'] = pd.to_datetime(historical_df['date'])
+        
+        last_year_record = historical_df[historical_df['date'].dt.date == last_year_date.date()]
+        
+        if not last_year_record.empty:
+            data['last_year_sales'] = last_year_record['sales'].iloc[0]
+            data['last_year_customers'] = last_year_record['customers'].iloc[0]
+        else:
+            data['last_year_sales'] = 0.0
+            data['last_year_customers'] = 0.0
+            
+        data['date'] = current_date.to_pydatetime()
+    else: 
+        return
+
+    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather']
     for col in all_cols:
         if col in data and data[col] is not None:
-            data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+            if col not in ['weather']:
+                 data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            data[col] = 0.0
+            if col not in ['weather']:
+                data[col] = 0.0
+            else:
+                data[col] = "N/A"
+
     db_client.collection(collection_name).add(data)
+
 
 def update_in_firestore(db_client, collection_name, doc_id, data):
     if db_client is None: return
     if 'date' in data and pd.notna(data['date']):
         data['date'] = pd.to_datetime(data['date']).to_pydatetime()
-    for col in ['sales', 'customers', 'add_on_sales']:
+    for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']:
         if col in data and data[col] is not None:
             data[col] = float(pd.to_numeric(data[col], errors='coerce'))
     db_client.collection(collection_name).document(doc_id).set(data)
@@ -402,42 +427,48 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            form_col, display_col = st.columns([1, 1])
+            form_col, display_col = st.columns([1, 1], gap="large")
 
             with form_col:
-                with st.expander("✍️ Add New Daily Record",expanded=True):
-                    with st.form("new_record_form",clear_on_submit=True):
-                        new_date=st.date_input("Date")
-                        new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
-                        new_customers=st.number_input("Customer Count",min_value=0)
-                        new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                        new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
-                        if st.form_submit_button("✅ Save Record"):
-                            new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
-                            add_to_firestore(db,'historical_data',new_rec)
-                            st.cache_data.clear()
-                            st.success("Record added to Firestore!");
-                            time.sleep(1)
-                            st.rerun()
+                st.subheader("✍️ Add New Daily Record")
+                with st.form("new_record_form",clear_on_submit=True, border=False):
+                    new_date=st.date_input("Date", date.today())
+                    new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+                    new_customers=st.number_input("Customer Count",min_value=0)
+                    new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
+                    new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                    if st.form_submit_button("✅ Save Record", use_container_width=True):
+                        new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
+                        add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
+                        st.cache_data.clear()
+                        st.success("Record added to Firestore!");
+                        time.sleep(1)
+                        st.rerun()
             
             with display_col:
                 st.subheader("🗓️ Recent Entries")
                 recent_df = st.session_state.historical_df.copy()
                 if not recent_df.empty:
                     recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
+                    display_cols = ['date', 'sales', 'customers', 'last_year_sales', 'last_year_customers', 'weather']
+                    # Ensure columns exist before trying to display them
+                    cols_to_show = [col for col in display_cols if col in recent_df.columns]
+                    
                     st.dataframe(
-                        recent_df.sort_values(by="date", ascending=False).head(7),
+                        recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
                         use_container_width=True,
                         hide_index=True,
                         column_config={
                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                            "customers": st.column_config.NumberColumn("Customers"),
+                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%,.2f"),
+                            "customers": st.column_config.NumberColumn("Customers", format="%d"),
+                            "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱%,.2f"),
+                            "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%d"),
+                            "weather": "Weather"
                         }
                     )
                 else:
                     st.info("No recent data to display.")
-
 
         with tabs[3]:
             st.subheader("View Historical Data")
