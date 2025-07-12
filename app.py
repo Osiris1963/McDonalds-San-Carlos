@@ -263,12 +263,11 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     
     if 'date' in data and pd.notna(data['date']):
         current_date = pd.to_datetime(data['date'])
-        last_year_date = current_date - timedelta(days=364) # Use 364 for day-of-week alignment
+        last_year_date = current_date - timedelta(days=364)
         
-        # Ensure historical_df['date'] is datetime
-        historical_df['date'] = pd.to_datetime(historical_df['date'])
+        historical_df['date_only'] = pd.to_datetime(historical_df['date']).dt.date
         
-        last_year_record = historical_df[historical_df['date'].dt.date == last_year_date.date()]
+        last_year_record = historical_df[historical_df['date_only'] == last_year_date.date()]
         
         if not last_year_record.empty:
             data['last_year_sales'] = last_year_record['sales'].iloc[0]
@@ -446,28 +445,28 @@ if db:
             
             with display_col:
                 st.subheader("🗓️ Recent Entries")
-                recent_df = st.session_state.historical_df.copy()
-                if not recent_df.empty:
-                    recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
-                    display_cols = ['date', 'sales', 'customers', 'last_year_sales', 'last_year_customers', 'weather']
-                    # Ensure columns exist before trying to display them
-                    cols_to_show = [col for col in display_cols if col in recent_df.columns]
-                    
-                    st.dataframe(
-                        recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱,.2f"),
-                            "customers": st.column_config.NumberColumn("Customers", format="%,d"),
-                            "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱,.2f"),
-                            "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%,d"),
-                            "weather": "Weather"
-                        }
-                    )
-                else:
-                    st.info("No recent data to display.")
+                with st.container(border=True):
+                    recent_df = st.session_state.historical_df.copy()
+                    if not recent_df.empty:
+                        recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
+                        display_cols = ['date', 'sales', 'customers', 'last_year_sales', 'last_year_customers', 'weather']
+                        cols_to_show = [col for col in display_cols if col in recent_df.columns]
+                        
+                        st.dataframe(
+                            recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                                "sales": st.column_config.NumberColumn("Sales (₱)", format="₱ {:,.2f}"),
+                                "customers": st.column_config.NumberColumn("Customers", format="{:,}"),
+                                "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱ {:,.2f}"),
+                                "last_year_customers": st.column_config.NumberColumn("LY Customers", format="{:,}"),
+                                "weather": "Weather"
+                            }
+                        )
+                    else:
+                        st.info("No recent data to display.")
 
         with tabs[3]:
             st.subheader("View Historical Data")
