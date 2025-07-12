@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
+import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -21,6 +23,7 @@ import bcrypt
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -281,13 +284,11 @@ def generate_recurring_local_events(start_date,end_date):
 def create_time_features(df):
     """Creates time series features from a datetime index."""
     df['date'] = pd.to_datetime(df['date'])
-    df['hour'] = df['date'].dt.hour
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
-    df['dayofmonth'] = df['date'].dt.day
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     return df
 
@@ -297,7 +298,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
@@ -329,17 +330,15 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     return forecast[['ds', 'yhat']], prophet_model
 
 @st.cache_resource
-def train_and_forecast_xgboost(historical_df, events_df, periods, target_col):
+def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty:
         return pd.DataFrame()
 
-    # Create features for the model
     df_featured = create_time_features(df_train.rename(columns={'date': 'date'}))
     
-    # Create future dates to predict
     last_date = df_featured['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
     future_df = pd.DataFrame({'date': future_dates})
@@ -348,26 +347,43 @@ def train_and_forecast_xgboost(historical_df, events_df, periods, target_col):
     features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']
     target = target_col
 
-    X_train, y_train = df_featured[features], df_featured[target]
-    X_future = future_df_featured[features]
-
-    reg = xgb.XGBRegressor(
-        n_estimators=1000,
-        early_stopping_rounds=50,
-        learning_rate=0.01,
-        objective='reg:squarederror'
-    )
+    X = df_featured[features]
+    y = df_featured[target]
     
-    reg.fit(X_train, y_train,
-            eval_set=[(X_train, y_train)],
-            verbose=False)
-            
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    def objective(trial):
+        params = {
+            'objective': 'reg:squarederror',
+            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'random_state': 42
+        }
+        
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], early_stopping_rounds=50, verbose=False)
+        preds = model.predict(X_test)
+        mae = mean_absolute_error(y_test, preds)
+        return mae
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=50) # Run 50 trials to find best params
+
+    # Train final model with best parameters
+    best_params = study.best_params
+    final_model = xgb.XGBRegressor(**best_params)
+    final_model.fit(X, y) # Train on all data
+
     # Predict on future dates
-    future_predictions = reg.predict(X_future)
+    X_future = future_df_featured[features]
+    future_predictions = final_model.predict(X_future)
     
     # Combine historical and future predictions
     full_prediction_df = df_featured[['date']].copy()
-    full_prediction_df['yhat'] = reg.predict(X_train)
+    full_prediction_df['yhat'] = final_model.predict(X)
     
     future_df['yhat'] = future_predictions
     
@@ -635,7 +651,7 @@ if db:
                 if len(st.session_state.historical_df) < 20: 
                     st.error("Please provide at least 20 days of data for reliable forecasting.")
                 else:
-                    with st.spinner("🧠 Building forecast models (Prophet + XGBoost)..."):
+                    with st.spinner("🧠 Optimizing and building forecast models... This may take a minute."):
                         base_df = st.session_state.historical_df.copy()
                         
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
@@ -650,21 +666,16 @@ if db:
                         ev_df = st.session_state.events_df.copy()
                         
                         # --- TRAIN AND COMBINE MODELS ---
-                        # 1. Prophet
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'customers')
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'atv')
 
-                        # 2. XGBoost
-                        xgb_cust_f = train_and_forecast_xgboost(hist_df_with_atv, ev_df, 15, 'customers')
-                        xgb_atv_f = train_and_forecast_xgboost(hist_df_with_atv, ev_df, 15, 'atv')
+                        xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, 15, 'customers')
+                        xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, 15, 'atv')
 
-                        # 3. Ensemble (blend) the forecasts
                         if not prophet_cust_f.empty and not xgb_cust_f.empty:
-                            # Merge forecasts on date
                             cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
                             atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
 
-                            # Calculate the blended forecast (50/50 average)
                             cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
                             
@@ -680,7 +691,6 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
-                            # For insights, we'll use the Prophet model's components
                             prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
                             st.session_state.forecast_components = prophet_forecast_components
                             st.session_state.all_holidays = prophet_model_cust.holidays
