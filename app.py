@@ -169,7 +169,13 @@ def initialize_state_firestore(db_client):
 @st.cache_data(ttl="6h")
 def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
-    docs = _db_client.collection(collection_name).stream(); records = [doc.to_dict() for doc in docs]
+    docs = _db_client.collection(collection_name).stream()
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+
     if not records: return pd.DataFrame()
     df = pd.DataFrame(records)
     if 'date' in df.columns:
@@ -177,13 +183,17 @@ def load_from_firestore(_db_client, collection_name):
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-    existing_numeric_cols = [col for col in ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers'] if col in df.columns]
-    for col in existing_numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=['sales', 'customers', 'add_on_sales'], inplace=True)
-    for col in existing_numeric_cols:
-         if col in df.columns: df[col] = df[col].astype(float)
+    
+    if 'sales' in df.columns and 'customers' in df.columns:
+        df.dropna(subset=['sales', 'customers'], inplace=True)
+
     if not df.empty:
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
     return df
@@ -344,12 +354,15 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     db_client.collection(collection_name).add(data)
 
 
-def update_activity_in_firestore(db_client, collection_name, doc_id, data):
-    """A specific function to update an activity document in Firestore."""
+def update_historical_record_in_firestore(db_client, doc_id, data):
+    if db_client is None: return
+    db_client.collection('historical_data').document(doc_id).update(data)
+
+def update_activity_in_firestore(db_client, doc_id, data):
     if db_client is None: return
     if 'potential_sales' in data:
         data['potential_sales'] = float(data['potential_sales'])
-    db_client.collection(collection_name).document(doc_id).update(data)
+    db_client.collection('future_activities').document(doc_id).update(data)
 
 def delete_from_firestore(db_client, collection_name, doc_id):
     if db_client is None: return
@@ -415,14 +428,14 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                 with update_col:
                     if st.form_submit_button("💾 Update", use_container_width=True):
                         update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                        update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                        update_activity_in_firestore(db, doc_id, update_data)
                         st.success("Activity updated!")
                         st.cache_data.clear()
                         time.sleep(1)
                         st.rerun()
                 with delete_col:
                     if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                        delete_from_firestore(db_client, 'future_activities', doc_id)
+                        delete_from_firestore(db, 'future_activities', doc_id)
                         st.warning("Activity deleted.")
                         st.cache_data.clear()
                         time.sleep(1)
@@ -455,14 +468,14 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                     with update_col:
                         if st.form_submit_button("💾 Update", use_container_width=True):
                             update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                            update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                            update_activity_in_firestore(db, doc_id, update_data)
                             st.success("Activity updated!")
                             st.cache_data.clear()
                             time.sleep(1)
                             st.rerun()
                     with delete_col:
                         if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                            delete_from_firestore(db_client, 'future_activities', doc_id)
+                            delete_from_firestore(db, 'future_activities', doc_id)
                             st.warning("Activity deleted.")
                             st.cache_data.clear()
                             time.sleep(1)
@@ -577,26 +590,44 @@ if db:
                 
                 if st.session_state.show_recent_entries:
                     st.subheader("🗓️ Recent Entries")
-                    with st.container(border=True):
-                        recent_df = st.session_state.historical_df.copy()
-                        if not recent_df.empty:
-                            recent_df['date'] = pd.to_datetime(recent_df['date']).dt.date
-                            display_cols = ['date', 'sales', 'customers', 'weather']
-                            cols_to_show = [col for col in display_cols if col in recent_df.columns]
-                            
-                            st.dataframe(
-                                recent_df[cols_to_show].sort_values(by="date", ascending=False).head(7),
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                                    "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                                    "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                                    "weather": "Weather"
-                                }
-                            )
-                        else:
-                            st.info("No recent data to display.")
+                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(7)
+                    
+                    if not recent_df.empty:
+                        for _, row in recent_df.iterrows():
+                            doc_id = row['doc_id']
+                            date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
+                            summary_line = f"**{date_str}** | Sales: ₱{row.get('sales', 0):,.2f} | Customers: {row.get('customers', 0)}"
+                            with st.expander(summary_line):
+                                with st.form(key=f"update_hist_{doc_id}", border=False):
+                                    st.markdown("##### Edit Record")
+                                    cols = st.columns(3)
+                                    updated_sales = cols[0].number_input("Total Sales (₱)", value=float(row.get('sales', 0)), format="%.2f")
+                                    updated_customers = cols[1].number_input("Customers", value=int(row.get('customers', 0)))
+                                    updated_addons = cols[2].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f")
+                                    updated_weather = st.selectbox("Weather", ["Sunny","Cloudy","Rainy","Storm"], index=["Sunny","Cloudy","Rainy","Storm"].index(row.get('weather', 'Sunny')))
+                                    
+                                    update_col, delete_col, _ = st.columns([1,1,3])
+                                    if update_col.form_submit_button("💾 Update", use_container_width=True):
+                                        update_data = {
+                                            "sales": updated_sales,
+                                            "customers": updated_customers,
+                                            "add_on_sales": updated_addons,
+                                            "weather": updated_weather
+                                        }
+                                        update_historical_record_in_firestore(db, doc_id, update_data)
+                                        st.success("Record updated!")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
+
+                                    if delete_col.form_submit_button("🗑️ Delete", use_container_width=True):
+                                        delete_from_firestore(db, 'historical_data', doc_id)
+                                        st.warning("Record deleted.")
+                                        st.cache_data.clear()
+                                        time.sleep(1)
+                                        st.rerun()
+                    else:
+                        st.info("No recent data to display.")
         
         with tabs[3]:
             def set_view_all(): st.session_state.show_all_activities = True
