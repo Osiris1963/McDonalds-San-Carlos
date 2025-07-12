@@ -32,7 +32,7 @@ st.set_page_config(
 # --- Custom McDonald's Inspired CSS ---
 def apply_custom_styling():
     st.markdown("""
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         /* --- Main Font & Colors --- */
         html, body, [class*="st-"] {
@@ -119,24 +119,24 @@ def apply_custom_styling():
             color: #d3d3d3;
         }
         
-        /* --- Custom Activity Card Style --- */
+        /* --- Custom Activity Card Style (Compact) --- */
         .activity-card {
             background-color: #252525;
-            border-radius: 12px;
-            padding: 1rem;
-            margin-bottom: 1rem;
+            border-radius: 10px;
+            padding: 0.8rem 1rem;
+            margin-bottom: 0.75rem;
             border: 1px solid #444;
         }
         .activity-card h3 {
-            font-size: 1.1rem;
-            font-weight: 700;
+            font-size: 1rem;
+            font-weight: 600;
             color: #ffffff;
-            margin-bottom: 0.25rem;
+            margin-bottom: 0.1rem;
         }
         .activity-card p {
-            font-size: 0.9rem;
+            font-size: 0.85rem;
             color: #d3d3d3;
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.25rem;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -406,51 +406,67 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
-def display_activities(df, db_client):
-    if not df.empty:
-        for index, row in df.iterrows():
-            doc_id = row['doc_id']
-            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
-            
-            st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
-            
-            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
-            st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
-            
-            status = row['remarks']
-            if status == 'Confirmed': color = '#22C55E' # Green
-            elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
-            elif status == 'Tentative': color = '#38BDF8' # Light Blue
-            else: color = '#EF4444' # Red
-            st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
-            
-            with st.expander("Edit / Manage"):
-                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
+def render_activity_card(row, db_client):
+    doc_id = row['doc_id']
+    activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+    
+    st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
+    
+    st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
+    st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+    
+    status = row['remarks']
+    if status == 'Confirmed': color = '#22C55E' # Green
+    elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
+    elif status == 'Tentative': color = '#38BDF8' # Light Blue
+    else: color = '#EF4444' # Red
+    st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
+    
+    with st.expander("Edit / Manage"):
+        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
 
-                with st.form(key=f"update_form_{doc_id}", border=False):
-                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
-                    
-                    update_col, delete_col = st.columns(2)
-                    with update_col:
-                        if st.form_submit_button("💾 Update", use_container_width=True):
-                            update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                            update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
-                            st.success("Activity updated!")
-                            st.cache_data.clear()
-                            time.sleep(1)
-                            st.rerun()
-                    with delete_col:
-                        if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                            delete_from_firestore(db_client, 'future_activities', doc_id)
-                            st.warning("Activity deleted.")
-                            st.cache_data.clear()
-                            time.sleep(1)
-                            st.rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
-    else:
+        with st.form(key=f"update_form_{doc_id}", border=False):
+            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
+            
+            update_col, delete_col = st.columns(2)
+            with update_col:
+                if st.form_submit_button("💾 Update", use_container_width=True):
+                    update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                    update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                    st.success("Activity updated!")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+            with delete_col:
+                if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                    delete_from_firestore(db_client, 'future_activities', doc_id)
+                    st.warning("Activity deleted.")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def display_activities(df, db_client, group_by_month=False):
+    if df.empty:
         st.info("No upcoming activities scheduled.")
+        return
+
+    if group_by_month:
+        df['month_year'] = df['date'].dt.strftime('%B %Y')
+        
+        current_month_year = ""
+        for index, row in df.iterrows():
+            month_year = row['month_year']
+            if month_year != current_month_year:
+                current_month_year = month_year
+                st.markdown(f"<h5 style='margin-top: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #444; padding-bottom: 0.5rem;'>{month_year}</h5>", unsafe_allow_html=True)
+            render_activity_card(row, db_client)
+    else:
+        for index, row in df.iterrows():
+            render_activity_card(row, db_client)
+
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -592,7 +608,7 @@ if db:
                 
                 activities_df = load_activities_from_firestore(db, 'future_activities')
                 all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
-                display_activities(all_upcoming_df, db)
+                display_activities(all_upcoming_df, db, group_by_month=True)
 
             else:
                 # --- DEFAULT OVERVIEW ---
