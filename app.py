@@ -261,7 +261,6 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
 def add_to_firestore(db_client, collection_name, data, historical_df):
     if db_client is None: return
     
-    # --- FIX: Auto-populate last year's data ---
     if 'date' in data and pd.notna(data['date']):
         current_date = pd.to_datetime(data['date'])
         last_year_date = current_date - timedelta(days=364) # Use 364 for day-of-week alignment
@@ -460,10 +459,10 @@ if db:
                         hide_index=True,
                         column_config={
                             "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%,.2f"),
-                            "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                            "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱%,.2f"),
-                            "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%d"),
+                            "sales": st.column_config.NumberColumn("Sales (₱)", format="₱,.2f"),
+                            "customers": st.column_config.NumberColumn("Customers", format="%,d"),
+                            "last_year_sales": st.column_config.NumberColumn("LY Sales (₱)", format="₱,.2f"),
+                            "last_year_customers": st.column_config.NumberColumn("LY Customers", format="%,d"),
                             "weather": "Weather"
                         }
                     )
