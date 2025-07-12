@@ -17,7 +17,6 @@ import json
 import logging
 
 # --- Suppress Prophet's informational messages ---
-# This will hide the verbose output that appears in the sidebar during forecasting
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
 
@@ -33,90 +32,109 @@ st.set_page_config(
 # --- Custom McDonald's Inspired CSS ---
 def apply_custom_styling():
     st.markdown("""
-    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         /* --- Main Font & Colors --- */
         html, body, [class*="st-"] {
-            font-family: 'Poppins', sans-serif;
+            font-family: 'Inter', sans-serif;
         }
         .main > div {
-            background-color: #1a1a1a;
+            background-color: #0F172A; /* Dark Slate Blue */
         }
         
         /* --- Clean Layout Adjustments --- */
-        /* Adjust top padding to position the tabs lower */
         .block-container {
-            padding-top: 3.5rem !important;
+            padding-top: 2.5rem !important;
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
         }
         
         /* --- Sidebar --- */
-        .st-emotion-cache-16txtl3 {
-            background-color: #252525;
-            border-right: 1px solid #444;
-        }
-        
-        /* --- Lock Sidebar Width and Disable Resizing --- */
         [data-testid="stSidebar"] {
-            width: 320px !important; /* Set a fixed width */
+            background-color: #1E293B; /* Darker Slate */
+            border-right: 1px solid #334155;
+            width: 320px !important;
         }
         [data-testid="stSidebar-resize-handler"] {
-            display: none; /* Hide the resize handle */
+            display: none;
         }
         
-        /* --- Primary Button (Generate Forecast) --- */
+        /* --- Primary & Secondary Buttons --- */
         .stButton > button {
-            border: none;
-            border-radius: 12px;
-            color: #ffffff; /* White text on red button */
+            border-radius: 8px;
             font-weight: 600;
-            background: linear-gradient(45deg, #c8102e, #e01a37); /* Red gradient */
             transition: all 0.2s ease-in-out;
-            box-shadow: 0 4px 15px 0 rgba(200, 16, 46, 0.4); /* Red glow */
+            border: none;
+            padding: 10px 16px;
         }
-        .stButton > button:hover {
+        /* Primary Action Button Style (e.g., Generate Forecast, Save) */
+        .stButton:has(button:contains("Generate")),
+        .stButton:has(button:contains("Save")) > button {
+            background: #2563EB; /* Bright Blue */
+            color: #FFFFFF;
+        }
+        .stButton:has(button:contains("Generate")):hover > button,
+        .stButton:has(button:contains("Save")):hover > button {
+            background: #1D4ED8; /* Darker Blue */
             transform: translateY(-2px);
-            box-shadow: 0 6px 20px 0 rgba(200, 16, 46, 0.5);
         }
-        
-        /* Special case for Refresh button and Show Recent Entries */
+        /* Secondary Action Button (e.g., Refresh, View All) */
         .stButton:has(button:contains("Refresh")),
-        .stButton:has(button:contains("Recent Entries")) > button {
-             border: 2px solid #c8102e;
-             background: transparent;
-             color: #c8102e;
+        .stButton:has(button:contains("View All")),
+        .stButton:has(button:contains("Back to Overview")) > button {
+            background-color: #334155; /* Slate Gray */
+            color: #F1F5F9; /* Light Slate */
         }
         .stButton:has(button:contains("Refresh")):hover > button,
-        .stButton:has(button:contains("Recent Entries")):hover > button {
-            background: #c8102e;
-            color: #ffffff;
+        .stButton:has(button:contains("View All")):hover > button,
+        .stButton:has(button:contains("Back to Overview")):hover > button {
+            background-color: #475569;
         }
-
 
         /* --- Tabs --- */
         .stTabs [data-baseweb="tab"] {
-            border-radius: 10px;
+            border-radius: 8px;
             background-color: transparent;
-            color: #d3d3d3;
+            color: #94A3B8; /* Muted Slate */
             padding: 10px 15px;
+            font-weight: 600;
         }
         .stTabs [data-baseweb="tab"][aria-selected="true"] {
-            background-color: #c8102e; /* Use classic red for selected tab */
-            color: #ffffff;
-            font-weight: 600;
+            background-color: #1E293B;
+            color: #F1F5F9; /* White-ish */
         }
 
-        /* --- Expanders as Cards --- */
+        /* --- Expanders for Editing --- */
         .st-expander {
-            border: none !important;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-            border-radius: 15px;
-            background-color: #252525;
-            margin-bottom: 1rem;
+            border: 1px solid #334155 !important;
+            box-shadow: none;
+            border-radius: 12px;
+            background-color: #1E293B; /* Darker Slate */
         }
         .st-expander header {
-            font-size: 1.1rem;
+            font-size: 0.9rem;
             font-weight: 600;
-            color: #ffffff;
+            color: #94A3B8;
+        }
+        
+        /* --- Custom Activity Card Style --- */
+        .activity-card {
+            background-color: #1E293B;
+            border-radius: 12px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            border: 1px solid #334155;
+        }
+        .activity-card h3 {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #F1F5F9;
+            margin-bottom: 0.25rem;
+        }
+        .activity-card p {
+            font-size: 0.9rem;
+            color: #94A3B8;
+            margin-bottom: 0.5rem;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -345,7 +363,6 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
 def update_activity_in_firestore(db_client, collection_name, doc_id, data):
     """A specific function to update an activity document in Firestore."""
     if db_client is None: return
-    # Ensure potential_sales is stored as a float
     if 'potential_sales' in data:
         data['potential_sales'] = float(data['potential_sales'])
     db_client.collection(collection_name).document(doc_id).update(data)
@@ -358,7 +375,7 @@ def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
 def plot_full_comparison_chart(hist,fcst,metrics,target):
     fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
-    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
+    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#1E293B',plot_bgcolor='#1E293B',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
@@ -373,7 +390,7 @@ def plot_forecast_breakdown(components,selected_date,all_events):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
         x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
     x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
-    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#1E293B',plot_bgcolor='#1E293B',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
     effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
@@ -393,43 +410,43 @@ def display_activities(df, db_client):
             doc_id = row['doc_id']
             activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
             
-            with st.container(border=True):
-                info_col, edit_col = st.columns([4, 1])
+            st.markdown(f'<div class="activity-card">', unsafe_allow_html=True)
+            
+            st.markdown(f"<h3>{row['activity_name']}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<p>📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}</p>", unsafe_allow_html=True)
+            
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E' # Green
+            elif status == 'Needs Follow-up': color = '#F59E0B' # Amber
+            elif status == 'Tentative': color = '#38BDF8' # Light Blue
+            else: color = '#EF4444' # Red
+            st.markdown(f"<p>Status: <span style='color:{color}; font-weight:600;'>{status}</span></p>", unsafe_allow_html=True)
+            
+            with st.expander("Edit / Manage"):
+                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
 
-                with info_col:
-                    st.markdown(f"**{row['activity_name']}**")
-                    st.markdown(f"📅 {activity_date_formatted} | 💰 ₱{row['potential_sales']:,.2f}")
+                with st.form(key=f"update_form_{doc_id}", border=False):
+                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
+                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
                     
-                    status = row['remarks']
-                    if status == 'Confirmed': color = 'lightgreen'
-                    elif status == 'Needs Follow-up': color = 'orange'
-                    elif status == 'Tentative': color = 'lightblue'
-                    else: color = '#ff4b4b' # Cancelled
-                    st.markdown(f"Status: <span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
-                
-                with edit_col:
-                    with st.expander("Edit ✏️", expanded=False):
-                        status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                        current_status_index = status_options.index(row['remarks']) if row['remarks'] in status_options else 0
-
-                        with st.form(key=f"update_form_{doc_id}", border=False):
-                            updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"sales_{doc_id}")
-                            updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"remarks_{doc_id}")
-                            
-                            if st.form_submit_button("💾 Update", use_container_width=True):
-                                update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                                update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
-                                st.success("Activity updated!")
-                                st.cache_data.clear()
-                                time.sleep(1)
-                                st.rerun()
-                            
-                            if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                                delete_from_firestore(db_client, 'future_activities', doc_id)
-                                st.warning("Activity deleted.")
-                                st.cache_data.clear()
-                                time.sleep(1)
-                                st.rerun()
+                    update_col, delete_col = st.columns(2)
+                    with update_col:
+                        if st.form_submit_button("💾 Update", use_container_width=True):
+                            update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                            update_activity_in_firestore(db_client, 'future_activities', doc_id, update_data)
+                            st.success("Activity updated!")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                    with delete_col:
+                        if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                            delete_from_firestore(db_client, 'future_activities', doc_id)
+                            st.warning("Activity deleted.")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.info("No upcoming activities scheduled.")
 
@@ -500,7 +517,7 @@ if db:
                     disp_cols={'ds':'Date','forecast_customers':'Predicted Customers','forecast_atv':'Predicted Avg Sale (₱)','forecast_sales':'Predicted Sales (₱)','weather':'Predicted Weather'}
                     existing_disp_cols={k:v for k,v in disp_cols.items()if k in future_forecast_df.columns};display_df=future_forecast_df.rename(columns=existing_disp_cols);final_cols_order=[v for k,v in disp_cols.items()if k in existing_disp_cols]
                     st.markdown("#### Forecasted Values");st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
-                    st.markdown("#### Forecast Visualization");fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#1e1e1e',plot_bgcolor='#2a2a2a',font_color='white');st.plotly_chart(fig,use_container_width=True)
+                    st.markdown("#### Forecast Visualization");fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#1E293B',plot_bgcolor='#1E293B',font_color='white');st.plotly_chart(fig,use_container_width=True)
                 with st.expander("🔬 View Full Forecast vs. Historical Data"):
                     st.info("This view shows how the component models performed against past data.");d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"]);hist_atv=calculate_atv(st.session_state.historical_df.copy())
                     with d_t1:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}),st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
@@ -564,8 +581,6 @@ if db:
                             st.info("No recent data to display.")
         
         with tabs[3]:
-            st.subheader("📅 Manage Future Activities & Events")
-
             if st.session_state.get('show_all_activities'):
                 # --- ALL ACTIVITIES VIEW ---
                 st.markdown("#### All Upcoming Activities")
@@ -583,13 +598,13 @@ if db:
 
                 with col1:
                     st.markdown("##### Add New Activity")
-                    with st.form("new_activity_form", clear_on_submit=True, border=False):
+                    with st.form("new_activity_form", clear_on_submit=True, border=True):
                         activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
                         activity_date = st.date_input("Date of Activity", min_value=date.today())
                         potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
                         remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
                         
-                        submitted = st.form_submit_button("✅ Save Activity")
+                        submitted = st.form_submit_button("✅ Save Activity", use_container_width=True)
                         if submitted:
                             if activity_name and activity_date:
                                 new_activity = {
@@ -607,18 +622,19 @@ if db:
                                 st.warning("Activity name and date are required.")
 
                 with col2:
-                    st.markdown("##### Next 15 Upcoming Activities")
+                    st.markdown("##### Next 10 Upcoming Activities")
                     
                     btn_cols = st.columns(2)
-                    if btn_cols[0].button("🔄 Refresh List", key='refresh_activities'):
+                    if btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True):
                         st.cache_data.clear()
                         st.rerun()
-                    if btn_cols[1].button("📂 View All Upcoming Activities"):
+                    if btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True):
                         st.session_state.show_all_activities = True
                         st.rerun()
                     
+                    st.markdown("---",)
                     activities_df = load_activities_from_firestore(db, 'future_activities')
-                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(15)
+                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
                     display_activities(upcoming_df, db)
 
         with tabs[4]:
