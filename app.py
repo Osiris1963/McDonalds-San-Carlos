@@ -151,7 +151,7 @@ def init_firestore():
 def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
-    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
+    if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_events')
     defaults = {
         'forecast_df': pd.DataFrame(), 
         'metrics': {}, 
@@ -166,44 +166,8 @@ def initialize_state_firestore(db_client):
         if key not in st.session_state: st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
-@st.cache_data(ttl="6h")
+@st.cache_data(ttl="1h") # Unified cache time
 def load_from_firestore(_db_client, collection_name):
-    if _db_client is None: return pd.DataFrame()
-    docs = _db_client.collection(collection_name).stream()
-    records = []
-    for doc in docs:
-        record = doc.to_dict()
-        record['doc_id'] = doc.id # BUG FIX: Added doc_id for all collections
-        records.append(record)
-
-    if not records: return pd.DataFrame()
-    df = pd.DataFrame(records)
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        if pd.api.types.is_datetime64_any_dtype(df['date']):
-            df['date'] = df['date'].dt.tz_localize(None)
-        df.dropna(subset=['date'], inplace=True)
-    
-    numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    
-    if 'sales' in df.columns and 'customers' in df.columns:
-        df.dropna(subset=['sales', 'customers'], inplace=True)
-
-    if not df.empty:
-        df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
-    return df
-
-@st.cache_data(ttl="1h")
-def load_activities_from_firestore(_db_client, collection_name):
-    """
-    Loads data from a specified Firestore collection and includes the document ID.
-    Specifically tailored for the 'future_activities' collection.
-    """
     if _db_client is None: return pd.DataFrame()
     
     docs = _db_client.collection(collection_name).stream()
@@ -222,8 +186,9 @@ def load_activities_from_firestore(_db_client, collection_name):
         if pd.api.types.is_datetime64_any_dtype(df['date']):
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
-        
-    numeric_cols = ['potential_sales']
+    
+    # Process all potential numeric columns
+    numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -232,7 +197,6 @@ def load_activities_from_firestore(_db_client, collection_name):
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
         
     return df
-
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -596,7 +560,7 @@ if db:
                         for _, row in recent_df.iterrows():
                             doc_id = row['doc_id']
                             date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
-                            summary_line = f"**{date_str}** | Sales: ₱{row.get('sales', 0):,.2f} | Customers: {row.get('customers', 0)}"
+                            summary_line = f"**{date_str}** | Sales: ₱{row.get('sales', 0):,.2f} | Customers: {row.get('customers', 0)} | Add-ons: ₱{row.get('add_on_sales', 0):,.2f}"
                             with st.expander(summary_line):
                                 with st.form(key=f"update_hist_{doc_id}", border=False):
                                     st.markdown("##### Edit Record")
@@ -638,7 +602,7 @@ if db:
                 st.markdown("#### All Upcoming Activities")
                 st.button("⬅️ Back to Overview", on_click=set_overview)
                 
-                activities_df = load_activities_from_firestore(db, 'future_activities')
+                activities_df = load_from_firestore(db, 'future_activities')
                 all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
                 
                 if all_upcoming_df.empty:
@@ -711,7 +675,7 @@ if db:
                     btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
                     
                     st.markdown("---",)
-                    activities_df = load_activities_from_firestore(db, 'future_activities')
+                    activities_df = load_from_firestore(db, 'future_activities')
                     upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
                     
                     if upcoming_df.empty:
