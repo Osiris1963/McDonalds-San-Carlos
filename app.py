@@ -623,6 +623,17 @@ if db:
                                 month_name = month_tabs_list[i]
                                 month_df = sorted_months_df[sorted_months_df['month_year'] == month_name]
                                 
+                                # --- Monthly Summary Metrics ---
+                                header_cols = st.columns([2, 1, 1])
+                                with header_cols[1]:
+                                    total_sales = month_df['potential_sales'].sum()
+                                    st.metric(label="Total Expected Sales", value=f"₱{total_sales:,.2f}")
+                                with header_cols[2]:
+                                    unconfirmed_count = len(month_df[month_df['remarks'] != 'Confirmed'])
+                                    st.metric(label="Unconfirmed Activities", value=unconfirmed_count)
+                                st.markdown("---")
+                                # --- End Summary ---
+
                                 activities = month_df.to_dict('records')
                                 for i in range(0, len(activities), 4):
                                     cols = st.columns(4)
