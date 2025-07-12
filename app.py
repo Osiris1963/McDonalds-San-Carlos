@@ -240,14 +240,14 @@ def calculate_atv(df):
 def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
-        # --- THIS IS THE FIX: Request a more accurate model ---
+        # --- THIS IS THE FIX: Request a more accurate, region-specific model ---
         params={
             "latitude":10.48,
             "longitude":123.42,
             "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
             "timezone":"Asia/Manila",
             "forecast_days":days,
-            "models": "ecmwf_ifs" # Explicitly request the high-accuracy ECMWF model
+            "models": "cma_gfs" # Explicitly request the high-accuracy CMA model for Southeast Asia
         }
         response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
         df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
