@@ -15,6 +15,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import logging
+import bcrypt
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -156,7 +157,9 @@ def initialize_state_firestore(db_client):
         'forecast_df': pd.DataFrame(), 
         'metrics': {}, 
         'name': "Store 688", 
-        'authentication_status': True, 
+        'authentication_status': False,
+        'access_level': 0,
+        'username': None,
         'forecast_components': pd.DataFrame(), 
         'migration_done': False,
         'show_recent_entries': False,
@@ -164,6 +167,21 @@ def initialize_state_firestore(db_client):
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
+
+# --- User Management Functions ---
+def get_user(db_client, username):
+    users_ref = db_client.collection('users')
+    query = users_ref.where('username', '==', username).limit(1)
+    results = list(query.stream())
+    if results:
+        return results[0]
+    return None
+
+def verify_password(plain_password, hashed_password):
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password)
+
+def hash_password(password):
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
 # --- Data Processing and Feature Engineering ---
 @st.cache_data(ttl="1h") # Unified cache time
@@ -350,7 +368,7 @@ def plot_forecast_breakdown(components,selected_date,all_events):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
         x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
     x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
-    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Customer Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
     effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
@@ -364,7 +382,7 @@ def generate_insight_summary(day_data,selected_date):
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
-def render_activity_card(row, db_client, view_type='compact_list'):
+def render_activity_card(row, db_client, view_type='compact_list', access_level=3):
     doc_id = row['doc_id']
     
     if view_type == 'compact_list':
@@ -380,52 +398,13 @@ def render_activity_card(row, db_client, view_type='compact_list'):
             else: color = '#EF4444'
             st.markdown(f"**Status:** <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
             st.markdown(f"**Potential Sales:** ₱{row['potential_sales']:,.2f}")
-
-            with st.form(key=f"compact_update_form_{doc_id}", border=False):
-                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                current_status_index = status_options.index(status) if status in status_options else 0
-                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"compact_sales_{doc_id}")
-                updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"compact_remarks_{doc_id}")
-                
-                update_col, delete_col = st.columns(2)
-                with update_col:
-                    if st.form_submit_button("💾 Update", use_container_width=True):
-                        update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
-                        update_activity_in_firestore(db, doc_id, update_data)
-                        st.success("Activity updated!")
-                        st.cache_data.clear()
-                        time.sleep(1)
-                        st.rerun()
-                with delete_col:
-                    if st.form_submit_button("🗑️ Delete", use_container_width=True):
-                        delete_from_firestore(db, 'future_activities', doc_id)
-                        st.warning("Activity deleted.")
-                        st.cache_data.clear()
-                        time.sleep(1)
-                        st.rerun()
-    else: # 'grid' view
-        # Use st.container(border=True) to create a visual box for each activity.
-        with st.container(border=True):
-            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
             
-            # Card Content
-            st.markdown(f"**{row['activity_name']}**")
-            st.markdown(f"<small>📅 {activity_date_formatted}</small>", unsafe_allow_html=True)
-            st.markdown(f"💰 ₱{row['potential_sales']:,.2f}")
-            status = row['remarks']
-            if status == 'Confirmed': color = '#22C55E'
-            elif status == 'Needs Follow-up': color = '#F59E0B'
-            elif status == 'Tentative': color = '#38BDF8'
-            else: color = '#EF4444'
-            st.markdown(f"Status: <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
-            
-            # Form inside an expander
-            with st.expander("Edit / Manage"):
-                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
-                current_status_index = status_options.index(status) if status in status_options else 0
-                with st.form(key=f"full_update_form_{doc_id}", border=False):
-                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"full_sales_{doc_id}")
-                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"full_remarks_{doc_id}")
+            if access_level <= 2:
+                with st.form(key=f"compact_update_form_{doc_id}", border=False):
+                    status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                    current_status_index = status_options.index(status) if status in status_options else 0
+                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"compact_sales_{doc_id}")
+                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"compact_remarks_{doc_id}")
                     
                     update_col, delete_col = st.columns(2)
                     with update_col:
@@ -443,15 +422,75 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                             st.cache_data.clear()
                             time.sleep(1)
                             st.rerun()
+    else: # 'grid' view
+        # Use st.container(border=True) to create a visual box for each activity.
+        with st.container(border=True):
+            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+            
+            # Card Content
+            st.markdown(f"**{row['activity_name']}**")
+            st.markdown(f"<small>📅 {activity_date_formatted}</small>", unsafe_allow_html=True)
+            st.markdown(f"💰 ₱{row['potential_sales']:,.2f}")
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E'
+            elif status == 'Needs Follow-up': color = '#F59E0B'
+            elif status == 'Tentative': color = '#38BDF8'
+            else: color = '#EF4444'
+            st.markdown(f"Status: <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
+            
+            # Form inside an expander
+            if access_level <= 2:
+                with st.expander("Edit / Manage"):
+                    status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                    current_status_index = status_options.index(status) if status in status_options else 0
+                    with st.form(key=f"full_update_form_{doc_id}", border=False):
+                        updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"full_sales_{doc_id}")
+                        updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"full_remarks_{doc_id}")
+                        
+                        update_col, delete_col = st.columns(2)
+                        with update_col:
+                            if st.form_submit_button("💾 Update", use_container_width=True):
+                                update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                                update_activity_in_firestore(db, doc_id, update_data)
+                                st.success("Activity updated!")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
+                        with delete_col:
+                            if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                                delete_from_firestore(db, 'future_activities', doc_id)
+                                st.warning("Activity deleted.")
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.rerun()
 
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
 if db:
     initialize_state_firestore(db)
-    if st.session_state["authentication_status"]:
+    
+    if not st.session_state["authentication_status"]:
+        st.title("Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            user = get_user(db, username)
+            if user:
+                user_data = user.to_dict()
+                if verify_password(password, user_data['password']):
+                    st.session_state['authentication_status'] = True
+                    st.session_state['username'] = username
+                    st.session_state['access_level'] = user_data['access_level']
+                    st.rerun()
+                else:
+                    st.error("Incorrect password")
+            else:
+                st.error("User not found")
+    
+    else:
         with st.sidebar:
-            st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['name']}*");st.markdown("---")
+            st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/2560px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
             st.info("Forecasting with Prophet Model")
 
             if st.button("🔄 Refresh Data from Firestore"):
@@ -500,8 +539,17 @@ if db:
             st.markdown("---")
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
             st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
+            if st.button("Logout"):
+                st.session_state['authentication_status'] = False
+                st.session_state['username'] = None
+                st.session_state['access_level'] = 0
+                st.rerun()
         
-        tabs=st.tabs(["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"])
+        tab_list = ["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
+        if st.session_state['access_level'] == 1:
+            tab_list.append("👥 User Interface")
+        
+        tabs=st.tabs(tab_list)
         
         with tabs[0]:
             if not st.session_state.forecast_df.empty:
@@ -529,50 +577,53 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         with tabs[2]:
-            form_col, display_col = st.columns([2, 3], gap="large")
+            if st.session_state['access_level'] <= 2:
+                form_col, display_col = st.columns([2, 3], gap="large")
 
-            with form_col:
-                st.subheader("✍️ Add New Daily Record")
-                with st.form("new_record_form",clear_on_submit=True, border=False):
-                    new_date=st.date_input("Date", date.today())
-                    new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
-                    new_customers=st.number_input("Customer Count",min_value=0)
-                    new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                    new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
-                    if st.form_submit_button("✅ Save Record"):
-                        new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
-                        add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
-                        st.cache_data.clear()
-                        st.success("Record added to Firestore!");
-                        time.sleep(1)
-                        st.rerun()
-            
-            with display_col:
-                if st.button("🗓️ Show/Hide Recent Entries"):
-                    st.session_state.show_recent_entries = not st.session_state.show_recent_entries
+                with form_col:
+                    st.subheader("✍️ Add New Daily Record")
+                    with st.form("new_record_form",clear_on_submit=True, border=False):
+                        new_date=st.date_input("Date", date.today())
+                        new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+                        new_customers=st.number_input("Customer Count",min_value=0)
+                        new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
+                        new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                        if st.form_submit_button("✅ Save Record"):
+                            new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
+                            add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
+                            st.cache_data.clear()
+                            st.success("Record added to Firestore!");
+                            time.sleep(1)
+                            st.rerun()
                 
-                if st.session_state.show_recent_entries:
-                    st.subheader("🗓️ Recent Entries")
-                    with st.container(border=True):
-                        recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
-                        if not recent_df.empty:
-                            display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
-                            cols_to_show = [col for col in display_cols if col in recent_df.columns]
-                            
-                            st.dataframe(
-                                recent_df[cols_to_show],
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
-                                    "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                                    "customers": st.column_config.NumberColumn("Customers", format="%d"),
-                                    "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
-                                    "weather": "Weather"
-                                }
-                            )
-                        else:
-                            st.info("No recent data to display.")
+                with display_col:
+                    if st.button("🗓️ Show/Hide Recent Entries"):
+                        st.session_state.show_recent_entries = not st.session_state.show_recent_entries
+                    
+                    if st.session_state.show_recent_entries:
+                        st.subheader("🗓️ Recent Entries")
+                        with st.container(border=True):
+                            recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
+                            if not recent_df.empty:
+                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
+                                cols_to_show = [col for col in display_cols if col in recent_df.columns]
+                                
+                                st.dataframe(
+                                    recent_df[cols_to_show],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    column_config={
+                                        "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                                        "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                                        "customers": st.column_config.NumberColumn("Customers", format="%d"),
+                                        "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
+                                        "weather": "Weather"
+                                    }
+                                )
+                            else:
+                                st.info("No recent data to display.")
+            else:
+                st.warning("You do not have permission to add or edit data in this tab.")
         
         with tabs[3]:
             def set_view_all(): st.session_state.show_all_activities = True
@@ -617,36 +668,39 @@ if db:
                                     row_activities = activities[i:i+4]
                                     for j, activity in enumerate(row_activities):
                                         with cols[j]:
-                                            render_activity_card(activity, db, view_type='grid')
+                                            render_activity_card(activity, db, view_type='grid', access_level=st.session_state['access_level'])
 
             else:
                 # --- DEFAULT OVERVIEW ---
                 col1, col2 = st.columns([1, 2], gap="large")
 
                 with col1:
-                    st.markdown("##### Add New Activity")
-                    with st.form("new_activity_form", clear_on_submit=True, border=True):
-                        activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
-                        activity_date = st.date_input("Date of Activity", min_value=date.today())
-                        potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
-                        remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
-                        
-                        submitted = st.form_submit_button("✅ Save Activity", use_container_width=True)
-                        if submitted:
-                            if activity_name and activity_date:
-                                new_activity = {
-                                    "activity_name": activity_name,
-                                    "date": pd.to_datetime(activity_date).to_pydatetime(),
-                                    "potential_sales": float(potential_sales),
-                                    "remarks": remarks
-                                }
-                                db.collection('future_activities').add(new_activity)
-                                st.success(f"Activity '{activity_name}' saved!")
-                                st.cache_data.clear()
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.warning("Activity name and date are required.")
+                    if st.session_state['access_level'] <= 3:
+                        st.markdown("##### Add New Activity")
+                        with st.form("new_activity_form", clear_on_submit=True, border=True):
+                            activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
+                            activity_date = st.date_input("Date of Activity", min_value=date.today())
+                            potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
+                            remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
+                            
+                            submitted = st.form_submit_button("✅ Save Activity", use_container_width=True)
+                            if submitted:
+                                if activity_name and activity_date:
+                                    new_activity = {
+                                        "activity_name": activity_name,
+                                        "date": pd.to_datetime(activity_date).to_pydatetime(),
+                                        "potential_sales": float(potential_sales),
+                                        "remarks": remarks
+                                    }
+                                    db.collection('future_activities').add(new_activity)
+                                    st.success(f"Activity '{activity_name}' saved!")
+                                    st.cache_data.clear()
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.warning("Activity name and date are required.")
+                    else:
+                        st.warning("You do not have permission to add new activities.")
 
                 with col2:
                     st.markdown("##### Next 10 Upcoming Activities")
@@ -663,7 +717,7 @@ if db:
                         st.info("No upcoming activities scheduled.")
                     else:
                         for _, row in upcoming_df.iterrows():
-                            render_activity_card(row, db, view_type='compact_list')
+                            render_activity_card(row, db, view_type='compact_list', access_level=st.session_state['access_level'])
 
 
         with tabs[4]:
@@ -699,3 +753,51 @@ if db:
                     st.write("No historical data to display.")
             else:
                 st.write("No historical data to display.")
+
+        if st.session_state['access_level'] == 1:
+            with tabs[5]:
+                st.subheader("User Management")
+
+                # Add new user
+                with st.expander("Add New User"):
+                    with st.form("new_user_form", clear_on_submit=True):
+                        new_username = st.text_input("Username")
+                        new_password = st.text_input("Password", type="password")
+                        new_access_level = st.selectbox("Access Level", [1, 2, 3])
+                        if st.form_submit_button("Add User"):
+                            if get_user(db, new_username):
+                                st.error("User already exists")
+                            else:
+                                hashed_password = hash_password(new_password)
+                                db.collection('users').add({
+                                    'username': new_username,
+                                    'password': hashed_password,
+                                    'access_level': new_access_level
+                                })
+                                st.success("User added successfully")
+                                st.rerun()
+
+                # Display existing users
+                users_df = load_from_firestore(db, 'users')
+                if not users_df.empty:
+                    st.write("Existing Users")
+                    for index, row in users_df.iterrows():
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.write(row['username'])
+                        with col2:
+                            st.write(f"Access Level: {row['access_level']}")
+                        with col3:
+                            if st.button("Edit", key=f"edit_{row['doc_id']}"):
+                                with st.form(f"edit_user_{row['doc_id']}"):
+                                    new_level = st.selectbox("New Access Level", [1, 2, 3], index=row['access_level'] - 1)
+                                    if st.form_submit_button("Update"):
+                                        db.collection('users').document(row['doc_id']).update({'access_level': new_level})
+                                        st.success("User updated")
+                                        st.rerun()
+                        with col4:
+                            if st.button("Delete", key=f"delete_{row['doc_id']}"):
+                                db.collection('users').document(row['doc_id']).delete()
+                                st.success("User deleted")
+                                st.rerun()
+
