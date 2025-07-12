@@ -483,12 +483,41 @@ if db:
 
         with tabs[3]:
             st.subheader("View Historical Data")
-            df=st.session_state.historical_df.copy()
-            if not df.empty and'date'in df.columns:
-                df['date']=pd.to_datetime(df['date'],errors='coerce');df.dropna(subset=['date'],inplace=True)
-                month_periods=df['date'].dt.to_period('M').unique();month_options=sorted([p.strftime('%B %Y')for p in month_periods],reverse=True)
-                if month_options:
-                    selected_month_str=st.selectbox("Select Month to View:",options=month_options);selected_period=pd.Period(selected_month_str);filtered_df=df[df['date'].dt.to_period('M')==selected_period].copy().reset_index(drop=True)
-                    st.dataframe(filtered_df, use_container_width=True, hide_index=True)
-                else:st.write("No historical data to display.")
-            else:st.write("No historical data to display.")
+            df = st.session_state.historical_df.copy()
+            if not df.empty and 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                df.dropna(subset=['date'], inplace=True)
+
+                # Get unique years, sort them in descending order
+                all_years = sorted(df['date'].dt.year.unique(), reverse=True)
+
+                if all_years:
+                    # Create two columns for the selectors
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        selected_year = st.selectbox("Select Year to View:", options=all_years)
+
+                    # Filter dataframe for the selected year to find available months
+                    df_year_filtered = df[df['date'].dt.year == selected_year]
+                    
+                    # Get unique month names and sort them chronologically descending
+                    all_months = sorted(df_year_filtered['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
+
+                    if all_months:
+                        with col2:
+                            selected_month_str = st.selectbox("Select Month to View:", options=all_months)
+
+                        # Convert month name to month number for filtering
+                        selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
+
+                        # Filter dataframe for the selected year and month
+                        filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().reset_index(drop=True)
+
+                        # Display the data
+                        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.write(f"No data available for the year {selected_year}.")
+                else:
+                    st.write("No historical data to display.")
+            else:
+                st.write("No historical data to display.")
