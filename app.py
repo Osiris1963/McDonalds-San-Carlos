@@ -227,7 +227,10 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
-    # Use 'base_sales' for a more accurate ATV of regular business
+    # --- THIS IS THE FIX ---
+    # Create 'base_sales' column to make the function self-contained and robust.
+    df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
+    
     sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0); 
     customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
@@ -280,14 +283,13 @@ def train_and_forecast_component(historical_df, events_df, periods, target_col):
     
     use_yearly_seasonality = len(df_train) >= 365
 
-    # --- THIS IS THE FIX: More flexible trend ---
     prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.05,  # Increased from 0.01 to make trend more flexible
+        changepoint_prior_scale=0.05,
         changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
@@ -565,7 +567,6 @@ if db:
                     with st.spinner("🧠 Building forecast model..."):
                         base_df = st.session_state.historical_df.copy()
                         
-                        # --- THIS IS THE FIX: Analyze 'base_sales' ---
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                         
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
