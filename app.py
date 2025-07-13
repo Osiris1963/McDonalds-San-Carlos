@@ -262,22 +262,16 @@ def create_advanced_features(df):
     return df
 
 @st.cache_resource
-def train_and_forecast_prophet(historical_df, events_df, recurring_events_df, periods, target_col):
+def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15: return pd.DataFrame(), None
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    recurring_events_final = pd.DataFrame()
-    if recurring_events_df is not None and not recurring_events_df.empty:
-        recurring_events_final = recurring_events_df.copy()
-        recurring_events_final = recurring_events_final.rename(columns={'date': 'ds', 'event_name': 'holiday'})
-        recurring_events_final['ds'] = pd.to_datetime(recurring_events_final['ds'])
-
+    # --- REVERTED: Recurring events are no longer part of the main training ---
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
-    all_manual_events = pd.concat([manual_events_renamed, recurring_events_final])
-    all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
+    all_manual_events = manual_events_renamed.dropna(subset=['ds', 'holiday'])
 
     if 'day_type' in historical_df.columns:
         not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
@@ -548,18 +542,18 @@ if db:
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
                         if removed_count > 0: st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
-                        hist_df_with_atv = calculate_atv(cleaned_df); ev_df = st.session_state.events_df.copy(); rec_ev_df = st.session_state.recurring_events_df.copy()
+                        hist_df_with_atv = calculate_atv(cleaned_df); ev_df = st.session_state.events_df.copy()
                         FORECAST_HORIZON = 15
                         cust_f, atv_f = pd.DataFrame(), pd.DataFrame()
                         with st.spinner("Forecasting Customers..."):
-                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, rec_ev_df, FORECAST_HORIZON, 'customers')
+                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                             if not prophet_cust_f.empty and not xgb_cust_f.empty:
                                 cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb')); cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             else: st.error("Failed to generate customer forecast.")
                         with st.spinner("Forecasting Average Sale..."):
                             VALIDATION_PERIOD = 30; train_df = hist_df_with_atv.iloc[:-VALIDATION_PERIOD]; validation_df = hist_df_with_atv.iloc[-VALIDATION_PERIOD:]
-                            prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, rec_ev_df, VALIDATION_PERIOD, 'atv')
+                            prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, VALIDATION_PERIOD, 'atv')
                             xgb_atv_val = train_and_forecast_xgboost_tuned(train_df, ev_df, VALIDATION_PERIOD, 'atv')
                             meta_model_atv = None
                             if not prophet_atv_val.empty and not xgb_atv_val.empty:
@@ -567,7 +561,7 @@ if db:
                                 validation_data_atv = pd.merge(validation_preds_atv, validation_df[['date', 'atv']], left_on='ds', right_on='date')
                                 meta_model_atv = LinearRegression(); meta_model_atv.fit(validation_data_atv[['yhat_prophet', 'yhat_xgb']], validation_data_atv['atv'])
                             if meta_model_atv:
-                                prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, rec_ev_df, FORECAST_HORIZON, 'atv')
+                                prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                                 xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                                 if not prophet_atv_f.empty and not xgb_atv_f.empty:
                                     atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
@@ -577,6 +571,35 @@ if db:
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                            
+                            # --- MODIFICATION: Apply recurring event impact post-forecast ---
+                            rec_ev_df = st.session_state.recurring_events_df.copy()
+                            if not rec_ev_df.empty:
+                                rec_ev_df['date'] = pd.to_datetime(rec_ev_df['date'])
+                                for _, event in rec_ev_df.iterrows():
+                                    if event['date'].date() in pd.to_datetime(combo_f['ds']).dt.date.values:
+                                        last_year_event_date = event['date'] - pd.DateOffset(years=1)
+                                        hist_event_data = hist_df_with_atv[hist_df_with_atv['date'] == last_year_event_date]
+                                        if not hist_event_data.empty:
+                                            event_sales = hist_event_data['sales'].iloc[0]
+                                            event_customers = hist_event_data['customers'].iloc[0]
+                                            
+                                            # Compare to average of surrounding days
+                                            surrounding_dates = pd.date_range(start=last_year_event_date - timedelta(days=3), end=last_year_event_date + timedelta(days=3))
+                                            surrounding_data = hist_df_with_atv[hist_df_with_atv['date'].isin(surrounding_dates) & (hist_df_with_atv['date'] != last_year_event_date)]
+                                            
+                                            if not surrounding_data.empty:
+                                                avg_sales = surrounding_data['sales'].mean()
+                                                avg_customers = surrounding_data['customers'].mean()
+                                                
+                                                sales_impact = event_sales - avg_sales
+                                                customer_impact = event_customers - avg_customers
+                                                
+                                                # Apply impact to the forecast
+                                                combo_f.loc[combo_f['ds'].dt.date == event['date'].date(), 'forecast_sales'] += sales_impact
+                                                combo_f.loc[combo_f['ds'].dt.date == event['date'].date(), 'forecast_customers'] += customer_impact
+                                                st.success(f"Applied historical impact for upcoming event: {event['event_name']}")
+
                             with st.spinner("🛰️ Fetching live weather..."): weather_df = get_weather_forecast()
                             if weather_df is not None: combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
                             else: combo_f['weather'] = 'Not Available'
@@ -649,22 +672,22 @@ if db:
         
         with tabs[3]:
             if st.session_state['access_level'] <= 2:
-                # --- MODIFICATION: New layout for data entry tab ---
                 col1, col2 = st.columns(2, gap="large")
                 with col1:
-                    st.subheader("✍️ Add New Daily Record")
-                    with st.form("new_record_form",clear_on_submit=True, border=True):
-                        new_date=st.date_input("Date", date.today()); new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
-                        new_customers=st.number_input("Customer Count",min_value=0); new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                        new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"]); new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' for unexpected events.")
-                        new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage...") if new_day_type == "Not Normal Day" else ""
-                        if st.form_submit_button("✅ Save Record", use_container_width=True):
-                            new_rec={"date":new_date, "sales":new_sales, "customers":new_customers, "weather":new_weather, "add_on_sales":new_addons, "day_type": new_day_type, "day_type_notes": new_day_type_notes}
-                            add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df); st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
+                    with st.container(border=True):
+                        st.subheader("✍️ Add New Daily Record")
+                        with st.form("new_record_form",clear_on_submit=True):
+                            new_date=st.date_input("Date", date.today()); new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+                            new_customers=st.number_input("Customer Count",min_value=0); new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
+                            new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"]); new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' for unexpected events.")
+                            new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage...") if new_day_type == "Not Normal Day" else ""
+                            if st.form_submit_button("✅ Save Record", use_container_width=True):
+                                new_rec={"date":new_date, "sales":new_sales, "customers":new_customers, "weather":new_weather, "add_on_sales":new_addons, "day_type": new_day_type, "day_type_notes": new_day_type_notes}
+                                add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df); st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
                 
                 with col2:
-                    st.subheader("🎉 Manage Recurring Events")
                     with st.container(border=True):
+                        st.subheader("🎉 Manage Recurring Events")
                         with st.form("add_recurring_event_form"):
                             event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
                             event_date = st.date_input("Date of Event")
@@ -675,7 +698,6 @@ if db:
                                 else: st.warning("Event name and date are required.")
 
                 st.markdown("---")
-                # --- MODIFICATION: Moved Recent Entries to the bottom ---
                 st.subheader("🗓️ Recent Entries & Events")
                 entry_tab, event_tab = st.tabs(["Recent Daily Entries", "Registered Recurring Events"])
                 with entry_tab:
