@@ -326,20 +326,30 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
+
+    # --- MODIFICATION: Handle "Not Normal Days" as special holidays ---
+    # This isolates their impact from regular seasonal patterns.
+    not_normal_days_df = historical_df[historical_df.get('day_type') == 'Not Normal Day'].copy()
+    if not not_normal_days_df.empty:
+        not_normal_events = pd.DataFrame({
+            'holiday': 'Unusual_Day',
+            'ds': pd.to_datetime(not_normal_days_df['date']),
+            'lower_window': 0,
+            'upper_window': 0,
+        })
+        # Combine with other scheduled events
+        all_manual_events = pd.concat([all_manual_events, not_normal_events])
     
     use_yearly_seasonality = len(df_train) >= 365
 
-    # --- MODIFICATION: Prioritize Recent Data ---
-    # The changepoint parameters have been adjusted to make the model more
-    # responsive to recent trends in the data.
     prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.15, # Increased from 0.05 for more trend flexibility.
-        changepoint_range=0.9, # Increased from 0.8 to allow trend changes in the last 10% of the data.
+        changepoint_prior_scale=0.15, 
+        changepoint_range=0.9,
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -353,38 +363,36 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     
-    # Drop rows where the target column is NA
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty:
         return pd.DataFrame()
 
-    # Combine historical and future dataframes to create continuous features
     last_date = df_train['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
     future_df_template = pd.DataFrame({'date': future_dates})
 
-    # Concatenate for seamless feature creation
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
     
-    # Use the new advanced feature engineering function
     full_df_featured = create_advanced_features(full_df)
     
-    # Separate the historical and future dataframes again
+    # --- MODIFICATION: Create a binary feature for "Not Normal Day" ---
+    # This explicitly tells XGBoost that these days are different.
+    full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+
     df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     
-    # Drop rows with NaNs created by shift/rolling operations from the training set
     df_featured.dropna(inplace=True)
 
-    # Define the expanded feature set
+    # Add the new feature to the list of features for the model
     features = [
         'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear',
         'sales_lag_7', 'customers_lag_7',
-        'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
+        'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7',
+        'is_not_normal_day' # New feature added here
     ]
     
-    # Ensure all features exist in the dataframe, if not, they are ignored
     features = [f for f in features if f in df_featured.columns]
     
     target = target_col
@@ -392,19 +400,14 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     X = df_featured[features]
     y = df_featured[target]
     
-    # Check if training data is sufficient after feature creation
     if X.empty or len(X) < 10:
         st.warning("Not enough data to train the XGBoost model after feature engineering.")
         return pd.DataFrame()
         
-    # --- MODIFICATION: Add Sample Weights to Prioritize Recent Data ---
-    # Weights increase linearly from a base of 0.5 to 1.0 for the most recent data.
-    # This makes the model pay more attention to recent trends during training.
     sample_weights = np.linspace(0.5, 1.0, len(y))
 
-    # Split data and weights for training and validation
     X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
-        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False # shuffle=False for time series
+        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
     )
 
     def objective(trial):
@@ -420,7 +423,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
         
         model = xgb.XGBRegressor(**params)
-        # Fit the model with sample weights for both training and evaluation sets
         model.fit(X_train, y_train, 
                   sample_weight=weights_train,
                   eval_set=[(X_test, y_test)],
@@ -428,7 +430,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
                   verbose=False)
         
         preds = model.predict(X_test)
-        # Also weight the final metric for Optuna to optimize on recent data performance
         mae = mean_absolute_error(y_test, preds, sample_weight=weights_test)
         return mae
 
@@ -438,7 +439,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     best_params = study.best_params
     best_params.pop('early_stopping_rounds', None)
     
-    # Train the final model on all data, using the full set of sample weights
     final_model = xgb.XGBRegressor(**best_params)
     final_model.fit(X, y, sample_weight=sample_weights)
 
@@ -481,16 +481,17 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     else: 
         return
 
-    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather']
+    # --- MODIFICATION: Handle new day_type fields ---
+    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather', 'day_type', 'day_type_notes']
     for col in all_cols:
         if col in data and data[col] is not None:
-            if col not in ['weather']:
+            if col not in ['weather', 'day_type', 'day_type_notes']:
                  data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            if col not in ['weather']:
+            if col not in ['weather', 'day_type', 'day_type_notes']:
                 data[col] = 0.0
             else:
-                data[col] = "N/A"
+                data[col] = "N/A" if col == 'weather' else "Normal Day"
 
     db_client.collection(collection_name).add(data)
 
@@ -559,7 +560,6 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     
     return eval_df
 
-# --- MODIFICATION: Updated function to accept a 'days' parameter ---
 def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
     """Calculates MAE and MAPE for a specified number of past days."""
     eval_df = create_daily_evaluation_data(historical_df, forecast_df)
@@ -744,7 +744,12 @@ def render_historical_record(row, db_client):
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-        
+        # --- MODIFICATION: Display Day Type and Notes ---
+        day_type = row.get('day_type', 'Normal Day')
+        st.write(f"**Day Type:** {day_type}")
+        if day_type == 'Not Normal Day':
+            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
+
         if st.session_state['access_level'] <= 2:
             with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
                 st.write("---")
@@ -758,8 +763,14 @@ def render_historical_record(row, db_client):
                 updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
                 
                 weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
-                current_weather_index = weather_options.index(row['weather']) if row.get('weather') in weather_options else 0
+                current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
                 updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+
+                # --- MODIFICATION: Add editing for Day Type ---
+                day_type_options = ["Normal Day", "Not Normal Day"]
+                current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
+                updated_day_type = st.selectbox("Day Type", options=day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
+                updated_day_type_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"notes_{row['doc_id']}")
                 
                 btn_cols = st.columns(2)
                 if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
@@ -767,7 +778,9 @@ def render_historical_record(row, db_client):
                         'sales': updated_sales,
                         'customers': updated_customers,
                         'add_on_sales': updated_addons,
-                        'weather': updated_weather
+                        'weather': updated_weather,
+                        'day_type': updated_day_type,
+                        'day_type_notes': updated_day_type_notes if updated_day_type == 'Not Normal Day' else ''
                     }
                     update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
                     st.success(f"Record for {date_str} updated!")
@@ -965,7 +978,6 @@ if db:
                 "The metrics and charts below use this adjusted forecast."
             )
             
-            # --- MODIFICATION: Added tabs for 7-day and 30-day evaluation ---
             eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
 
             def render_evaluation_content(days):
@@ -1027,8 +1039,23 @@ if db:
                         new_customers=st.number_input("Customer Count",min_value=0)
                         new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                         new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                        
+                        # --- MODIFICATION: Add Day Type selector ---
+                        new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
+                        new_day_type_notes = ""
+                        if new_day_type == "Not Normal Day":
+                            new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage, unexpected local event...")
+
                         if st.form_submit_button("✅ Save Record"):
-                            new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
+                            new_rec={
+                                "date":new_date,
+                                "sales":new_sales,
+                                "customers":new_customers,
+                                "weather":new_weather,
+                                "add_on_sales":new_addons,
+                                "day_type": new_day_type,
+                                "day_type_notes": new_day_type_notes
+                            }
                             add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
                             st.cache_data.clear()
                             st.success("Record added to Firestore!");
@@ -1044,7 +1071,7 @@ if db:
                         with st.container(border=True):
                             recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
                             if not recent_df.empty:
-                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
+                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
                                 cols_to_show = [col for col in display_cols if col in recent_df.columns]
                                 
                                 st.dataframe(
@@ -1056,7 +1083,8 @@ if db:
                                         "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
                                         "customers": st.column_config.NumberColumn("Customers", format="%d"),
                                         "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
-                                        "weather": "Weather"
+                                        "weather": "Weather",
+                                        "day_type": "Day Type"
                                     }
                                 )
                             else:
