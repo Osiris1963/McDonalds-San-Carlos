@@ -5,6 +5,7 @@ import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression # Added for Stacking
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -687,7 +688,7 @@ if db:
     else:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-            st.info("Forecasting with an Ensemble Model (Prophet + XGBoost)")
+            st.info("Forecasting with a Stacking Ensemble Model (Prophet + XGBoost + Meta-Learner)")
 
             if st.button("🔄 Refresh Data from Firestore"):
                 st.cache_data.clear()
@@ -696,10 +697,11 @@ if db:
                 st.rerun()
 
             if st.button("📈 Generate Forecast", use_container_width=True):
-                if len(st.session_state.historical_df) < 20: 
-                    st.error("Please provide at least 20 days of data for reliable forecasting.")
+                # Check for minimum data length
+                if len(st.session_state.historical_df) < 50: # Increased minimum for stacking
+                    st.error("Please provide at least 50 days of data for reliable stacking.")
                 else:
-                    with st.spinner("🧠 Optimizing and building forecast models... This may take a minute."):
+                    with st.spinner("🧠 Building Stacking Ensemble... This may take a few minutes."):
                         base_df = st.session_state.historical_df.copy()
                         
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
@@ -710,23 +712,77 @@ if db:
                             st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
                         hist_df_with_atv = calculate_atv(cleaned_df)
-                        
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- TRAIN AND COMBINE MODELS ---
-                        prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'customers')
-                        prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'atv')
+                        # --- STACKING IMPLEMENTATION ---
+                        
+                        # Define the forecast horizon and validation period
+                        FORECAST_HORIZON = 15
+                        VALIDATION_PERIOD = 30 # Use last 30 days to train the meta-model
+                        
+                        # Split data for meta-model training
+                        train_df = hist_df_with_atv.iloc[:-VALIDATION_PERIOD]
+                        validation_df = hist_df_with_atv.iloc[-VALIDATION_PERIOD:]
+                        
+                        # --- TRAIN META-MODEL FOR CUSTOMERS ---
+                        with st.spinner("Training Customer Meta-Model..."):
+                            # 1. Get base model predictions on the validation set
+                            prophet_cust_val, _ = train_and_forecast_prophet(train_df, ev_df, VALIDATION_PERIOD, 'customers')
+                            xgb_cust_val = train_and_forecast_xgboost_tuned(train_df, ev_df, VALIDATION_PERIOD, 'customers')
+                            
+                            if not prophet_cust_val.empty and not xgb_cust_val.empty:
+                                # 2. Align predictions with actuals
+                                validation_preds_cust = pd.merge(prophet_cust_val[['ds', 'yhat']], xgb_cust_val[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                validation_data_cust = pd.merge(validation_preds_cust, validation_df[['date', 'customers']], left_on='ds', right_on='date')
 
-                        xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, 15, 'customers')
-                        xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, 15, 'atv')
+                                # 3. Train the meta-model
+                                meta_model_cust = LinearRegression()
+                                X_meta_cust = validation_data_cust[['yhat_prophet', 'yhat_xgb']]
+                                y_meta_cust = validation_data_cust['customers']
+                                meta_model_cust.fit(X_meta_cust, y_meta_cust)
+                            else:
+                                meta_model_cust = None # Flag if training failed
 
-                        if not prophet_cust_f.empty and not xgb_cust_f.empty:
+                        # --- TRAIN META-MODEL FOR ATV ---
+                        with st.spinner("Training ATV Meta-Model..."):
+                            # 1. Get base model predictions on the validation set
+                            prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, VALIDATION_PERIOD, 'atv')
+                            xgb_atv_val = train_and_forecast_xgboost_tuned(train_df, ev_df, VALIDATION_PERIOD, 'atv')
+
+                            if not prophet_atv_val.empty and not xgb_atv_val.empty:
+                                # 2. Align predictions with actuals
+                                validation_preds_atv = pd.merge(prophet_atv_val[['ds', 'yhat']], xgb_atv_val[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                validation_data_atv = pd.merge(validation_preds_atv, validation_df[['date', 'atv']], left_on='ds', right_on='date')
+
+                                # 3. Train the meta-model
+                                meta_model_atv = LinearRegression()
+                                X_meta_atv = validation_data_atv[['yhat_prophet', 'yhat_xgb']]
+                                y_meta_atv = validation_data_atv['atv']
+                                meta_model_atv.fit(X_meta_atv, y_meta_atv)
+                            else:
+                                meta_model_atv = None # Flag if training failed
+
+                        # --- GENERATE FINAL FORECASTS ---
+                        with st.spinner("Generating Final Forecasts..."):
+                            # Get base model forecasts on the FULL historical dataset
+                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
+                            xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
+                            
+                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                            xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+
+                        if meta_model_cust and meta_model_atv and not prophet_cust_f.empty and not xgb_cust_f.empty:
+                            # 4. Use meta-models to combine final forecasts
                             cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
                             atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
 
-                            cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
-                            atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
+                            final_X_meta_cust = cust_f[['yhat_prophet', 'yhat_xgb']]
+                            cust_f['yhat'] = meta_model_cust.predict(final_X_meta_cust)
+
+                            final_X_meta_atv = atv_f[['yhat_prophet', 'yhat_xgb']]
+                            atv_f['yhat'] = meta_model_atv.predict(final_X_meta_atv)
                             
+                            # Combine into a single forecast dataframe
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
@@ -739,13 +795,14 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
+                            # Store Prophet components for insights tab
                             prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
                             st.session_state.forecast_components = prophet_forecast_components
                             st.session_state.all_holidays = prophet_model_cust.holidays
                             
-                            st.success(f"Ensemble forecast generated successfully!")
+                            st.success(f"Stacking ensemble forecast generated successfully!")
                         else:
-                            st.error("Forecast generation failed. One of the models could not be trained.")
+                            st.error("Forecast generation failed. Could not train the stacking ensemble.")
 
             st.markdown("---")
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
