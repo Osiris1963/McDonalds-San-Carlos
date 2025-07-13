@@ -448,7 +448,7 @@ def generate_insight_summary(day_data,selected_date):
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
 def render_activity_card(row, db_client, view_type='compact_list', access_level=3):
-    if 'doc_id' not in row: return # Safeguard against missing doc_id
+    if 'doc_id' not in row: return 
     doc_id = row['doc_id']
     if view_type == 'compact_list':
         date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y'); summary_line = f"**{date_str}** | {row['activity_name']}"
@@ -649,71 +649,57 @@ if db:
         
         with tabs[3]:
             if st.session_state['access_level'] <= 2:
-                form_col, display_col = st.columns([2, 3], gap="large")
-                with form_col:
+                # --- MODIFICATION: New layout for data entry tab ---
+                col1, col2 = st.columns(2, gap="large")
+                with col1:
                     st.subheader("✍️ Add New Daily Record")
-                    with st.form("new_record_form",clear_on_submit=True, border=False):
+                    with st.form("new_record_form",clear_on_submit=True, border=True):
                         new_date=st.date_input("Date", date.today()); new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
                         new_customers=st.number_input("Customer Count",min_value=0); new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                         new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"]); new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' for unexpected events.")
                         new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage...") if new_day_type == "Not Normal Day" else ""
-                        if st.form_submit_button("✅ Save Record"):
+                        if st.form_submit_button("✅ Save Record", use_container_width=True):
                             new_rec={"date":new_date, "sales":new_sales, "customers":new_customers, "weather":new_weather, "add_on_sales":new_addons, "day_type": new_day_type, "day_type_notes": new_day_type_notes}
                             add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df); st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
                 
-                with display_col:
-                    btn_cols = st.columns(2)
-                    if btn_cols[0].button("🗓️ Show/Hide Recent Entries"): st.session_state.show_recent_entries = not st.session_state.show_recent_entries
-                    if btn_cols[1].button("🎉 Manage Recurring Events"): st.session_state.show_recurring_events_dialog = True
-                    
-                    if st.session_state.show_recent_entries:
-                        st.subheader("🗓️ Recent Entries")
-                        with st.container(border=True):
-                            recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
-                            if not recent_df.empty:
-                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
-                                st.dataframe(recent_df[[col for col in display_cols if col in recent_df.columns]], use_container_width=True, hide_index=True,
-                                    column_config={"date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"), "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
-                                                   "customers": st.column_config.NumberColumn("Customers", format="%d"), "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
-                                                   "weather": "Weather", "day_type": "Day Type"})
-                            else: st.info("No recent data to display.")
-            else: st.warning("You do not have permission to add or edit data.")
-        
-        if st.session_state.get('show_recurring_events_dialog', False):
-            # --- MODIFICATION: Use a conditional block instead of st.dialog ---
-            dialog_cols = st.columns([1, 2, 1])
-            with dialog_cols[1]:
-                with st.container(border=True):
-                    st.subheader("Manage Recurring Events")
-                    st.info("Add yearly events with specific dates that impact sales (e.g., local festivals, holidays with shifting dates).")
-                    
-                    with st.form("add_recurring_event_form"):
-                        event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
-                        event_date = st.date_input("Date of Event")
-                        if st.form_submit_button("Add Event", use_container_width=True):
-                            if event_name and event_date:
-                                add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'date': event_date})
-                                st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1)
-                                st.session_state.show_recurring_events_dialog = False; st.rerun()
-                            else: st.warning("Event name and date are required.")
+                with col2:
+                    st.subheader("🎉 Manage Recurring Events")
+                    with st.container(border=True):
+                        with st.form("add_recurring_event_form"):
+                            event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
+                            event_date = st.date_input("Date of Event")
+                            if st.form_submit_button("Add Event", use_container_width=True):
+                                if event_name and event_date:
+                                    add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'date': event_date})
+                                    st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1); st.rerun()
+                                else: st.warning("Event name and date are required.")
 
-                    st.markdown("---")
-                    st.subheader("Existing Recurring Events")
+                st.markdown("---")
+                # --- MODIFICATION: Moved Recent Entries to the bottom ---
+                st.subheader("🗓️ Recent Entries & Events")
+                entry_tab, event_tab = st.tabs(["Recent Daily Entries", "Registered Recurring Events"])
+                with entry_tab:
+                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
+                    if not recent_df.empty:
+                        display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
+                        st.dataframe(recent_df[[col for col in display_cols if col in recent_df.columns]], use_container_width=True, hide_index=True,
+                            column_config={"date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"), "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                                           "customers": st.column_config.NumberColumn("Customers", format="%d"), "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
+                                           "weather": "Weather", "day_type": "Day Type"})
+                    else: st.info("No recent data to display.")
+                
+                with event_tab:
                     recurring_df = st.session_state.recurring_events_df
                     if not recurring_df.empty:
                         for index, row in recurring_df.iterrows():
-                            col1, col2 = st.columns([3,1])
+                            re_col1, re_col2 = st.columns([3,1])
                             event_display_date = pd.to_datetime(row['date']).strftime('%B %d, %Y')
-                            col1.write(f"**{row['event_name']}** - {event_display_date}")
-                            if col2.button("Delete", key=f"delete_rec_{row['doc_id']}", use_container_width=True):
-                                delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1)
-                                st.session_state.show_recurring_events_dialog = False; st.rerun()
+                            re_col1.write(f"**{row['event_name']}** - {event_display_date}")
+                            if re_col2.button("Delete", key=f"delete_rec_{row['doc_id']}", use_container_width=True):
+                                delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1); st.rerun()
                     else: st.info("No recurring events added yet.")
 
-                    if st.button("Close", use_container_width=True):
-                        st.session_state.show_recurring_events_dialog = False
-                        st.rerun()
-
+            else: st.warning("You do not have permission to add or edit data.")
 
         with tabs[4]:
             def set_view_all(): st.session_state.show_all_activities = True
