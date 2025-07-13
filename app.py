@@ -271,8 +271,7 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
-# --- MODIFICATION ---: Corrected function to handle categorical features like 'weather'
-def create_advanced_features(df, target_column):
+def create_advanced_features(df, target_column=None):
     """
     Creates time series and other features from the input dataframe.
     Handles categorical features by one-hot encoding them.
@@ -281,10 +280,8 @@ def create_advanced_features(df, target_column):
 
     # One-Hot Encode categorical features like 'weather'
     if 'weather' in df.columns:
-        # Using get_dummies to convert categorical variable into dummy/indicator variables
         weather_dummies = pd.get_dummies(df['weather'], prefix='weather')
         df = pd.concat([df, weather_dummies], axis=1)
-        # Drop the original 'weather' column as it's been encoded
         df.drop('weather', axis=1, inplace=True)
 
     df = df.set_index('date')
@@ -297,12 +294,10 @@ def create_advanced_features(df, target_column):
     df['dayofyear'] = df.index.dayofyear
     df['weekofyear'] = df.index.isocalendar().week.astype(int)
 
-    # Lag features on the target column
-    if target_column in df.columns:
+    # Lag/Rolling features - only if a target_column is provided (i.e., for training)
+    if target_column and target_column in df.columns:
         for lag in [7, 14]:
             df[f'lag_{target_column}_{lag}'] = df[target_column].shift(lag)
-
-        # Rolling window features on the target column
         df[f'rolling_mean_{target_column}_7'] = df[target_column].rolling(window=7).mean()
         df[f'rolling_std_{target_column}_7'] = df[target_column].rolling(window=7).std()
     
@@ -651,8 +646,8 @@ if db:
                 time.sleep(1); st.rerun()
 
             if st.button("📈 Generate Forecast", use_container_width=True):
-                if len(st.session_state.historical_df) < 20: 
-                    st.error("Please provide at least 20 days of data for reliable forecasting.")
+                if len(st.session_state.historical_df) < 30: 
+                    st.error("Please provide at least 30 days of data for reliable forecasting.")
                 else:
                     spinner_text = "🧠 Building advanced forecast... This uses robust tuning and may take a few minutes."
                     with st.spinner(spinner_text):
@@ -675,7 +670,7 @@ if db:
                             
                             df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
 
-                            df_featured_train = create_advanced_features(df_merged.copy(), 'residual')
+                            df_featured_train = create_advanced_features(df_merged.copy(), target_column='residual')
 
                             xgb_model = train_xgboost_on_residuals_tuned(df_featured_train, 'residual')
                             if not xgb_model: return pd.DataFrame(), prophet_model, all_events
@@ -684,20 +679,14 @@ if db:
                             future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
                             future_df_base = pd.DataFrame({'date': future_dates})
                             
-                            future_df_base[target_col] = 0 
-                            future_featured = create_advanced_features(future_df_base.copy(), target_col)
+                            future_featured = create_advanced_features(future_df_base.copy(), target_column=None)
                             
                             train_cols = xgb_model.get_booster().feature_names
-                            future_cols = future_featured.columns
-
+                            
                             # Align columns - crucial for prediction
-                            for col in train_cols:
-                                if col not in future_cols:
-                                    future_featured[col] = 0
+                            future_featured_aligned = future_featured.reindex(columns=train_cols, fill_value=0)
                             
-                            future_featured = future_featured[train_cols]
-                            
-                            future_residual_preds = xgb_model.predict(future_featured)
+                            future_residual_preds = xgb_model.predict(future_featured_aligned)
 
                             final_forecast = prophet_forecast.copy()
                             final_forecast.loc[len(df):, 'yhat'] += future_residual_preds
