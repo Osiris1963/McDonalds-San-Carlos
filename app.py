@@ -569,7 +569,12 @@ if db:
             if hist_df.empty or hist_forecast_df.empty:
                 st.warning("Not enough historical actuals or saved forecasts to evaluate. Please add data and generate a forecast.")
             else:
+                # FIX: Ensure data types of the merge key ('date') are identical
+                hist_df['date'] = pd.to_datetime(hist_df['date'])
+                hist_forecast_df['date'] = pd.to_datetime(hist_forecast_df['date'])
+
                 eval_df = pd.merge(hist_df, hist_forecast_df, on='date', how='inner')
+
                 if 'add_on_sales' in eval_df.columns and 'forecast_sales' in eval_df.columns:
                     eval_df['forecast_total_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
                 else:
@@ -603,20 +608,20 @@ if db:
         
         with tabs[3]: # Add/Edit Data
             if st.session_state['access_level'] <= 2:
-                # The rest of the original code for this tab goes here
-                pass # Placeholder for brevity
+                # Add original code for this tab here
+                pass
             else:
                 st.warning("You do not have permission to add or edit data.")
         
         with tabs[4]: # Future Activities
-            # The rest of the original code for this tab goes here
-            pass # Placeholder for brevity
+            # Add original code for this tab here
+            pass
 
         with tabs[5]: # Historical Data
-            # The rest of the original code for this tab goes here
-            pass # Placeholder for brevity
+            # Add original code for this tab here
+            pass
         
         if st.session_state['access_level'] == 1:
             with tabs[6]: # User Interface
-                # The rest of the original code for this tab goes here
-                pass # Placeholder for brevity
+                # Add original code for this tab here
+                pass
