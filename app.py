@@ -158,21 +158,12 @@ def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
-    # --- MODIFICATION: Load recurring events into state ---
     if 'recurring_events_df' not in st.session_state: st.session_state.recurring_events_df = load_from_firestore(db_client, 'recurring_events')
 
     defaults = {
-        'forecast_df': pd.DataFrame(), 
-        'metrics': {}, 
-        'name': "Store 688", 
-        'authentication_status': False,
-        'access_level': 0,
-        'username': None,
-        'forecast_components': pd.DataFrame(), 
-        'migration_done': False,
-        'show_recent_entries': False,
-        'show_all_activities': False,
-        'show_recurring_events_modal': False
+        'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688", 'authentication_status': False,
+        'access_level': 0, 'username': None, 'forecast_components': pd.DataFrame(), 'migration_done': False,
+        'show_recent_entries': False, 'show_all_activities': False, 'show_recurring_events_dialog': False
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -182,9 +173,7 @@ def get_user(db_client, username):
     users_ref = db_client.collection('users')
     query = users_ref.where('username', '==', username).limit(1)
     results = list(query.stream())
-    if results:
-        return results[0]
-    return None
+    return results[0] if results else None
 
 def verify_password(plain_password, hashed_password):
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
@@ -198,9 +187,11 @@ def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
     
     docs = _db_client.collection(collection_name).stream()
-    records = [doc.to_dict() for doc in docs]
-    for doc, record in zip(docs, records):
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
         record['doc_id'] = doc.id
+        records.append(record)
         
     if not records: return pd.DataFrame()
     
@@ -220,10 +211,8 @@ def load_from_firestore(_db_client, collection_name):
     return df
 
 def remove_outliers_iqr(df, column='sales'):
-    Q1 = df[column].quantile(0.25)
-    Q3 = df[column].quantile(0.75)
-    IQR = Q3 - Q1
-    upper_bound = Q3 + 1.5 * IQR
+    Q1 = df[column].quantile(0.25); Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1; upper_bound = Q3 + 1.5 * IQR
     original_rows = len(df)
     cleaned_df = df[df[column] <= upper_bound].copy()
     removed_rows = original_rows - len(cleaned_df)
@@ -241,18 +230,13 @@ def calculate_atv(df):
 def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
-        params={
-            "latitude":10.48, "longitude":123.42,
-            "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
-            "timezone":"Asia/Manila", "forecast_days":days,
-        }
+        params={"latitude":10.48, "longitude":123.42, "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max", "timezone":"Asia/Manila", "forecast_days":days}
         response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
         df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
         df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
         return df
     except requests.exceptions.RequestException as e:
-        st.error(f"Could not fetch weather data. Error: {e}")
-        return None
+        st.error(f"Could not fetch weather data. Error: {e}"); return None
 
 def map_weather_code(code):
     if code in [0, 1]: return "Sunny"
@@ -264,27 +248,14 @@ def map_weather_code(code):
     if code in [95, 96, 99]: return "Thunderstorm"
     return "Cloudy"
 
-def generate_recurring_local_events(start_date,end_date):
-    local_events=[];current_date=start_date
-    while current_date<=end_date:
-        if current_date.day in[15,30]:local_events.append({'holiday':'Payday','ds':current_date,'lower_window':0,'upper_window':1});[local_events.append({'holiday':'Near_Payday','ds':current_date-timedelta(days=i),'lower_window':0,'upper_window':0})for i in range(1,3)]
-        if current_date.month==7 and current_date.day==1:local_events.append({'holiday':'San Carlos Charter Day','ds':current_date,'lower_window':0,'upper_window':0})
-        current_date+=timedelta(days=1)
-    return pd.DataFrame(local_events)
-
 # --- Core Forecasting Models ---
-
 def create_advanced_features(df):
     df['date'] = pd.to_datetime(df['date'])
-    df['dayofweek'] = df['date'].dt.dayofweek
-    df['quarter'] = df['date'].dt.quarter
-    df['month'] = df['date'].dt.month
-    df['year'] = df['date'].dt.year
-    df['dayofyear'] = df['date'].dt.dayofyear
-    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    df['dayofweek'] = df['date'].dt.dayofweek; df['quarter'] = df['date'].dt.quarter
+    df['month'] = df['date'].dt.month; df['year'] = df['date'].dt.year
+    df['dayofyear'] = df['date'].dt.dayofyear; df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     df = df.sort_values('date')
-    df['sales_lag_7'] = df['sales'].shift(7)
-    df['customers_lag_7'] = df['customers'].shift(7)
+    df['sales_lag_7'] = df['sales'].shift(7); df['customers_lag_7'] = df['customers'].shift(7)
     df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
     df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
     df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
@@ -294,30 +265,17 @@ def create_advanced_features(df):
 def train_and_forecast_prophet(historical_df, events_df, recurring_events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
-    
-    if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame(), None
+    if df_train.empty or len(df_train) < 15: return pd.DataFrame(), None
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    start_date = df_train['date'].min()
-    end_date = df_train['date'].max() + timedelta(days=periods)
-    
-    # --- MODIFICATION: Dynamically generate dates for recurring events ---
-    all_years = range(start_date.year, end_date.year + 2)
-    custom_recurring_events = []
+    # --- MODIFICATION: Use specific dates from recurring events ---
+    recurring_events_final = pd.DataFrame()
     if recurring_events_df is not None and not recurring_events_df.empty:
-        for _, event in recurring_events_df.iterrows():
-            for year in all_years:
-                custom_recurring_events.append({
-                    'holiday': event['event_name'],
-                    'ds': pd.to_datetime(f"{year}-{event['month']}-{event['day']}"),
-                    'lower_window': 0, 'upper_window': 1
-                })
-    
-    recurring_events_final = pd.DataFrame(custom_recurring_events)
-    
-    # Combine all event types
+        recurring_events_final = recurring_events_df.copy()
+        recurring_events_final = recurring_events_final.rename(columns={'date': 'ds', 'event_name': 'holiday'})
+        recurring_events_final['ds'] = pd.to_datetime(recurring_events_final['ds'])
+
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events_final])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
@@ -325,10 +283,7 @@ def train_and_forecast_prophet(historical_df, events_df, recurring_events_df, pe
     if 'day_type' in historical_df.columns:
         not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
         if not not_normal_days_df.empty:
-            not_normal_events = pd.DataFrame({
-                'holiday': 'Unusual_Day', 'ds': pd.to_datetime(not_normal_days_df['date']),
-                'lower_window': 0, 'upper_window': 0,
-            })
+            not_normal_events = pd.DataFrame({'holiday': 'Unusual_Day', 'ds': pd.to_datetime(not_normal_days_df['date']), 'lower_window': 0, 'upper_window': 0})
             all_manual_events = pd.concat([all_manual_events, not_normal_events])
     
     use_yearly_seasonality = len(df_train) >= 365
@@ -343,7 +298,6 @@ def train_and_forecast_prophet(historical_df, events_df, recurring_events_df, pe
     
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
-    
     return forecast[['ds', 'yhat']], prophet_model
 
 @st.cache_resource
@@ -358,70 +312,47 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
     full_df_featured = create_advanced_features(full_df)
     
-    if 'day_type' in full_df_featured.columns:
-        full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
-    else:
-        full_df_featured['is_not_normal_day'] = 0
+    full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0) if 'day_type' in full_df_featured.columns else 0
 
     df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     df_featured.dropna(subset=['sales_lag_7'], inplace=True)
 
-    features = [
-        'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear',
-        'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 
-        'customers_rolling_mean_7', 'sales_rolling_std_7', 'is_not_normal_day' 
-    ]
+    features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'is_not_normal_day']
     features = [f for f in features if f in df_featured.columns]
     target = target_col
     X = df_featured[features]; y = df_featured[target]
     
     if X.empty or len(X) < 10:
-        st.warning("Not enough data for XGBoost model after feature engineering.")
-        return pd.DataFrame()
+        st.warning("Not enough data for XGBoost model."); return pd.DataFrame()
         
     sample_weights = np.linspace(0.5, 1.0, len(y))
-    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
-        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
-    )
+    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False)
 
     def objective(trial):
-        params = {
-            'objective': 'reg:squarederror', 'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1), 'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'random_state': 42, 'early_stopping_rounds': 50
-        }
+        params = {'objective': 'reg:squarederror', 'n_estimators': trial.suggest_int('n_estimators', 500, 2000), 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1), 'max_depth': trial.suggest_int('max_depth', 3, 10), 'subsample': trial.suggest_float('subsample', 0.6, 1.0), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0), 'random_state': 42, 'early_stopping_rounds': 50}
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, sample_weight=weights_train, eval_set=[(X_test, y_test)], sample_weight_eval_set=[weights_test], verbose=False)
-        preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds, sample_weight=weights_test)
+        mae = mean_absolute_error(y_test, model.predict(X_test), sample_weight=weights_test)
         return mae
 
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50) 
+    study = optuna.create_study(direction='minimize'); study.optimize(objective, n_trials=50) 
     best_params = study.best_params; best_params.pop('early_stopping_rounds', None)
-    final_model = xgb.XGBRegressor(**best_params)
-    final_model.fit(X, y, sample_weight=sample_weights)
+    final_model = xgb.XGBRegressor(**best_params); final_model.fit(X, y, sample_weight=sample_weights)
 
-    X_future = future_df_featured[features]
-    future_predictions = final_model.predict(X_future)
-    full_prediction_df = df_featured[['date']].copy()
-    full_prediction_df['yhat'] = final_model.predict(X)
+    future_predictions = final_model.predict(future_df_featured[features])
+    full_prediction_df = df_featured[['date']].copy(); full_prediction_df['yhat'] = final_model.predict(X)
     future_df_template['yhat'] = future_predictions
-    final_df = pd.concat([full_prediction_df, future_df_template], ignore_index=True).rename(columns={'date': 'ds'})
-    return final_df
+    return pd.concat([full_prediction_df, future_df_template], ignore_index=True).rename(columns={'date': 'ds'})
 
-# --- Plotting Functions & Firestore Data I/O ---
+# --- Plotting & Firestore I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df=None):
     if db_client is None: return
-    
     if collection_name == 'historical_data' and historical_df is not None:
         if 'date' in data and pd.notna(data['date']):
             current_date = pd.to_datetime(data['date'])
             last_year_date = current_date - timedelta(days=364)
-            hist_copy = historical_df.copy()
-            hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
+            hist_copy = historical_df.copy(); hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
             last_year_record = hist_copy[hist_copy['date_only'] == last_year_date.date()]
             data['last_year_sales'] = last_year_record['sales'].iloc[0] if not last_year_record.empty else 0.0
             data['last_year_customers'] = last_year_record['customers'].iloc[0] if not last_year_record.empty else 0.0
@@ -430,28 +361,25 @@ def add_to_firestore(db_client, collection_name, data, historical_df=None):
         all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather', 'day_type', 'day_type_notes']
         for col in all_cols:
             if col in data and data[col] is not None:
-                if col not in ['weather', 'day_type', 'day_type_notes']:
-                     data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+                if col not in ['weather', 'day_type', 'day_type_notes']: data[col] = float(pd.to_numeric(data[col], errors='coerce'))
             else:
                 if col not in ['weather', 'day_type', 'day_type_notes']: data[col] = 0.0
                 else: data[col] = "N/A" if col == 'weather' else "Normal Day"
-    
+    elif collection_name == 'recurring_events':
+        data['date'] = pd.to_datetime(data['date']).to_pydatetime()
+
     db_client.collection(collection_name).add(data)
 
-
 def update_historical_record_in_firestore(db_client, doc_id, data):
-    if db_client is None: return
-    db_client.collection('historical_data').document(doc_id).update(data)
+    if db_client: db_client.collection('historical_data').document(doc_id).update(data)
 
 def update_activity_in_firestore(db_client, doc_id, data):
-    if db_client is None: return
-    if 'potential_sales' in data:
+    if db_client and 'potential_sales' in data:
         data['potential_sales'] = float(data['potential_sales'])
-    db_client.collection('future_activities').document(doc_id).update(data)
+        db_client.collection('future_activities').document(doc_id).update(data)
 
 def delete_from_firestore(db_client, collection_name, doc_id):
-    if db_client is None: return
-    db_client.collection(collection_name).document(doc_id).delete()
+    if db_client: db_client.collection(collection_name).document(doc_id).delete()
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
@@ -462,10 +390,8 @@ def plot_full_comparison_chart(hist,fcst,metrics,target):
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
-    if 'weekly' in day_data and pd.notna(day_data['weekly']):
-        x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
-    if 'yearly' in day_data and pd.notna(day_data['yearly']):
-        x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
+    if 'weekly' in day_data and pd.notna(day_data['weekly']): x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
+    if 'yearly' in day_data and pd.notna(day_data['yearly']): x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
     if 'holidays' in day_data and pd.notna(day_data['holidays']):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
         x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
@@ -504,8 +430,7 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
 
 def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
     if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
-        fig = go.Figure().update_layout(title=title, paper_bgcolor='white', plot_bgcolor='white', font_color='black', xaxis={"visible": False}, yaxis={"visible": False}, annotations=[{"text": "No data available.", "xref": "paper", "yref": "paper", "showarrow": False, "font": {"size": 16}}])
-        return fig
+        return go.Figure().update_layout(title=title, paper_bgcolor='white', plot_bgcolor='white', font_color='black', xaxis={"visible": False}, yaxis={"visible": False}, annotations=[{"text": "No data available.", "xref": "paper", "yref": "paper", "showarrow": False, "font": {"size": 16}}])
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df[date_col], y=df[actual_col], mode='lines+markers', name='Actual', line=dict(color='#1f77b4', width=2), marker=dict(symbol='circle', size=6)))
     fig.add_trace(go.Scatter(x=df[date_col], y=df[forecast_col], mode='lines+markers', name='Forecast', line=dict(color='#d62728', dash='dash', width=2), marker=dict(symbol='x', size=7)))
@@ -517,7 +442,7 @@ def generate_insight_summary(day_data,selected_date):
     effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
     significant_effects={k:v for k,v in effects.items()if abs(v)>1}
     summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
-    if not significant_effects: summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."; return summary
+    if not significant_effects: summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven by this trend."; return summary
     pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
     if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
@@ -627,10 +552,12 @@ if db:
                         with st.spinner("Forecasting Customers..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, rec_ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
+                            cust_f = pd.DataFrame()
                             if not prophet_cust_f.empty and not xgb_cust_f.empty:
                                 cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb')); cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             else: st.error("Failed to generate customer forecast.")
                         with st.spinner("Forecasting Average Sale..."):
+                            atv_f = pd.DataFrame()
                             VALIDATION_PERIOD = 30; train_df = hist_df_with_atv.iloc[:-VALIDATION_PERIOD]; validation_df = hist_df_with_atv.iloc[-VALIDATION_PERIOD:]
                             prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, rec_ev_df, VALIDATION_PERIOD, 'atv')
                             xgb_atv_val = train_and_forecast_xgboost_tuned(train_df, ev_df, VALIDATION_PERIOD, 'atv')
@@ -647,7 +574,7 @@ if db:
                                     atv_f['yhat'] = meta_model_atv.predict(atv_f[['yhat_prophet', 'yhat_xgb']])
                                 else: st.error("Failed to generate ATV forecast.")
                             else: st.error("Failed to train ATV meta-model.")
-                        if 'cust_f' in locals() and not cust_f.empty and 'atv_f' in locals() and not atv_f.empty:
+                        if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             with st.spinner("🛰️ Fetching live weather..."): weather_df = get_weather_forecast()
@@ -735,10 +662,9 @@ if db:
                             add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df); st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
                 
                 with display_col:
-                    # --- MODIFICATION: Add button for recurring events modal ---
                     btn_cols = st.columns(2)
                     if btn_cols[0].button("🗓️ Show/Hide Recent Entries"): st.session_state.show_recent_entries = not st.session_state.show_recent_entries
-                    if btn_cols[1].button("🎉 Manage Recurring Events"): st.session_state.show_recurring_events_modal = True
+                    if btn_cols[1].button("🎉 Manage Recurring Events"): st.session_state.show_recurring_events_dialog = True
                     
                     if st.session_state.show_recent_entries:
                         st.subheader("🗓️ Recent Entries")
@@ -753,37 +679,33 @@ if db:
                             else: st.info("No recent data to display.")
             else: st.warning("You do not have permission to add or edit data.")
         
-        # --- MODIFICATION: Recurring Events Modal ---
-        if st.session_state.get('show_recurring_events_modal', False):
-            with st.form("recurring_events_form"):
-                st.subheader("Manage High-Impact Recurring Events")
-                st.info("Add yearly events that significantly impact sales (e.g., local festivals).")
-                
-                with st.expander("Add New Recurring Event", expanded=True):
+        if st.session_state.get('show_recurring_events_dialog', False):
+            with st.dialog("Manage Recurring Events", width="small"):
+                with st.form("recurring_events_form"):
+                    st.subheader("Add New Recurring Event")
+                    st.info("Add yearly events with specific dates that impact sales (e.g., local festivals, holidays with shifting dates).")
                     event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
-                    month_options = {1: 'January', 2: 'February', 3: 'March', 4: 'April', 5: 'May', 6: 'June', 7: 'July', 8: 'August', 9: 'September', 10: 'October', 11: 'November', 12: 'December'}
-                    event_month = st.selectbox("Month", options=list(month_options.keys()), format_func=lambda x: month_options[x])
-                    event_day = st.number_input("Day", min_value=1, max_value=31, value=1)
-                    if st.form_submit_button("Add Event"):
-                        if event_name:
-                            add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'month': event_month, 'day': event_day})
-                            st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1); st.rerun()
-                        else: st.warning("Event name is required.")
+                    event_date = st.date_input("Date of Event")
+                    
+                    if st.form_submit_button("Add Event", use_container_width=True):
+                        if event_name and event_date:
+                            add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'date': event_date})
+                            st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1)
+                            st.session_state.show_recurring_events_dialog = False; st.rerun()
+                        else: st.warning("Event name and date are required.")
 
                 st.markdown("---")
-                st.write("**Existing Recurring Events**")
+                st.subheader("Existing Recurring Events")
                 recurring_df = st.session_state.recurring_events_df
                 if not recurring_df.empty:
                     for index, row in recurring_df.iterrows():
-                        col1, col2, col3 = st.columns([2,1,1])
-                        col1.write(f"**{row['event_name']}** - {month_options[row['month']]} {row['day']}")
-                        if col3.form_submit_button("Delete", key=f"delete_rec_{row['doc_id']}"):
-                            delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1); st.rerun()
+                        col1, col2 = st.columns([3,1])
+                        event_display_date = pd.to_datetime(row['date']).strftime('%B %d, %Y')
+                        col1.write(f"**{row['event_name']}** - {event_display_date}")
+                        if col2.button("Delete", key=f"delete_rec_{row['doc_id']}", use_container_width=True):
+                            delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1)
+                            st.session_state.show_recurring_events_dialog = False; st.rerun()
                 else: st.info("No recurring events added yet.")
-                
-                if st.form_submit_button("Close"):
-                    st.session_state.show_recurring_events_modal = False
-                    st.rerun()
 
 
         with tabs[4]:
@@ -792,10 +714,13 @@ if db:
             if st.session_state.get('show_all_activities'):
                 st.markdown("#### All Upcoming Activities"); st.button("⬅️ Back to Overview", on_click=set_overview)
                 activities_df = load_from_firestore(db, 'future_activities')
-                all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+                all_upcoming_df = pd.DataFrame()
+                if not activities_df.empty:
+                    all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+                
                 if all_upcoming_df.empty: st.info("No upcoming activities scheduled.")
                 else:
-                    all_upcoming_df['month_year'] = all_upcoming_df['date'].dt.strftime('%B %Y')
+                    all_upcoming_df['month_year'] = pd.to_datetime(all_upcoming_df['date']).dt.strftime('%B %Y')
                     sorted_months_df = all_upcoming_df.sort_values('date'); month_tabs_list = sorted_months_df['month_year'].unique().tolist()
                     if month_tabs_list:
                         month_tabs = st.tabs(month_tabs_list)
@@ -832,7 +757,10 @@ if db:
                     btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
                     st.markdown("---",)
                     activities_df = load_from_firestore(db, 'future_activities')
-                    upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
+                    upcoming_df = pd.DataFrame()
+                    if not activities_df.empty:
+                        upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
+                    
                     if upcoming_df.empty: st.info("No upcoming activities scheduled.")
                     else:
                         for _, row in upcoming_df.iterrows(): render_activity_card(row, db, view_type='compact_list', access_level=st.session_state['access_level'])
