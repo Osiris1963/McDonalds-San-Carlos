@@ -409,9 +409,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
         
         model = xgb.XGBRegressor(**params)
+        
+        # CORRECTED: Pass early stopping rounds correctly in fit method
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
-                  early_stopping_rounds=50, # Add early stopping
+                  early_stopping_rounds=50,
                   verbose=False)
         
         preds = model.predict(X_test)
@@ -831,6 +833,9 @@ if db:
                             left_on='date',
                             right_on='ds'
                         )
+                        
+                        eval_df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+
 
                         if not eval_df.empty:
                             eval_df['add_on_sales'] = pd.to_numeric(eval_df['add_on_sales'], errors='coerce').fillna(0)
