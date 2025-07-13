@@ -160,16 +160,15 @@ def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
-    # Load historical forecasts
     if 'historical_forecasts' not in st.session_state: st.session_state.historical_forecasts = load_from_firestore(db_client, 'historical_forecasts')
     defaults = {
-        'forecast_df': pd.DataFrame(), 
-        'metrics': {}, 
-        'name': "Store 688", 
+        'forecast_df': pd.DataFrame(),
+        'metrics': {},
+        'name': "Store 688",
         'authentication_status': False,
         'access_level': 0,
         'username': None,
-        'forecast_components': pd.DataFrame(), 
+        'forecast_components': pd.DataFrame(),
         'migration_done': False,
         'show_recent_entries': False,
         'show_all_activities': False,
@@ -197,18 +196,18 @@ def hash_password(password):
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
-    
+
     docs = _db_client.collection(collection_name).stream()
     records = []
     for doc in docs:
         record = doc.to_dict()
         record['doc_id'] = doc.id
         records.append(record)
-        
+
     if not records: return pd.DataFrame()
-    
+
     df = pd.DataFrame(records)
-    
+
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.normalize()
         df.dropna(subset=['date'], inplace=True)
@@ -219,7 +218,7 @@ def load_from_firestore(_db_client, collection_name):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        
+
     return df
 
 def remove_outliers_iqr(df, column='sales'):
@@ -382,7 +381,6 @@ def delete_from_firestore(db_client, collection_name, doc_id):
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-# --- MODIFIED: Plotting function for high-readability charts ---
 def plot_evaluation_chart(df, y_true, y_pred, title, y_axis_title):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df['date'], y=df[y_true], mode='lines+markers', name='Actual', line=dict(color='royalblue', width=2), marker=dict(size=8)))
@@ -396,10 +394,6 @@ def plot_evaluation_chart(df, y_true, y_pred, title, y_axis_title):
         yaxis=dict(title_font_color='black', tickfont=dict(color='black'), gridcolor='#dddddd', linecolor='black')
     )
     return fig
-
-def plot_full_comparison_chart(hist,fcst,metrics,target):
-    fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
-    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
@@ -425,7 +419,7 @@ apply_custom_styling()
 db = init_firestore()
 if db:
     initialize_state_firestore(db)
-    
+
     if not st.session_state["authentication_status"]:
         st.markdown("<style>div[data-testid='stHorizontalBlock'] { margin-top: 5%; }</style>", unsafe_allow_html=True)
         col1, col2, col3 = st.columns([1.5, 1, 1.5])
@@ -466,13 +460,13 @@ if db:
                         if removed_count > 0: st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
                         hist_df_with_atv = calculate_atv(cleaned_df); ev_df = st.session_state.events_df.copy()
                         FORECAST_HORIZON = 15; cust_f = pd.DataFrame(); atv_f = pd.DataFrame()
-                        
+
                         with st.spinner("Forecasting Customers..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                             if not prophet_cust_f.empty and not xgb_cust_f.empty: cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb')); cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             else: st.error("Failed to generate customer forecast.")
-                        
+
                         with st.spinner("Forecasting Average Sale..."):
                             VALIDATION_PERIOD = 30; train_df = hist_df_with_atv.iloc[:-VALIDATION_PERIOD]; validation_df = hist_df_with_atv.iloc[-VALIDATION_PERIOD:]
                             prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, VALIDATION_PERIOD, 'atv')
@@ -488,13 +482,12 @@ if db:
                                 if not prophet_atv_f.empty and not xgb_atv_f.empty: atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb')); final_X_meta_atv = atv_f[['yhat_prophet', 'yhat_xgb']]; atv_f['yhat'] = meta_model_atv.predict(final_X_meta_atv)
                                 else: st.error("Failed to generate ATV forecast.")
                             else: st.error("Failed to train ATV meta-model.")
-                        
+
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
-                            st.session_state.forecast_df = combo_f # Save future forecast
-                            
-                            # --- MODIFIED: Save historical part of the forecast ---
+                            st.session_state.forecast_df = combo_f
+
                             historical_part_of_forecast = combo_f[combo_f['ds'] < pd.to_datetime('today').normalize()]
                             for _, row in historical_part_of_forecast.iterrows():
                                 doc_ref = db.collection('historical_forecasts').document(row['ds'].strftime('%Y-%m-%d'))
@@ -503,9 +496,8 @@ if db:
                                     'forecast_sales': row['forecast_sales'],
                                     'forecast_customers': row['forecast_customers']
                                 })
-                            
-                            st.session_state.historical_forecasts = load_from_firestore(db, 'historical_forecasts') # Refresh
-                            
+                            st.session_state.historical_forecasts = load_from_firestore(db, 'historical_forecasts')
+
                             if prophet_model_cust: st.session_state.forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']]); st.session_state.all_holidays = prophet_model_cust.holidays
                             st.success("Hybrid ensemble forecast generated and saved!")
                         else: st.error("Forecast generation failed.")
@@ -514,24 +506,42 @@ if db:
             st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
             st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
             if st.button("Logout"): st.session_state['authentication_status'] = False; st.session_state['username'] = None; st.session_state['access_level'] = 0; st.rerun()
-        
+
         tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
         if st.session_state['access_level'] == 1: tab_list.append("👥 User Interface")
-        
+
         tabs = st.tabs(tab_list)
-        
+
         with tabs[0]: # Forecast Dashboard
             if not st.session_state.forecast_df.empty:
                 forecast_df = st.session_state.forecast_df.copy()
                 with st.spinner("🛰️ Fetching live weather..."): weather_df = get_weather_forecast()
                 if weather_df is not None: forecast_df = pd.merge(forecast_df, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
                 else: forecast_df['weather'] = 'Not Available'
-                
+
                 future_forecast_df = forecast_df[forecast_df['ds'] >= pd.to_datetime('today').normalize()].copy()
                 if not future_forecast_df.empty:
-                    disp_cols={'ds':'Date','forecast_customers':'Predicted Customers','forecast_atv':'Predicted Avg Sale (₱)','forecast_sales':'Predicted Sales (₱)','weather':'Predicted Weather'}
-                    display_df=future_forecast_df.rename(columns=disp_cols);final_cols_order=[v for k,v in disp_cols.items()if k in disp_cols]
-                    st.markdown("#### Forecasted Values");st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
+                    st.markdown("#### Forecasted Values")
+                    disp_cols = {
+                        'ds': 'Date', 'forecast_customers': 'Predicted Customers',
+                        'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)',
+                        'weather': 'Predicted Weather'
+                    }
+                    cols_to_show = [col for col in disp_cols.keys() if col in future_forecast_df.columns]
+                    display_df = future_forecast_df[cols_to_show].rename(columns=disp_cols)
+
+                    if 'Date' in display_df.columns:
+                        display_df = display_df.set_index('Date')
+
+                    st.dataframe(
+                        display_df.style.format({
+                            'Predicted Customers': '{:,.0f}',
+                            'Predicted Avg Sale (₱)': '₱{:,.2f}',
+                            'Predicted Sales (₱)': '₱{:,.2f}'
+                        }),
+                        use_container_width=True, height=560
+                    )
+
                     fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');st.plotly_chart(fig,use_container_width=True)
                 else: st.warning("Forecast contains no future dates.")
             else: st.info("Click 'Generate Forecast' in the sidebar to begin.")
@@ -552,22 +562,19 @@ if db:
         with tabs[2]: # Forecast Evaluator
             st.header("📈 Forecast vs. Actual Performance")
             st.info("This tab compares saved historical forecasts against actual data. Use the 'Generate Forecast' button to update the saved forecasts.")
-            
+
             hist_df = st.session_state.historical_df.copy()
             hist_forecast_df = st.session_state.historical_forecasts.copy()
 
             if hist_df.empty or hist_forecast_df.empty:
                 st.warning("Not enough historical actuals or saved forecasts to evaluate. Please add data and generate a forecast.")
             else:
-                # Merge actuals with saved forecasts
                 eval_df = pd.merge(hist_df, hist_forecast_df, on='date', how='inner')
                 if 'add_on_sales' in eval_df.columns and 'forecast_sales' in eval_df.columns:
-                    # Adjust forecast sales with actual add-on sales for fair comparison
                     eval_df['forecast_total_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
                 else:
-                    eval_df['forecast_total_sales'] = eval_df['forecast_sales']
-                
-                # Filter to the last 30 days of available comparison data
+                    eval_df['forecast_total_sales'] = eval_df.get('forecast_sales', 0)
+
                 eval_df = eval_df.sort_values('date', ascending=False).head(30)
 
                 if eval_df.empty:
@@ -575,7 +582,7 @@ if db:
                 else:
                     st.markdown("---")
                     st.subheader(f"Accuracy Metrics for the Last {len(eval_df)} Days")
-                    
+
                     sales_mae = mean_absolute_error(eval_df['sales'], eval_df['forecast_total_sales'])
                     sales_mape = mean_absolute_percentage_error(eval_df['sales'], eval_df['forecast_total_sales'])
                     cust_mae = mean_absolute_error(eval_df['customers'], eval_df['forecast_customers'])
@@ -586,13 +593,30 @@ if db:
                     m_col1.metric(label="Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
                     m_col2.metric(label="Customer MAPE (Accuracy)", value=f"{100 - cust_mape * 100:.2f}%")
                     m_col2.metric(label="Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
-                    
+
                     st.markdown("---")
                     st.subheader("Comparison Charts")
                     sales_fig = plot_evaluation_chart(eval_df, 'sales', 'forecast_total_sales', 'Actual Sales vs. Forecast Sales', 'Sales (₱)')
                     st.plotly_chart(sales_fig, use_container_width=True)
                     cust_fig = plot_evaluation_chart(eval_df, 'customers', 'forecast_customers', 'Actual Customers vs. Forecast Customers', 'Number of Customers')
                     st.plotly_chart(cust_fig, use_container_width=True)
+        
+        with tabs[3]: # Add/Edit Data
+            if st.session_state['access_level'] <= 2:
+                # The rest of the original code for this tab goes here
+                pass # Placeholder for brevity
+            else:
+                st.warning("You do not have permission to add or edit data.")
+        
+        with tabs[4]: # Future Activities
+            # The rest of the original code for this tab goes here
+            pass # Placeholder for brevity
 
-        # Other tabs (Add/Edit, Activities, Historical, User Mgmt) remain the same
-        # ... (The rest of your code for tabs 3, 4, 5, 6 would go here)
+        with tabs[5]: # Historical Data
+            # The rest of the original code for this tab goes here
+            pass # Placeholder for brevity
+        
+        if st.session_state['access_level'] == 1:
+            with tabs[6]: # User Interface
+                # The rest of the original code for this tab goes here
+                pass # Placeholder for brevity
