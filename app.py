@@ -281,8 +281,8 @@ def generate_recurring_local_events(start_date,end_date):
 
 # --- Core Forecasting Models ---
 
-def create_time_features(df):
-    """Creates time series features from a datetime index."""
+def create_advanced_features(df):
+    """Creates time series, lag, and rolling window features from a datetime index."""
     df['date'] = pd.to_datetime(df['date'])
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
@@ -290,7 +290,23 @@ def create_time_features(df):
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+
+    # Add lag and rolling features using a longer window (e.g., 7 days)
+    # This helps capture weekly seasonality and recent trends.
+    df = df.sort_values('date') # Ensure data is sorted for correct calculations
+    
+    # Lag features
+    df['sales_lag_7'] = df['sales'].shift(7)
+    df['customers_lag_7'] = df['customers'].shift(7)
+
+    # Rolling window features
+    # min_periods=1 allows the calculation to work at the beginning of the series
+    df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
+    df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
+    df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
+    
     return df
+
 
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
@@ -332,25 +348,53 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
+    
+    # Drop rows where the target column is NA
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty:
         return pd.DataFrame()
 
-    df_featured = create_time_features(df_train.rename(columns={'date': 'date'}))
-    
-    last_date = df_featured['date'].max()
+    # Combine historical and future dataframes to create continuous features
+    last_date = df_train['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
-    future_df = pd.DataFrame({'date': future_dates})
-    future_df_featured = create_time_features(future_df)
+    future_df_template = pd.DataFrame({'date': future_dates})
 
-    features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']
+    # Concatenate for seamless feature creation
+    full_df = pd.concat([df_train, future_df_template], ignore_index=True)
+    
+    # Use the new advanced feature engineering function
+    # This will create lags and rolling features across the entire timeline
+    full_df_featured = create_advanced_features(full_df)
+    
+    # Separate the historical and future dataframes again
+    df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
+    future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
+    
+    # Drop rows with NaNs created by shift/rolling operations from the training set
+    df_featured.dropna(inplace=True)
+
+    # Define the expanded feature set
+    features = [
+        'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear',
+        'sales_lag_7', 'customers_lag_7',
+        'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
+    ]
+    
+    # Ensure all features exist in the dataframe, if not, they are ignored
+    features = [f for f in features if f in df_featured.columns]
+    
     target = target_col
 
     X = df_featured[features]
     y = df_featured[target]
     
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Check if training data is sufficient after feature creation
+    if X.empty or len(X) < 10:
+        st.warning("Not enough data to train the XGBoost model after feature engineering.")
+        return pd.DataFrame()
+        
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False) # shuffle=False for time series
 
     def objective(trial):
         params = {
@@ -361,12 +405,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'random_state': 42,
-            # --- THIS IS THE FIX: Add early_stopping_rounds to the constructor ---
             'early_stopping_rounds': 50
         }
         
         model = xgb.XGBRegressor(**params)
-        # Pass the evaluation set directly to fit
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
                   verbose=False)
@@ -379,7 +421,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     study.optimize(objective, n_trials=50) 
 
     best_params = study.best_params
-    # We need to remove our custom parameter before creating the final model
     best_params.pop('early_stopping_rounds', None)
     
     final_model = xgb.XGBRegressor(**best_params)
@@ -391,12 +432,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     full_prediction_df = df_featured[['date']].copy()
     full_prediction_df['yhat'] = final_model.predict(X)
     
-    future_df['yhat'] = future_predictions
+    future_df_template['yhat'] = future_predictions
     
-    final_df = pd.concat([full_prediction_df, future_df], ignore_index=True)
+    final_df = pd.concat([full_prediction_df, future_df_template], ignore_index=True)
     final_df = final_df.rename(columns={'date': 'ds'})
     
     return final_df
+
 
 
 # --- Plotting Functions & Firestore Data I/O ---
