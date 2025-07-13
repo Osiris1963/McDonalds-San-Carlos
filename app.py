@@ -209,6 +209,7 @@ def load_from_firestore(_db_client, collection_name):
 
     df = pd.DataFrame(records)
 
+    # Standardize timezone handling
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
@@ -338,7 +339,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     if X.empty or len(X) < 10: st.warning("Not enough data for XGBoost model after feature engineering."); return pd.DataFrame()
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
     
-    # --- FIX: Moved 'early_stopping_rounds' to constructor ---
     def objective(trial):
         params = {
             'objective': 'reg:squarederror',
@@ -348,17 +348,16 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'random_state': 42,
-            'early_stopping_rounds': 50
         }
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
+                  early_stopping_rounds=50,
                   verbose=False)
         preds = model.predict(X_test); mae = mean_absolute_error(y_test, preds); return mae
 
     study = optuna.create_study(direction='minimize'); study.optimize(objective, n_trials=25)
     best_params = study.best_params
-    best_params.pop('early_stopping_rounds', None) # Remove for final model fitting
     
     final_model = xgb.XGBRegressor(**best_params); final_model.fit(X, y)
     X_future = future_df_featured[features]; future_predictions = final_model.predict(X_future)
@@ -366,7 +365,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     future_df_template['yhat'] = future_predictions
     final_df = pd.concat([full_prediction_df, future_df_template], ignore_index=True).rename(columns={'date': 'ds'})
     return final_df
-
 
 # --- Plotting & Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
