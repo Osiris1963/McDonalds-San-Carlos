@@ -668,24 +668,18 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- MODIFICATION ---: Updated forecast generation to isolate weather features from the ATV model.
                         def generate_hybrid_forecast(df, events, periods, target_col):
                             df = df.drop_duplicates(subset=['date']).reset_index(drop=True)
 
-                            # 1. Generate features on the actual historical target values
                             df_with_actual_features = create_advanced_features(df.copy(), target_column=target_col)
-
-                            # --- NEW LOGIC ---
-                            # Based on user feedback, if we are modeling ATV, remove weather features.
+                            
                             if target_col == 'atv':
                                 weather_cols = [col for col in df_with_actual_features.columns if 'weather_' in col]
                                 df_with_actual_features = df_with_actual_features.drop(columns=weather_cols)
                             
-                            # 2. Get the baseline forecast from Prophet
                             prophet_forecast, prophet_model, all_events = train_and_forecast_prophet(df, events, periods, target_col)
                             if prophet_forecast.empty: return pd.DataFrame(), None, None
 
-                            # 3. Merge Prophet's historical forecast to calculate residuals
                             hist_prophet = prophet_forecast[prophet_forecast['ds'] <= df['date'].max()]
                             df_merged = pd.merge(df_with_actual_features, hist_prophet[['ds', 'yhat']], left_on='date', right_on='ds')
                             
@@ -695,11 +689,9 @@ if db:
                             
                             df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
 
-                            # 4. Train XGBoost to predict the residuals
                             xgb_model = train_xgboost_on_residuals_tuned(df_merged, 'residual')
                             if not xgb_model: return pd.DataFrame(), prophet_model, all_events
                             
-                            # 5. Prepare feature set for future dates
                             last_date = df['date'].max()
                             future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
                             future_df_base = pd.DataFrame({'date': future_dates})
@@ -709,9 +701,12 @@ if db:
                             future_featured = create_advanced_features(future_featured, target_column=target_col)
                             future_featured = future_featured[future_featured['date'].isin(future_dates)]
                             
-                            # 6. Predict future residuals and combine with Prophet baseline
                             train_cols = xgb_model.get_booster().feature_names
                             future_featured_aligned = future_featured.reindex(columns=train_cols, fill_value=0)
+                            
+                            # --- MODIFICATION ---: Added explicit type conversion to prevent dtype errors.
+                            future_featured_aligned = future_featured_aligned.astype(float)
+
                             future_residual_preds = xgb_model.predict(future_featured_aligned)
 
                             final_forecast = prophet_forecast.copy()
