@@ -359,7 +359,8 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
     if df_featured.empty:
         return None
 
-    features = [col for col in df_featured.columns if col not in ['date', 'ds', 'y', 'yhat_prophet', target_col]]
+    # --- MODIFICATION ---: Added 'doc_id' to the exclusion list.
+    features = [col for col in df_featured.columns if col not in ['date', 'ds', 'y', 'yhat_prophet', target_col, 'doc_id']]
     target = target_col
 
     for col in features:
@@ -675,7 +676,8 @@ if db:
                             
                             if target_col == 'atv':
                                 weather_cols = [col for col in df_with_actual_features.columns if 'weather_' in col]
-                                df_with_actual_features = df_with_actual_features.drop(columns=weather_cols)
+                                if weather_cols:
+                                    df_with_actual_features = df_with_actual_features.drop(columns=weather_cols)
                             
                             prophet_forecast, prophet_model, all_events = train_and_forecast_prophet(df, events, periods, target_col)
                             if prophet_forecast.empty: return pd.DataFrame(), None, None
@@ -704,9 +706,6 @@ if db:
                             train_cols = xgb_model.get_booster().feature_names
                             future_featured_aligned = future_featured.reindex(columns=train_cols, fill_value=0)
                             
-                            # --- MODIFICATION ---: Added explicit type conversion to prevent dtype errors.
-                            future_featured_aligned = future_featured_aligned.astype(float)
-
                             future_residual_preds = xgb_model.predict(future_featured_aligned)
 
                             final_forecast = prophet_forecast.copy()
