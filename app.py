@@ -327,18 +327,17 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
 
-    # --- MODIFICATION: Handle "Not Normal Days" as special holidays ---
-    # This isolates their impact from regular seasonal patterns.
-    not_normal_days_df = historical_df[historical_df.get('day_type') == 'Not Normal Day'].copy()
-    if not not_normal_days_df.empty:
-        not_normal_events = pd.DataFrame({
-            'holiday': 'Unusual_Day',
-            'ds': pd.to_datetime(not_normal_days_df['date']),
-            'lower_window': 0,
-            'upper_window': 0,
-        })
-        # Combine with other scheduled events
-        all_manual_events = pd.concat([all_manual_events, not_normal_events])
+    # --- FIX: Check if 'day_type' column exists before using it ---
+    if 'day_type' in historical_df.columns:
+        not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
+        if not not_normal_days_df.empty:
+            not_normal_events = pd.DataFrame({
+                'holiday': 'Unusual_Day',
+                'ds': pd.to_datetime(not_normal_days_df['date']),
+                'lower_window': 0,
+                'upper_window': 0,
+            })
+            all_manual_events = pd.concat([all_manual_events, not_normal_events])
     
     use_yearly_seasonality = len(df_train) >= 365
 
@@ -376,21 +375,25 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     
     full_df_featured = create_advanced_features(full_df)
     
-    # --- MODIFICATION: Create a binary feature for "Not Normal Day" ---
-    # This explicitly tells XGBoost that these days are different.
-    full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+    # --- FIX: Check if 'day_type' column exists before creating the feature ---
+    if 'day_type' in full_df_featured.columns:
+        full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+    else:
+        full_df_featured['is_not_normal_day'] = 0
+
 
     df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     
-    df_featured.dropna(inplace=True)
+    # Drop rows with NaNs created by shift/rolling operations from the training set
+    df_featured.dropna(subset=['sales_lag_7'], inplace=True)
 
-    # Add the new feature to the list of features for the model
+
     features = [
         'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear',
         'sales_lag_7', 'customers_lag_7',
         'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7',
-        'is_not_normal_day' # New feature added here
+        'is_not_normal_day' 
     ]
     
     features = [f for f in features if f in df_featured.columns]
@@ -481,7 +484,6 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     else: 
         return
 
-    # --- MODIFICATION: Handle new day_type fields ---
     all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather', 'day_type', 'day_type_notes']
     for col in all_cols:
         if col in data and data[col] is not None:
@@ -744,7 +746,6 @@ def render_historical_record(row, db_client):
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-        # --- MODIFICATION: Display Day Type and Notes ---
         day_type = row.get('day_type', 'Normal Day')
         st.write(f"**Day Type:** {day_type}")
         if day_type == 'Not Normal Day':
@@ -766,7 +767,6 @@ def render_historical_record(row, db_client):
                 current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
                 updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
 
-                # --- MODIFICATION: Add editing for Day Type ---
                 day_type_options = ["Normal Day", "Not Normal Day"]
                 current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
                 updated_day_type = st.selectbox("Day Type", options=day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
@@ -1040,7 +1040,6 @@ if db:
                         new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                         new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
                         
-                        # --- MODIFICATION: Add Day Type selector ---
                         new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
                         new_day_type_notes = ""
                         if new_day_type == "Not Normal Day":
