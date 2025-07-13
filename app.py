@@ -668,12 +668,18 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- MODIFICATION ---: Re-written function for improved feature engineering and robustness.
+                        # --- MODIFICATION ---: Updated forecast generation to isolate weather features from the ATV model.
                         def generate_hybrid_forecast(df, events, periods, target_col):
                             df = df.drop_duplicates(subset=['date']).reset_index(drop=True)
 
-                            # 1. Generate features on the *actual* historical target values first
+                            # 1. Generate features on the actual historical target values
                             df_with_actual_features = create_advanced_features(df.copy(), target_column=target_col)
+
+                            # --- NEW LOGIC ---
+                            # Based on user feedback, if we are modeling ATV, remove weather features.
+                            if target_col == 'atv':
+                                weather_cols = [col for col in df_with_actual_features.columns if 'weather_' in col]
+                                df_with_actual_features = df_with_actual_features.drop(columns=weather_cols)
                             
                             # 2. Get the baseline forecast from Prophet
                             prophet_forecast, prophet_model, all_events = train_and_forecast_prophet(df, events, periods, target_col)
@@ -689,7 +695,7 @@ if db:
                             
                             df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
 
-                            # 4. Train XGBoost to predict the residuals, using the features we generated in step 1
+                            # 4. Train XGBoost to predict the residuals
                             xgb_model = train_xgboost_on_residuals_tuned(df_merged, 'residual')
                             if not xgb_model: return pd.DataFrame(), prophet_model, all_events
                             
@@ -698,8 +704,6 @@ if db:
                             future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
                             future_df_base = pd.DataFrame({'date': future_dates})
                             
-                            # To create future features, we need to temporarily join the future dates with the end of our historical data
-                            # to properly calculate lags and rolling features.
                             temp_hist_for_lags = df_with_actual_features.tail(30)
                             future_featured = pd.concat([temp_hist_for_lags, future_df_base], ignore_index=True)
                             future_featured = create_advanced_features(future_featured, target_column=target_col)
