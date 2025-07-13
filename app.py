@@ -326,18 +326,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
-
-    # --- FIX: Check if 'day_type' column exists before using it ---
-    if 'day_type' in historical_df.columns:
-        not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
-        if not not_normal_days_df.empty:
-            not_normal_events = pd.DataFrame({
-                'holiday': 'Unusual_Day',
-                'ds': pd.to_datetime(not_normal_days_df['date']),
-                'lower_window': 0,
-                'upper_window': 0,
-            })
-            all_manual_events = pd.concat([all_manual_events, not_normal_events])
     
     use_yearly_seasonality = len(df_train) >= 365
 
@@ -347,8 +335,8 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.15, 
-        changepoint_range=0.9,
+        changepoint_prior_scale=0.05,
+        changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -362,40 +350,39 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     
+    # Drop rows where the target column is NA
     df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty:
         return pd.DataFrame()
 
+    # Combine historical and future dataframes to create continuous features
     last_date = df_train['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
     future_df_template = pd.DataFrame({'date': future_dates})
 
+    # Concatenate for seamless feature creation
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
     
+    # Use the new advanced feature engineering function
+    # This will create lags and rolling features across the entire timeline
     full_df_featured = create_advanced_features(full_df)
     
-    # --- FIX: Check if 'day_type' column exists before creating the feature ---
-    if 'day_type' in full_df_featured.columns:
-        full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
-    else:
-        full_df_featured['is_not_normal_day'] = 0
-
-
+    # Separate the historical and future dataframes again
     df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     
     # Drop rows with NaNs created by shift/rolling operations from the training set
-    df_featured.dropna(subset=['sales_lag_7'], inplace=True)
+    df_featured.dropna(inplace=True)
 
-
+    # Define the expanded feature set
     features = [
         'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear',
         'sales_lag_7', 'customers_lag_7',
-        'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7',
-        'is_not_normal_day' 
+        'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
     ]
     
+    # Ensure all features exist in the dataframe, if not, they are ignored
     features = [f for f in features if f in df_featured.columns]
     
     target = target_col
@@ -403,15 +390,12 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     X = df_featured[features]
     y = df_featured[target]
     
+    # Check if training data is sufficient after feature creation
     if X.empty or len(X) < 10:
         st.warning("Not enough data to train the XGBoost model after feature engineering.")
         return pd.DataFrame()
         
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-
-    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
-        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
-    )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False) # shuffle=False for time series
 
     def objective(trial):
         params = {
@@ -427,13 +411,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, 
-                  sample_weight=weights_train,
-                  eval_set=[(X_test, y_test)],
-                  sample_weight_eval_set=[weights_test],
+                  eval_set=[(X_test, y_test)], 
                   verbose=False)
         
         preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds, sample_weight=weights_test)
+        mae = mean_absolute_error(y_test, preds)
         return mae
 
     study = optuna.create_study(direction='minimize')
@@ -443,7 +425,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     best_params.pop('early_stopping_rounds', None)
     
     final_model = xgb.XGBRegressor(**best_params)
-    final_model.fit(X, y, sample_weight=sample_weights)
+    final_model.fit(X, y)
 
     X_future = future_df_featured[features]
     future_predictions = final_model.predict(X_future)
@@ -484,16 +466,16 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     else: 
         return
 
-    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather', 'day_type', 'day_type_notes']
+    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather']
     for col in all_cols:
         if col in data and data[col] is not None:
-            if col not in ['weather', 'day_type', 'day_type_notes']:
+            if col not in ['weather']:
                  data[col] = float(pd.to_numeric(data[col], errors='coerce'))
         else:
-            if col not in ['weather', 'day_type', 'day_type_notes']:
+            if col not in ['weather']:
                 data[col] = 0.0
             else:
-                data[col] = "N/A" if col == 'weather' else "Normal Day"
+                data[col] = "N/A"
 
     db_client.collection(collection_name).add(data)
 
@@ -562,21 +544,21 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     
     return eval_df
 
-def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
-    """Calculates MAE and MAPE for a specified number of past days."""
+def calculate_accuracy_metrics(historical_df, forecast_df):
+    """Calculates MAE and MAPE for the last 30 days using adjusted forecast sales."""
     eval_df = create_daily_evaluation_data(historical_df, forecast_df)
     if eval_df is None or eval_df.empty:
         return None
 
-    period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-    eval_df_period = eval_df[eval_df['date'] >= period_start_date].copy()
+    thirty_days_ago = pd.to_datetime('today').normalize() - pd.Timedelta(days=30)
+    eval_df_30_days = eval_df[eval_df['date'] >= thirty_days_ago].copy()
 
-    if eval_df_period.empty:
+    if eval_df_30_days.empty:
         return None
 
     # Use 'actual_sales' and the new 'adjusted_forecast_sales'
-    actual_s = eval_df_period['actual_sales']
-    forecast_s = eval_df_period['adjusted_forecast_sales']
+    actual_s = eval_df_30_days['actual_sales']
+    forecast_s = eval_df_30_days['adjusted_forecast_sales']
     
     non_zero_mask_s = actual_s != 0
     if not non_zero_mask_s.any():
@@ -588,8 +570,8 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
     sales_accuracy = 100 - sales_mape
 
     # Customer calculation remains the same
-    actual_c = eval_df_period['actual_customers']
-    forecast_c = eval_df_period['forecast_customers']
+    actual_c = eval_df_30_days['actual_customers']
+    forecast_c = eval_df_30_days['forecast_customers']
 
     non_zero_mask_c = actual_c != 0
     if not non_zero_mask_c.any():
@@ -746,11 +728,7 @@ def render_historical_record(row, db_client):
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-        day_type = row.get('day_type', 'Normal Day')
-        st.write(f"**Day Type:** {day_type}")
-        if day_type == 'Not Normal Day':
-            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
-
+        
         if st.session_state['access_level'] <= 2:
             with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
                 st.write("---")
@@ -764,13 +742,8 @@ def render_historical_record(row, db_client):
                 updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
                 
                 weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
-                current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
+                current_weather_index = weather_options.index(row['weather']) if row.get('weather') in weather_options else 0
                 updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
-
-                day_type_options = ["Normal Day", "Not Normal Day"]
-                current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
-                updated_day_type = st.selectbox("Day Type", options=day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
-                updated_day_type_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"notes_{row['doc_id']}")
                 
                 btn_cols = st.columns(2)
                 if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
@@ -778,9 +751,7 @@ def render_historical_record(row, db_client):
                         'sales': updated_sales,
                         'customers': updated_customers,
                         'add_on_sales': updated_addons,
-                        'weather': updated_weather,
-                        'day_type': updated_day_type,
-                        'day_type_notes': updated_day_type_notes if updated_day_type == 'Not Normal Day' else ''
+                        'weather': updated_weather
                     }
                     update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
                     st.success(f"Record for {date_str} updated!")
@@ -972,60 +943,66 @@ if db:
         
         with tabs[2]:
             st.header("📈 Forecast Performance Evaluator")
-            st.info(
-                "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
-                "is adjusted by adding the *actual add-on sales* for each corresponding day. "
-                "The metrics and charts below use this adjusted forecast."
-            )
+            st.markdown("---")
             
-            eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
-
-            def render_evaluation_content(days):
-                """Helper function to render metrics and charts for a given period."""
-                st.subheader(f"Accuracy Metrics for the Last {days} Days")
-                metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df, days=days)
-                
-                if metrics:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric(label="Sales MAPE (Accuracy)", value=f"{metrics['sales_accuracy']:.2f}%")
-                        st.metric(label="Sales MAE (Avg Error)", value=f"₱{metrics['sales_mae']:,.2f}")
-                    with col2:
-                        st.metric(label="Customer MAPE (Accuracy)", value=f"{metrics['customer_accuracy']:.2f}%")
-                        st.metric(label="Customer MAE (Avg Error)", value=f"{int(round(metrics['customer_mae']))} customers")
-                else:
-                    st.warning(f"Not enough overlapping data in the last {days} days to calculate metrics.")
-                
-                st.markdown("---")
-                st.subheader(f"Comparison Charts for the Last {days} Days")
-                
-                evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
-                period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-                chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= period_start_date]
-                
-                if chart_df.empty:
-                    st.info(f"No overlapping historical and forecast data found for the last {days} days to display charts.")
-                else:
-                    sales_fig = plot_evaluation_graph(
-                        chart_df,
-                        date_col='date', actual_col='actual_sales', forecast_col='adjusted_forecast_sales',
-                        title='Actual Sales vs. Forecast Sales', y_axis_title='Sales (₱)'
-                    )
-                    st.plotly_chart(sales_fig, use_container_width=True)
-
-                    cust_fig = plot_evaluation_graph(
-                        chart_df,
-                        date_col='date', actual_col='actual_customers', forecast_col='forecast_customers',
-                        title='Actual Customers vs. Forecast Customers', y_axis_title='Number of Customers'
-                    )
-                    st.plotly_chart(cust_fig, use_container_width=True)
-
-            with eval_tab_7:
-                render_evaluation_content(7)
+            # --- Accuracy Metrics ---
+            st.subheader("Accuracy Metrics for the Last 30 Days")
             
-            with eval_tab_30:
-                render_evaluation_content(30)
+            metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df)
+            
+            if metrics:
+                st.info(
+                    "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
+                    "is adjusted by adding the *actual add-on sales* for each corresponding day. "
+                    "The metrics and charts below use this adjusted forecast."
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        label="Sales MAPE (Accuracy)",
+                        value=f"{metrics['sales_accuracy']:.2f}%"
+                    )
+                    st.metric(
+                        label="Sales MAE (Avg Error)",
+                        value=f"₱{metrics['sales_mae']:,.2f}"
+                    )
+                with col2:
+                    st.metric(
+                        label="Customer MAPE (Accuracy)",
+                        value=f"{metrics['customer_accuracy']:.2f}%"
+                    )
+                    st.metric(
+                        label="Customer MAE (Avg Error)",
+                        value=f"{int(round(metrics['customer_mae']))} customers"
+                    )
+            else:
+                st.warning("Not enough overlapping data in the last 30 days to calculate metrics.")
+            
+            st.markdown("---")
+            
+            # --- Comparison Charts ---
+            st.subheader("Comparison Charts")
+            
+            evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
+            thirty_days_ago = pd.to_datetime('today').normalize() - pd.Timedelta(days=30)
+            chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= thirty_days_ago]
+            
+            if chart_df.empty:
+                st.info("No overlapping historical and forecast data found for the last 30 days to display charts.")
+            else:
+                sales_fig = plot_evaluation_graph(
+                    chart_df,
+                    date_col='date', actual_col='actual_sales', forecast_col='adjusted_forecast_sales',
+                    title='Actual Sales vs. Forecast Sales', y_axis_title='Sales (₱)'
+                )
+                st.plotly_chart(sales_fig, use_container_width=True)
 
+                cust_fig = plot_evaluation_graph(
+                    chart_df,
+                    date_col='date', actual_col='actual_customers', forecast_col='forecast_customers',
+                    title='Actual Customers vs. Forecast Customers', y_axis_title='Number of Customers'
+                )
+                st.plotly_chart(cust_fig, use_container_width=True)
         
         with tabs[3]:
             if st.session_state['access_level'] <= 2:
@@ -1039,22 +1016,8 @@ if db:
                         new_customers=st.number_input("Customer Count",min_value=0)
                         new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                         new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
-                        
-                        new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
-                        new_day_type_notes = ""
-                        if new_day_type == "Not Normal Day":
-                            new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage, unexpected local event...")
-
                         if st.form_submit_button("✅ Save Record"):
-                            new_rec={
-                                "date":new_date,
-                                "sales":new_sales,
-                                "customers":new_customers,
-                                "weather":new_weather,
-                                "add_on_sales":new_addons,
-                                "day_type": new_day_type,
-                                "day_type_notes": new_day_type_notes
-                            }
+                            new_rec={"date":new_date,"sales":new_sales,"customers":new_customers,"weather":new_weather,"add_on_sales":new_addons}
                             add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
                             st.cache_data.clear()
                             st.success("Record added to Firestore!");
@@ -1070,7 +1033,7 @@ if db:
                         with st.container(border=True):
                             recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
                             if not recent_df.empty:
-                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
+                                display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
                                 cols_to_show = [col for col in display_cols if col in recent_df.columns]
                                 
                                 st.dataframe(
@@ -1082,8 +1045,7 @@ if db:
                                         "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
                                         "customers": st.column_config.NumberColumn("Customers", format="%d"),
                                         "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
-                                        "weather": "Weather",
-                                        "day_type": "Day Type"
+                                        "weather": "Weather"
                                     }
                                 )
                             else:
