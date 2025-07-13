@@ -3,7 +3,7 @@ import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
 import optuna
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression # For Stacking ATV
 import numpy as np
@@ -75,12 +75,14 @@ def apply_custom_styling():
         }
         /* Primary Action Button Style (e.g., Generate Forecast, Save) */
         .stButton:has(button:contains("Generate")),
-        .stButton:has(button:contains("Save")) > button {
+        .stButton:has(button:contains("Save")),
+        .stButton:has(button:contains("Evaluate")) > button {
             background: linear-gradient(45deg, #c8102e, #e01a37); /* Red gradient */
             color: #FFFFFF;
         }
         .stButton:has(button:contains("Generate")):hover > button,
-        .stButton:has(button:contains("Save")):hover > button {
+        .stButton:has(button:contains("Save")):hover > button,
+        .stButton:has(button:contains("Evaluate")):hover > button {
             transform: translateY(-2px);
             box-shadow: 0 4px 15px 0 rgba(200, 16, 46, 0.4);
         }
@@ -168,7 +170,8 @@ def initialize_state_firestore(db_client):
         'forecast_components': pd.DataFrame(), 
         'migration_done': False,
         'show_recent_entries': False,
-        'show_all_activities': False
+        'show_all_activities': False,
+        'evaluation_df': pd.DataFrame() # New state for evaluator tab
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -406,14 +409,12 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'random_state': 42,
+            'early_stopping_rounds': 50
         }
         
         model = xgb.XGBRegressor(**params)
-        
-        # CORRECTED: Pass early stopping rounds correctly in fit method
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
-                  early_stopping_rounds=50,
                   verbose=False)
         
         preds = model.predict(X_test)
@@ -424,6 +425,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     study.optimize(objective, n_trials=50) 
 
     best_params = study.best_params
+    best_params.pop('early_stopping_rounds', None)
     
     final_model = xgb.XGBRegressor(**best_params)
     final_model.fit(X, y)
@@ -527,6 +529,34 @@ def generate_insight_summary(day_data,selected_date):
     if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
     if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
+
+# --- NEW: Function to plot evaluation charts ---
+def plot_evaluation_chart(df, y_true, y_pred, title, y_axis_title):
+    fig = go.Figure()
+    # Actual values
+    fig.add_trace(go.Scatter(
+        x=df['date'], y=df[y_true],
+        mode='lines+markers', name='Actual',
+        line=dict(color='royalblue', width=2),
+        marker=dict(size=8)
+    ))
+    # Predicted values
+    fig.add_trace(go.Scatter(
+        x=df['date'], y=df[y_pred],
+        mode='lines+markers', name='Forecast',
+        line=dict(color='red', dash='dash', width=2),
+        marker=dict(symbol='x', size=8)
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title='Date',
+        yaxis_title=y_axis_title,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='white',    # White background for the plot
+        paper_bgcolor='white',   # White background for the paper
+        font_color='black'       # Dark font for readability
+    )
+    return fig
 
 def render_activity_card(row, db_client, view_type='compact_list', access_level=3):
     doc_id = row['doc_id']
@@ -797,118 +827,27 @@ if db:
                 st.session_state['access_level'] = 0
                 st.rerun()
         
-        tab_list = ["🔮 Forecast Dashboard","💡 Forecast Insights", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
+        # --- MODIFIED: Added Forecast Evaluator Tab ---
+        tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
         if st.session_state['access_level'] == 1:
             tab_list.append("👥 User Interface")
         
-        tabs=st.tabs(tab_list)
+        tabs = st.tabs(tab_list)
         
         with tabs[0]:
             if not st.session_state.forecast_df.empty:
-                today=pd.to_datetime('today').normalize()
-                future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
-                
-                if future_forecast_df.empty:
-                    st.warning("Forecast contains no future dates.")
+                today=pd.to_datetime('today').normalize();future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
+                if future_forecast_df.empty:st.warning("Forecast contains no future dates.")
                 else:
                     disp_cols={'ds':'Date','forecast_customers':'Predicted Customers','forecast_atv':'Predicted Avg Sale (₱)','forecast_sales':'Predicted Sales (₱)','weather':'Predicted Weather'}
-                    existing_disp_cols={k:v for k,v in disp_cols.items()if k in future_forecast_df.columns}
-                    display_df=future_forecast_df.rename(columns=existing_disp_cols)
-                    final_cols_order=[v for k,v in disp_cols.items()if k in existing_disp_cols]
-                    st.markdown("#### 15-Day Forecast")
-                    st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
-                
-                # --- FORECAST ACCURACY EVALUATOR ---
-                with st.expander("🎯 Forecast Accuracy Evaluator"):
-                    hist_df = st.session_state.historical_df.copy()
-                    fcst_df = st.session_state.forecast_df.copy()
-
-                    if not hist_df.empty and not fcst_df.empty and 'date' in hist_df.columns:
-                        hist_df['date'] = pd.to_datetime(hist_df['date']).dt.normalize()
-                        fcst_df['ds'] = pd.to_datetime(fcst_df['ds']).dt.normalize()
-
-                        eval_df = pd.merge(
-                            hist_df[['date', 'sales', 'customers', 'add_on_sales']],
-                            fcst_df[['ds', 'forecast_sales', 'forecast_customers', 'forecast_atv']],
-                            left_on='date',
-                            right_on='ds'
-                        )
-                        
-                        eval_df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-
-
-                        if not eval_df.empty:
-                            eval_df['add_on_sales'] = pd.to_numeric(eval_df['add_on_sales'], errors='coerce').fillna(0)
-                            eval_df['actual_total_sales'] = eval_df['sales'] + eval_df['add_on_sales']
-                            
-                            eval_df['actual_atv'] = np.divide(
-                                eval_df['actual_total_sales'],
-                                eval_df['customers'],
-                                out=np.zeros_like(eval_df['actual_total_sales'], dtype=float),
-                                where=eval_df['customers'] != 0
-                            )
-
-                            sales_mae = mean_absolute_error(eval_df['actual_total_sales'], eval_df['forecast_sales'])
-                            customers_mae = mean_absolute_error(eval_df['customers'], eval_df['forecast_customers'])
-                            atv_mae = mean_absolute_error(eval_df['actual_atv'], eval_df['forecast_atv'])
-
-                            st.markdown("##### Overall Accuracy (Mean Absolute Error)")
-                            m_col1, m_col2, m_col3 = st.columns(3)
-                            m_col1.metric(label="Sales Accuracy", value=f"₱{sales_mae:,.2f}", help="Lower is better. The average absolute difference between predicted and actual total sales.")
-                            m_col2.metric(label="Customer Accuracy", value=f"{customers_mae:,.1f}", help="Lower is better. The average absolute difference between predicted and actual customers.")
-                            m_col3.metric(label="Avg. Sale Accuracy", value=f"₱{atv_mae:,.2f}", help="Lower is better. The average absolute difference between predicted and actual average sale.")
-                            st.markdown("---")
-
-                            st.markdown("##### Daily Breakdown Comparison")
-                            eval_df['sales_variance'] = eval_df['forecast_sales'] - eval_df['actual_total_sales']
-                            eval_df['cust_variance'] = eval_df['forecast_customers'] - eval_df['customers']
-                            
-                            display_eval_df = eval_df[[
-                                'date', 'forecast_sales', 'actual_total_sales', 'sales_variance',
-                                'forecast_customers', 'customers', 'cust_variance'
-                            ]].copy()
-
-                            display_eval_df.rename(columns={
-                                'date': 'Date', 'forecast_sales': 'Predicted Sales', 'actual_total_sales': 'Actual Sales',
-                                'sales_variance': 'Sales Variance', 'forecast_customers': 'Predicted Cust.',
-                                'customers': 'Actual Cust.', 'cust_variance': 'Customer Variance'
-                            }, inplace=True)
-
-                            st.dataframe(
-                                display_eval_df.set_index('Date').style.format({
-                                    'Predicted Sales': '₱{:,.2f}', 
-                                    'Actual Sales': '₱{:,.2f}',
-                                    'Sales Variance': '₱{:,.2f}', 
-                                    'Predicted Cust.': '{:,.0f}',
-                                    'Actual Cust.': '{:,.0f}', 
-                                    'Customer Variance': '{:,.0f}'
-                                }).bar(subset=["Sales Variance", "Customer Variance"], align='mid', color=['#d62728', '#2ca02c']),
-                                use_container_width=True
-                            )
-                        else:
-                            st.info("No overlapping past forecast data found to evaluate. Once a forecast is generated and new daily records are added, this section will populate.")
-                    else:
-                        st.info("Generate a forecast and add historical data to enable accuracy evaluation.")
-
-                st.markdown("#### Forecast Visualization")
-                fig=go.Figure()
-                fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')))
-                fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')))
-                fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white')
-                st.plotly_chart(fig,use_container_width=True)
-
+                    existing_disp_cols={k:v for k,v in disp_cols.items()if k in future_forecast_df.columns};display_df=future_forecast_df.rename(columns=existing_disp_cols);final_cols_order=[v for k,v in disp_cols.items()if k in existing_disp_cols]
+                    st.markdown("#### Forecasted Values");st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
+                    st.markdown("#### Forecast Visualization");fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');st.plotly_chart(fig,use_container_width=True)
                 with st.expander("🔬 View Full Forecast vs. Historical Data"):
-                    st.info("This view shows how the component models performed against past data.")
-                    d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"])
-                    hist_for_plotting = calculate_atv(st.session_state.historical_df.copy())
-                    
-                    with d_t1:
-                        st.plotly_chart(plot_full_comparison_chart(hist_for_plotting,st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}),st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
-                    with d_t2:
-                        st.plotly_chart(plot_full_comparison_chart(hist_for_plotting,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
-            else:
-                st.info("Click the 'Generate Forecast' button to begin.")
-        
+                    st.info("This view shows how the component models performed against past data.");d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"]);hist_atv=calculate_atv(st.session_state.historical_df.copy())
+                    with d_t1:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}),st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
+                    with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
+            else:st.info("Click the 'Generate Component Forecast' button to begin.")
         with tabs[1]:
             st.info("The breakdown below is generated by the Prophet model component of the forecast.")
             if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
@@ -922,7 +861,127 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         
+        # --- NEW: Forecast Evaluator Tab Logic ---
         with tabs[2]:
+            st.header("📈 Forecast vs. Actual Performance Evaluator")
+            st.info("Select a past week to generate a historical forecast and compare it against the actual results for that period.")
+
+            hist_df = st.session_state.historical_df
+            if len(hist_df) < 60: # Need enough data for training + evaluation
+                st.warning("You need at least 60 days of historical data to use the evaluator.")
+            else:
+                # --- User Input ---
+                min_eval_date = hist_df['date'].min() + timedelta(days=50) # Ensure enough training data
+                max_eval_date = hist_df['date'].max() - timedelta(days=7)  # Ensure a full week of actuals
+                
+                # Default to the most recent possible evaluation week
+                default_eval_date = max_eval_date
+
+                eval_start_date = st.date_input(
+                    "Select the start date of the week to evaluate:",
+                    value=default_eval_date,
+                    min_value=min_eval_date,
+                    max_value=max_eval_date,
+                    help=f"Select the Sunday or Monday that begins the 7-day period you want to check. Data must exist for the full 7 days after this date."
+                )
+
+                if st.button("📊 Evaluate Accuracy for Selected Week"):
+                    eval_end_date = eval_start_date + timedelta(days=6)
+                    
+                    # 1. Prepare training and actual dataframes
+                    training_data = hist_df[hist_df['date'] < pd.to_datetime(eval_start_date)].copy()
+                    actual_data = hist_df[(hist_df['date'] >= pd.to_datetime(eval_start_date)) & (hist_df['date'] <= pd.to_datetime(eval_end_date))].copy()
+
+                    if len(actual_data) < 7:
+                        st.error(f"Cannot perform evaluation. Full 7 days of actual data not available from {eval_start_date.strftime('%Y-%m-%d')}.")
+                    else:
+                        with st.spinner(f"🛠️ Generating historical forecast for {eval_start_date.strftime('%Y-%m-%d')} to {eval_end_date.strftime('%Y-%m-%d')}..."):
+                            # 2. Run the forecast for the evaluation period (7 days)
+                            ev_df = st.session_state.events_df.copy()
+                            EVAL_HORIZON = 7
+
+                            # --- Re-run forecasting pipeline on the training subset ---
+                            train_df_atv = calculate_atv(training_data)
+                            
+                            # Customer Forecast
+                            prophet_cust_f_eval, _ = train_and_forecast_prophet(train_df_atv, ev_df, EVAL_HORIZON, 'customers')
+                            xgb_cust_f_eval = train_and_forecast_xgboost_tuned(train_df_atv, ev_df, EVAL_HORIZON, 'customers')
+                            
+                            cust_f_eval = pd.DataFrame()
+                            if not prophet_cust_f_eval.empty and not xgb_cust_f_eval.empty:
+                                cust_f_eval = pd.merge(prophet_cust_f_eval, xgb_cust_f_eval, on='ds', suffixes=('_prophet', '_xgb'))
+                                cust_f_eval['forecast_customers'] = (cust_f_eval['yhat_prophet'] + cust_f_eval['yhat_xgb']) / 2
+                            
+                            # ATV Forecast (for Sales)
+                            atv_f_eval, _ = train_and_forecast_prophet(train_df_atv, ev_df, EVAL_HORIZON, 'atv')
+                            
+                            # 3. Combine forecasts
+                            if not cust_f_eval.empty and not atv_f_eval.empty:
+                                combined_eval_f = pd.merge(
+                                    cust_f_eval[['ds', 'forecast_customers']],
+                                    atv_f_eval[['ds', 'yhat']].rename(columns={'yhat': 'forecast_atv'}),
+                                    on='ds'
+                                )
+                                combined_eval_f['forecast_base_sales'] = combined_eval_f['forecast_customers'] * combined_eval_f['forecast_atv']
+                                
+                                # 4. Merge forecast with actuals
+                                evaluation_df = pd.merge(
+                                    actual_data, 
+                                    combined_eval_f, 
+                                    left_on='date', 
+                                    right_on='ds'
+                                ).drop(columns=['ds'])
+                                
+                                # 5. Adjust forecast sales with actual add-on sales for fair comparison
+                                evaluation_df['forecast_total_sales'] = evaluation_df['forecast_base_sales'] + evaluation_df['add_on_sales']
+                                st.session_state.evaluation_df = evaluation_df
+                                st.success("Evaluation complete!")
+                            else:
+                                st.error("Failed to generate one or more forecast components for the evaluation period.")
+                
+                # --- Display Results ---
+                if not st.session_state.evaluation_df.empty:
+                    eval_df = st.session_state.evaluation_df
+                    
+                    st.markdown("---")
+                    st.subheader("Accuracy Metrics for the Week")
+                    
+                    # Calculate Metrics
+                    sales_mae = mean_absolute_error(eval_df['sales'], eval_df['forecast_total_sales'])
+                    sales_mape = mean_absolute_percentage_error(eval_df['sales'], eval_df['forecast_total_sales'])
+                    cust_mae = mean_absolute_error(eval_df['customers'], eval_df['forecast_customers'])
+                    cust_mape = mean_absolute_percentage_error(eval_df['customers'], eval_df['forecast_customers'])
+
+                    m_col1, m_col2 = st.columns(2)
+                    with m_col1:
+                        st.metric(label="Sales MAPE (Accuracy)", value=f"{100 - sales_mape * 100:.2f}%")
+                        st.metric(label="Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
+                    with m_col2:
+                        st.metric(label="Customer MAPE (Accuracy)", value=f"{100 - cust_mape * 100:.2f}%")
+                        st.metric(label="Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
+                    
+                    st.markdown("---")
+                    st.subheader("Comparison Charts")
+
+                    # Display plots
+                    sales_fig = plot_evaluation_chart(eval_df, 'sales', 'forecast_total_sales', 'Actual Sales vs. Forecast Sales', 'Sales (₱)')
+                    st.plotly_chart(sales_fig, use_container_width=True)
+                    
+                    cust_fig = plot_evaluation_chart(eval_df, 'customers', 'forecast_customers', 'Actual Customers vs. Forecast Customers', 'Number of Customers')
+                    st.plotly_chart(cust_fig, use_container_width=True)
+                    
+                    with st.expander("View Raw Evaluation Data"):
+                        display_cols = {
+                            "date": "Date",
+                            "sales": "Actual Sales",
+                            "forecast_total_sales": "Forecast Sales",
+                            "customers": "Actual Customers",
+                            "forecast_customers": "Forecast Customers",
+                            "add_on_sales": "Add-on Sales"
+                        }
+                        st.dataframe(eval_df[display_cols.keys()].rename(columns=display_cols), use_container_width=True, hide_index=True)
+        
+        with tabs[3]:
             if st.session_state['access_level'] <= 2:
                 form_col, display_col = st.columns([2, 3], gap="large")
 
@@ -971,7 +1030,7 @@ if db:
             else:
                 st.warning("You do not have permission to add or edit data in this tab.")
         
-        with tabs[3]:
+        with tabs[4]:
             def set_view_all(): st.session_state.show_all_activities = True
             def set_overview(): st.session_state.show_all_activities = False
 
@@ -1066,7 +1125,7 @@ if db:
                             render_activity_card(row, db, view_type='compact_list', access_level=st.session_state['access_level'])
 
 
-        with tabs[4]:
+        with tabs[5]:
             st.subheader("View & Edit Historical Data")
             df = st.session_state.historical_df.copy()
             if not df.empty and 'date' in df.columns:
@@ -1120,7 +1179,7 @@ if db:
                 st.write("No historical data to display.")
 
         if st.session_state['access_level'] == 1:
-            with tabs[5]:
+            with tabs[6]:
                 st.subheader("User Management")
 
                 # Add new user
