@@ -4,7 +4,6 @@ from prophet import Prophet
 import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error
-# --- MODIFICATION ---: Import TimeSeriesSplit for proper cross-validation
 from sklearn.model_selection import TimeSeriesSplit
 import numpy as np
 import plotly.graph_objs as go
@@ -272,9 +271,22 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
-# --- MODIFICATION ---: Advanced Feature Engineering Function
+# --- MODIFICATION ---: Corrected function to handle categorical features like 'weather'
 def create_advanced_features(df, target_column):
+    """
+    Creates time series and other features from the input dataframe.
+    Handles categorical features by one-hot encoding them.
+    """
     df['date'] = pd.to_datetime(df['date'])
+
+    # One-Hot Encode categorical features like 'weather'
+    if 'weather' in df.columns:
+        # Using get_dummies to convert categorical variable into dummy/indicator variables
+        weather_dummies = pd.get_dummies(df['weather'], prefix='weather')
+        df = pd.concat([df, weather_dummies], axis=1)
+        # Drop the original 'weather' column as it's been encoded
+        df.drop('weather', axis=1, inplace=True)
+
     df = df.set_index('date')
 
     # Time-based features
@@ -285,13 +297,14 @@ def create_advanced_features(df, target_column):
     df['dayofyear'] = df.index.dayofyear
     df['weekofyear'] = df.index.isocalendar().week.astype(int)
 
-    # Lag features
-    for lag in [7, 14]:
-        df[f'lag_{target_column}_{lag}'] = df[target_column].shift(lag)
+    # Lag features on the target column
+    if target_column in df.columns:
+        for lag in [7, 14]:
+            df[f'lag_{target_column}_{lag}'] = df[target_column].shift(lag)
 
-    # Rolling window features
-    df[f'rolling_mean_{target_column}_7'] = df[target_column].rolling(window=7).mean()
-    df[f'rolling_std_{target_column}_7'] = df[target_column].rolling(window=7).std()
+        # Rolling window features on the target column
+        df[f'rolling_mean_{target_column}_7'] = df[target_column].rolling(window=7).mean()
+        df[f'rolling_std_{target_column}_7'] = df[target_column].rolling(window=7).std()
     
     # Fourier terms for seasonality
     df['dayofyear_sin'] = np.sin(2 * np.pi * df['dayofyear'] / 365.25)
@@ -304,9 +317,10 @@ def create_advanced_features(df, target_column):
     df['friday_payday'] = (df['dayofweek'] == 4) & (df['is_payday'])
 
     df = df.reset_index()
-    # Fill NaNs created by lags/rolling windows
-    df = df.bfill() 
+    # Fill NaNs created by lags/rolling windows using backfill, then forward fill
+    df = df.bfill().ffill() 
     return df
+
 
 # --- Core Forecasting Models ---
 @st.cache_resource
@@ -342,16 +356,14 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast, prophet_model, all_manual_events
 
-# --- MODIFICATION ---: XGBoost model now predicts residuals and uses robust TimeSeriesSplit for tuning.
 @st.cache_resource
 def train_xgboost_on_residuals_tuned(df_featured, target_col):
     if df_featured.empty:
         return None
 
     features = [col for col in df_featured.columns if col not in ['date', 'ds', 'y', 'yhat_prophet', target_col]]
-    target = target_col # The target is the residual column
+    target = target_col
 
-    # Ensure all feature columns are numeric
     for col in features:
         df_featured[col] = pd.to_numeric(df_featured[col], errors='coerce')
     df_featured = df_featured.fillna(0)
@@ -360,7 +372,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
     X = df_featured[features]
     y = df_featured[target]
     
-    # --- MODIFICATION ---: Objective function for Optuna using TimeSeriesSplit
     def objective(trial):
         params = {
             'objective': 'reg:squarederror',
@@ -374,7 +385,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
         
         model = xgb.XGBRegressor(**params)
         
-        # --- MODIFICATION ---: Use TimeSeriesSplit for robust validation
         tscv = TimeSeriesSplit(n_splits=3)
         scores = []
         for train_index, test_index in tscv.split(X):
@@ -392,7 +402,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
         return np.mean(scores)
 
     study = optuna.create_study(direction='minimize')
-    # --- MODIFICATION ---: Reduced trials for faster interactive use, can be increased for higher accuracy
     study.optimize(objective, n_trials=25) 
 
     best_params = study.best_params
@@ -634,7 +643,6 @@ if db:
     else:
         with st.sidebar:
             st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-            # --- MODIFICATION ---: Updated info box for new model
             st.info("Forecasting with an advanced ensemble model: Prophet + XGBoost on Residuals.")
 
             if st.button("🔄 Refresh Data from Firestore"):
@@ -658,48 +666,44 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- MODIFICATION ---: New "Prophet + XGBoost on Residuals" pipeline
                         def generate_hybrid_forecast(df, events, periods, target_col):
-                            # 1. Train Prophet
                             prophet_forecast, prophet_model, all_events = train_and_forecast_prophet(df, events, periods, target_col)
                             if prophet_forecast.empty: return pd.DataFrame(), None, None
 
-                            # 2. Prepare data for XGBoost (historical part only)
                             hist_prophet = prophet_forecast.iloc[:-periods]
                             df_merged = pd.merge(df, hist_prophet[['ds', 'yhat']], left_on='date', right_on='ds')
                             
-                            # 3. Calculate residuals
                             df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
 
-                            # 4. Create advanced features
-                            df_featured = create_advanced_features(df_merged, 'residual')
+                            df_featured_train = create_advanced_features(df_merged.copy(), 'residual')
 
-                            # 5. Train XGBoost on residuals
-                            xgb_model = train_xgboost_on_residuals_tuned(df_featured, 'residual')
+                            xgb_model = train_xgboost_on_residuals_tuned(df_featured_train, 'residual')
                             if not xgb_model: return pd.DataFrame(), prophet_model, all_events
                             
-                            # 6. Predict future residuals
-                            # Create future features dataframe
                             last_date = df['date'].max()
                             future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
                             future_df_base = pd.DataFrame({'date': future_dates})
                             
-                            # Add a placeholder for the target to use the feature creation function
                             future_df_base[target_col] = 0 
-                            future_featured = create_advanced_features(future_df_base, target_col)
+                            future_featured = create_advanced_features(future_df_base.copy(), target_col)
                             
-                            future_features_for_xgb = [col for col in df_featured.columns if col in future_featured.columns and col not in ['date', 'ds', 'y', 'yhat_prophet', 'residual', target_col]]
-                            
-                            future_residual_preds = xgb_model.predict(future_featured[future_features_for_xgb])
+                            train_cols = xgb_model.get_booster().feature_names
+                            future_cols = future_featured.columns
 
-                            # 7. Combine forecasts
+                            # Align columns - crucial for prediction
+                            for col in train_cols:
+                                if col not in future_cols:
+                                    future_featured[col] = 0
+                            
+                            future_featured = future_featured[train_cols]
+                            
+                            future_residual_preds = xgb_model.predict(future_featured)
+
                             final_forecast = prophet_forecast.copy()
-                            # Add predicted residuals to the future part of the Prophet forecast
                             final_forecast.loc[len(df):, 'yhat'] += future_residual_preds
 
                             return final_forecast, prophet_model, all_events
 
-                        # Generate forecasts for both customers and ATV
                         cust_f, prophet_model_cust, all_holidays_cust = generate_hybrid_forecast(hist_df_with_atv, ev_df, 15, 'customers')
                         atv_f, _, _ = generate_hybrid_forecast(hist_df_with_atv, ev_df, 15, 'atv')
 
@@ -718,7 +722,6 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
-                            # Store prophet components for insight tab
                             st.session_state.forecast_components = prophet_model_cust.predict(cust_f[['ds']])
                             st.session_state.all_holidays = all_holidays_cust
                             
