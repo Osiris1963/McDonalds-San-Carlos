@@ -329,17 +329,14 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     use_yearly_seasonality = len(df_train) >= 365
 
-    # --- MODIFICATION: Prioritize Recent Data ---
-    # The changepoint parameters have been adjusted to make the model more
-    # responsive to recent trends in the data.
     prophet_model = Prophet(
         growth='linear',
         holidays=all_manual_events,
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.15, # Increased from 0.05 for more trend flexibility.
-        changepoint_range=0.9, # Increased from 0.8 to allow trend changes in the last 10% of the data.
+        changepoint_prior_scale=0.05,
+        changepoint_range=0.8
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -368,6 +365,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
     
     # Use the new advanced feature engineering function
+    # This will create lags and rolling features across the entire timeline
     full_df_featured = create_advanced_features(full_df)
     
     # Separate the historical and future dataframes again
@@ -397,15 +395,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning("Not enough data to train the XGBoost model after feature engineering.")
         return pd.DataFrame()
         
-    # --- MODIFICATION: Add Sample Weights to Prioritize Recent Data ---
-    # Weights increase linearly from a base of 0.5 to 1.0 for the most recent data.
-    # This makes the model pay more attention to recent trends during training.
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-
-    # Split data and weights for training and validation
-    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
-        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False # shuffle=False for time series
-    )
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False) # shuffle=False for time series
 
     def objective(trial):
         params = {
@@ -420,16 +410,12 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
         
         model = xgb.XGBRegressor(**params)
-        # Fit the model with sample weights for both training and evaluation sets
         model.fit(X_train, y_train, 
-                  sample_weight=weights_train,
-                  eval_set=[(X_test, y_test)],
-                  sample_weight_eval_set=[weights_test],
+                  eval_set=[(X_test, y_test)], 
                   verbose=False)
         
         preds = model.predict(X_test)
-        # Also weight the final metric for Optuna to optimize on recent data performance
-        mae = mean_absolute_error(y_test, preds, sample_weight=weights_test)
+        mae = mean_absolute_error(y_test, preds)
         return mae
 
     study = optuna.create_study(direction='minimize')
@@ -438,9 +424,8 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     best_params = study.best_params
     best_params.pop('early_stopping_rounds', None)
     
-    # Train the final model on all data, using the full set of sample weights
     final_model = xgb.XGBRegressor(**best_params)
-    final_model.fit(X, y, sample_weight=sample_weights)
+    final_model.fit(X, y)
 
     X_future = future_df_featured[features]
     future_predictions = final_model.predict(X_future)
@@ -454,6 +439,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     final_df = final_df.rename(columns={'date': 'ds'})
     
     return final_df
+
 
 
 # --- Plotting Functions & Firestore Data I/O ---
