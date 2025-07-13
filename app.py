@@ -363,7 +363,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     # Concatenate for seamless feature creation
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
     
-    # Use the new advanced feature engineering function
+    # Use the advanced feature engineering function
     # This will create lags and rolling features across the entire timeline
     full_df_featured = create_advanced_features(full_df)
     
@@ -515,16 +515,32 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def generate_insight_summary(day_data,selected_date):
+    # Note: Since the model providing this breakdown (Prophet) was trained on log-transformed data,
+    # the absolute values here represent the effect on the log scale. The directional insights remain valid.
     effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
-    significant_effects={k:v for k,v in effects.items()if abs(v)>1}
-    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
+    significant_effects={k:v for k,v in effects.items()if abs(v)>0.05} # Adjusted threshold for log scale
+    
+    # We need to convert the yhat and trend back to the original scale for the summary text
+    yhat_original = np.expm1(day_data.get('yhat', 0))
+    trend_original = np.expm1(day_data.get('trend', 0))
+
+    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{trend_original:.0f} customers**.\n\n"
     if not significant_effects:
-        summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."
+        summary += f"The final forecast of **{yhat_original:.0f} customers** is driven primarily by this trend."
         return summary
-    pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
-    if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
-    if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
-    summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
+    
+    pos_drivers={k:v for k,v in significant_effects.items()if v>0}
+    neg_drivers={k:v for k,v in significant_effects.items()if v<0}
+    
+    if pos_drivers:
+        biggest_pos_driver=max(pos_drivers,key=pos_drivers.get)
+        summary+=f"📈 A key positive driver is **{biggest_pos_driver}**.\n"
+    if neg_drivers:
+        biggest_neg_driver=min(neg_drivers,key=neg_drivers.get)
+        summary+=f"📉 A key negative driver is **{biggest_neg_driver}**.\n"
+        
+    summary+=f"\nAfter all factors, the final forecast is **{yhat_original:.0f} customers**.";
+    return summary
 
 def render_activity_card(row, db_client, view_type='compact_list', access_level=3):
     doc_id = row['doc_id']
@@ -702,18 +718,23 @@ if db:
                     with st.spinner("🧠 Optimizing and building forecast models... This may take a minute."):
                         base_df = st.session_state.historical_df.copy()
                         
-                        base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
+                        # Calculate ATV first on original values
+                        hist_df_with_atv = calculate_atv(base_df)
                         
-                        cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
-                        
-                        if removed_count > 0:
-                            st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
+                        # --- NEW: LOG TRANSFORMATION FOR OUTLIER HANDLING ---
+                        # Create a copy for plotting before transforming
+                        hist_for_plotting = hist_df_with_atv.copy()
 
-                        hist_df_with_atv = calculate_atv(cleaned_df)
+                        # Apply log transformation to stabilize data and handle outliers
+                        # Using np.log1p handles zeros gracefully (log(1+x))
+                        st.info("Applying log transformation to handle outliers...")
+                        hist_df_with_atv['sales'] = np.log1p(hist_df_with_atv['sales'])
+                        hist_df_with_atv['customers'] = np.log1p(hist_df_with_atv['customers'])
+                        hist_df_with_atv['atv'] = np.log1p(hist_df_with_atv['atv'])
                         
                         ev_df = st.session_state.events_df.copy()
                         
-                        # --- TRAIN AND COMBINE MODELS ---
+                        # --- TRAIN AND COMBINE MODELS (on transformed data) ---
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'customers')
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, 15, 'atv')
 
@@ -727,6 +748,11 @@ if db:
                             cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
                             
+                            # --- NEW: INVERSE TRANSFORM ---
+                            # Convert predictions back to the original scale
+                            cust_f['yhat'] = np.expm1(cust_f['yhat'])
+                            atv_f['yhat'] = np.expm1(atv_f['yhat'])
+                            
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
@@ -739,10 +765,14 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
+                            # Prophet components are on the log scale, but insights still valuable
                             prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
                             st.session_state.forecast_components = prophet_forecast_components
                             st.session_state.all_holidays = prophet_model_cust.holidays
                             
+                            # Store the untransformed historical data for plotting
+                            st.session_state.hist_for_plotting = hist_for_plotting
+
                             st.success(f"Ensemble forecast generated successfully!")
                         else:
                             st.error("Forecast generation failed. One of the models could not be trained.")
@@ -772,7 +802,11 @@ if db:
                     st.markdown("#### Forecasted Values");st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
                     st.markdown("#### Forecast Visualization");fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');st.plotly_chart(fig,use_container_width=True)
                 with st.expander("🔬 View Full Forecast vs. Historical Data"):
-                    st.info("This view shows how the component models performed against past data.");d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"]);hist_atv=calculate_atv(st.session_state.historical_df.copy())
+                    st.info("This view shows how the component models performed against past data.");d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"])
+                    
+                    # Use the stored, untransformed historical data for accurate plotting
+                    hist_atv = st.session_state.get('hist_for_plotting', st.session_state.historical_df.copy())
+
                     with d_t1:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}),st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
                     with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
             else:st.info("Click the 'Generate Component Forecast' button to begin.")
