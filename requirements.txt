@@ -11,3 +11,4 @@ xgboost
 tensorflow
 scikit-learn
 optuna
+library==1.2.3
