@@ -359,7 +359,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
     if df_featured.empty:
         return None
 
-    # --- MODIFICATION ---: Added 'doc_id' to the exclusion list.
     features = [col for col in df_featured.columns if col not in ['date', 'ds', 'y', 'yhat_prophet', target_col, 'doc_id']]
     target = target_col
 
@@ -700,7 +699,10 @@ if db:
                             
                             temp_hist_for_lags = df_with_actual_features.tail(30)
                             future_featured = pd.concat([temp_hist_for_lags, future_df_base], ignore_index=True)
-                            future_featured = create_advanced_features(future_featured, target_column=target_col)
+                            
+                            # --- MODIFICATION ---: Corrected logic to prevent data leakage during future feature creation
+                            future_featured = create_advanced_features(future_featured, target_column=None) # Pass None to avoid creating target-based features
+                            
                             future_featured = future_featured[future_featured['date'].isin(future_dates)]
                             
                             train_cols = xgb_model.get_booster().feature_names
