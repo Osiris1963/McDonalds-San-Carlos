@@ -161,6 +161,7 @@ def initialize_state_firestore(db_client):
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
     if 'historical_forecasts' not in st.session_state: st.session_state.historical_forecasts = load_from_firestore(db_client, 'historical_forecasts')
+
     defaults = {
         'forecast_df': pd.DataFrame(),
         'metrics': {},
@@ -208,8 +209,10 @@ def load_from_firestore(_db_client, collection_name):
 
     df = pd.DataFrame(records)
 
+    # --- FIX: Standardize timezone handling ---
     if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.normalize()
+        # Convert to datetime and then remove timezone information
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
         if not df.empty:
             df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
@@ -220,6 +223,7 @@ def load_from_firestore(_db_client, collection_name):
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     return df
+
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -316,6 +320,12 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty: return pd.DataFrame()
+    
+    # --- FIX: Drop non-numeric columns before training ---
+    cols_to_drop = [col for col in ['doc_id', 'weather'] if col in df_train.columns]
+    if cols_to_drop:
+        df_train = df_train.drop(columns=cols_to_drop)
+
     last_date = df_train['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
     future_df_template = pd.DataFrame({'date': future_dates})
@@ -330,19 +340,33 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     X = df_featured[features]; y = df_featured[target]
     if X.empty or len(X) < 10: st.warning("Not enough data for XGBoost model after feature engineering."); return pd.DataFrame()
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
+    
     def objective(trial):
-        params = {'objective': 'reg:squarederror', 'n_estimators': trial.suggest_int('n_estimators', 500, 2000), 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1), 'max_depth': trial.suggest_int('max_depth', 3, 10), 'subsample': trial.suggest_float('subsample', 0.6, 1.0), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0), 'random_state': 42, 'early_stopping_rounds': 50}
+        params = {
+            'objective': 'reg:squarederror',
+            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'random_state': 42,
+        }
         model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+        model.fit(X_train, y_train, 
+                  eval_set=[(X_test, y_test)], 
+                  early_stopping_rounds=50, # Correct parameter for early stopping
+                  verbose=False)
         preds = model.predict(X_test); mae = mean_absolute_error(y_test, preds); return mae
-    study = optuna.create_study(direction='minimize'); study.optimize(objective, n_trials=50)
-    best_params = study.best_params; best_params.pop('early_stopping_rounds', None)
+
+    study = optuna.create_study(direction='minimize'); study.optimize(objective, n_trials=25)
+    best_params = study.best_params
     final_model = xgb.XGBRegressor(**best_params); final_model.fit(X, y)
     X_future = future_df_featured[features]; future_predictions = final_model.predict(X_future)
     full_prediction_df = df_featured[['date']].copy(); full_prediction_df['yhat'] = final_model.predict(X)
     future_df_template['yhat'] = future_predictions
     final_df = pd.concat([full_prediction_df, future_df_template], ignore_index=True).rename(columns={'date': 'ds'})
     return final_df
+
 
 # --- Plotting & Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
@@ -394,6 +418,10 @@ def plot_evaluation_chart(df, y_true, y_pred, title, y_axis_title):
         yaxis=dict(title_font_color='black', tickfont=dict(color='black'), gridcolor='#dddddd', linecolor='black')
     )
     return fig
+
+def plot_full_comparison_chart(hist,fcst,metrics,target):
+    fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
+    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
@@ -514,12 +542,16 @@ if db:
 
         with tabs[0]: # Forecast Dashboard
             if not st.session_state.forecast_df.empty:
-                forecast_df = st.session_state.forecast_df.copy()
+                forecast_df_display = st.session_state.forecast_df.copy()
                 with st.spinner("🛰️ Fetching live weather..."): weather_df = get_weather_forecast()
-                if weather_df is not None: forecast_df = pd.merge(forecast_df, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
-                else: forecast_df['weather'] = 'Not Available'
-
-                future_forecast_df = forecast_df[forecast_df['ds'] >= pd.to_datetime('today').normalize()].copy()
+                if weather_df is not None:
+                    weather_df['date'] = pd.to_datetime(weather_df['date']).dt.tz_localize(None)
+                    forecast_df_display = pd.merge(forecast_df_display, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                else:
+                    forecast_df_display['weather'] = 'Not Available'
+                
+                future_forecast_df = forecast_df_display[forecast_df_display['ds'] >= pd.to_datetime('today').normalize()].copy()
+                
                 if not future_forecast_df.empty:
                     st.markdown("#### Forecasted Values")
                     disp_cols = {
@@ -532,7 +564,7 @@ if db:
 
                     if 'Date' in display_df.columns:
                         display_df = display_df.set_index('Date')
-
+                    
                     st.dataframe(
                         display_df.style.format({
                             'Predicted Customers': '{:,.0f}',
@@ -544,7 +576,20 @@ if db:
 
                     fig=go.Figure();fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')));fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')));fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');st.plotly_chart(fig,use_container_width=True)
                 else: st.warning("Forecast contains no future dates.")
-            else: st.info("Click 'Generate Forecast' in the sidebar to begin.")
+                
+                with st.expander("🔬 View Full Forecast vs. Historical Data"):
+                    st.info("This view shows how the component models performed against past data.")
+                    d_t1, d_t2 = st.tabs(["Customer Analysis", "Avg. Transaction Analysis"])
+                    
+                    # --- FIX: Ensure hist_atv is calculated before plotting ---
+                    hist_atv = calculate_atv(st.session_state.historical_df.copy())
+                    
+                    with d_t1:
+                        st.plotly_chart(plot_full_comparison_chart(hist_atv, st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}), st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
+                    with d_t2:
+                        st.plotly_chart(plot_full_comparison_chart(hist_atv, st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}), st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
+            else:
+                st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
         with tabs[1]: # Forecast Insights
             st.info("The breakdown below is generated by the Prophet model component of the forecast.")
@@ -569,22 +614,20 @@ if db:
             if hist_df.empty or hist_forecast_df.empty:
                 st.warning("Not enough historical actuals or saved forecasts to evaluate. Please add data and generate a forecast.")
             else:
-                # FIX: Ensure data types of the merge key ('date') are identical
-                hist_df['date'] = pd.to_datetime(hist_df['date'])
-                hist_forecast_df['date'] = pd.to_datetime(hist_forecast_df['date'])
+                # --- FIX: Ensure data types of the merge key ('date') are identical and timezone-naive ---
+                hist_df['date'] = pd.to_datetime(hist_df['date']).dt.tz_localize(None)
+                hist_forecast_df['date'] = pd.to_datetime(hist_forecast_df['date']).dt.tz_localize(None)
 
                 eval_df = pd.merge(hist_df, hist_forecast_df, on='date', how='inner')
 
-                if 'add_on_sales' in eval_df.columns and 'forecast_sales' in eval_df.columns:
-                    eval_df['forecast_total_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
-                else:
-                    eval_df['forecast_total_sales'] = eval_df.get('forecast_sales', 0)
+                if not eval_df.empty:
+                    if 'add_on_sales' in eval_df.columns and 'forecast_sales' in eval_df.columns:
+                        eval_df['forecast_total_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
+                    else:
+                        eval_df['forecast_total_sales'] = eval_df.get('forecast_sales', 0)
 
-                eval_df = eval_df.sort_values('date', ascending=False).head(30)
+                    eval_df = eval_df.sort_values('date', ascending=False).head(30)
 
-                if eval_df.empty:
-                    st.warning("No overlapping data found between historical records and saved forecasts.")
-                else:
                     st.markdown("---")
                     st.subheader(f"Accuracy Metrics for the Last {len(eval_df)} Days")
 
@@ -605,6 +648,8 @@ if db:
                     st.plotly_chart(sales_fig, use_container_width=True)
                     cust_fig = plot_evaluation_chart(eval_df, 'customers', 'forecast_customers', 'Actual Customers vs. Forecast Customers', 'Number of Customers')
                     st.plotly_chart(cust_fig, use_container_width=True)
+                else:
+                    st.warning("No overlapping data found between historical records and saved forecasts.")
         
         with tabs[3]: # Add/Edit Data
             if st.session_state['access_level'] <= 2:
