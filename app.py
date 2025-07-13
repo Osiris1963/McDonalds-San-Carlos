@@ -318,10 +318,11 @@ def create_advanced_features(df, target_column=None):
 
 
 # --- Core Forecasting Models ---
+
+# --- MODIFICATION ---: Removed the redundant dropna() line to prevent timeline de-synchronization.
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
-    df_train.dropna(subset=['date', target_col], inplace=True)
     
     if df_train.empty or len(df_train) < 15:
         return pd.DataFrame(), None, pd.DataFrame()
@@ -351,7 +352,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast, prophet_model, all_manual_events
 
-# --- MODIFICATION ---: Corrected function to align with modern XGBoost API.
 @st.cache_resource
 def train_xgboost_on_residuals_tuned(df_featured, target_col):
     """
@@ -373,7 +373,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
     y = df_featured[target]
     
     def objective(trial):
-        # --- FIX: 'early_stopping_rounds' is now a model parameter, not a fit parameter.
         params = {
             'objective': 'reg:squarederror',
             'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
@@ -382,7 +381,7 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'random_state': 42,
-            'early_stopping_rounds': 50  # Moved here
+            'early_stopping_rounds': 50
         }
         
         model = xgb.XGBRegressor(**params)
@@ -393,7 +392,6 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
             X_train, X_test = X.iloc[train_index], X.iloc[test_index]
             y_train, y_test = y.iloc[train_index], y.iloc[test_index]
             
-            # --- FIX: 'early_stopping_rounds' is removed from the .fit() call.
             model.fit(X_train, y_train, 
                       eval_set=[(X_test, y_test)], 
                       verbose=False)
@@ -408,12 +406,10 @@ def train_xgboost_on_residuals_tuned(df_featured, target_col):
     study.optimize(objective, n_trials=25) 
 
     best_params = study.best_params
-    # We need to remove the early stopping rounds parameter for the final fit
     best_params.pop('early_stopping_rounds', None)
     
     final_model = xgb.XGBRegressor(**best_params)
     
-    # Train the final model on all available data
     final_model.fit(X, y)
     
     return final_model
@@ -696,7 +692,6 @@ if db:
                             
                             train_cols = xgb_model.get_booster().feature_names
                             
-                            # Align columns - crucial for prediction
                             future_featured_aligned = future_featured.reindex(columns=train_cols, fill_value=0)
                             
                             future_residual_preds = xgb_model.predict(future_featured_aligned)
