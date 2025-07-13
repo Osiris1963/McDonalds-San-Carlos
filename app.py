@@ -209,9 +209,7 @@ def load_from_firestore(_db_client, collection_name):
 
     df = pd.DataFrame(records)
 
-    # --- FIX: Standardize timezone handling ---
     if 'date' in df.columns:
-        # Convert to datetime and then remove timezone information
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
         if not df.empty:
@@ -223,7 +221,6 @@ def load_from_firestore(_db_client, collection_name):
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
     return df
-
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -321,7 +318,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty: return pd.DataFrame()
     
-    # --- FIX: Drop non-numeric columns before training ---
+    # Drop non-numeric columns that might have been loaded
     cols_to_drop = [col for col in ['doc_id', 'weather'] if col in df_train.columns]
     if cols_to_drop:
         df_train = df_train.drop(columns=cols_to_drop)
@@ -341,6 +338,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     if X.empty or len(X) < 10: st.warning("Not enough data for XGBoost model after feature engineering."); return pd.DataFrame()
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
     
+    # --- FIX: Moved 'early_stopping_rounds' to constructor ---
     def objective(trial):
         params = {
             'objective': 'reg:squarederror',
@@ -350,16 +348,18 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'random_state': 42,
+            'early_stopping_rounds': 50
         }
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, 
                   eval_set=[(X_test, y_test)], 
-                  early_stopping_rounds=50, # Correct parameter for early stopping
                   verbose=False)
         preds = model.predict(X_test); mae = mean_absolute_error(y_test, preds); return mae
 
     study = optuna.create_study(direction='minimize'); study.optimize(objective, n_trials=25)
     best_params = study.best_params
+    best_params.pop('early_stopping_rounds', None) # Remove for final model fitting
+    
     final_model = xgb.XGBRegressor(**best_params); final_model.fit(X, y)
     X_future = future_df_featured[features]; future_predictions = final_model.predict(X_future)
     full_prediction_df = df_featured[['date']].copy(); full_prediction_df['yhat'] = final_model.predict(X)
@@ -581,7 +581,6 @@ if db:
                     st.info("This view shows how the component models performed against past data.")
                     d_t1, d_t2 = st.tabs(["Customer Analysis", "Avg. Transaction Analysis"])
                     
-                    # --- FIX: Ensure hist_atv is calculated before plotting ---
                     hist_atv = calculate_atv(st.session_state.historical_df.copy())
                     
                     with d_t1:
@@ -614,7 +613,6 @@ if db:
             if hist_df.empty or hist_forecast_df.empty:
                 st.warning("Not enough historical actuals or saved forecasts to evaluate. Please add data and generate a forecast.")
             else:
-                # --- FIX: Ensure data types of the merge key ('date') are identical and timezone-naive ---
                 hist_df['date'] = pd.to_datetime(hist_df['date']).dt.tz_localize(None)
                 hist_forecast_df['date'] = pd.to_datetime(hist_forecast_df['date']).dt.tz_localize(None)
 
@@ -653,20 +651,20 @@ if db:
         
         with tabs[3]: # Add/Edit Data
             if st.session_state['access_level'] <= 2:
-                # Add original code for this tab here
-                pass
+                # Placeholder for original code
+                st.write("Data entry interface here.")
             else:
                 st.warning("You do not have permission to add or edit data.")
         
         with tabs[4]: # Future Activities
-            # Add original code for this tab here
-            pass
+            # Placeholder for original code
+            st.write("Future activities management here.")
 
         with tabs[5]: # Historical Data
-            # Add original code for this tab here
-            pass
+            # Placeholder for original code
+            st.write("Historical data viewer here.")
         
         if st.session_state['access_level'] == 1:
             with tabs[6]: # User Interface
-                # Add original code for this tab here
-                pass
+                # Placeholder for original code
+                st.write("User management interface here.")
