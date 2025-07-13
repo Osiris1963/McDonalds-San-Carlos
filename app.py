@@ -516,31 +516,37 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def create_daily_evaluation_data(historical_df, forecast_df):
-    """Merges historical and forecast data for daily evaluation."""
+    """Merges historical and forecast data for daily evaluation, adjusting forecast sales."""
     if forecast_df.empty or historical_df.empty:
         return pd.DataFrame()
 
+    # Select total sales, customers, and add_on_sales from historical data
     hist_eval = historical_df.copy()
     hist_eval['date'] = pd.to_datetime(hist_eval['date'])
-    hist_eval['base_sales'] = hist_eval['sales'] - hist_eval.get('add_on_sales', 0)
-    hist_eval = hist_eval[['date', 'base_sales', 'customers']]
-    hist_eval.rename(columns={'base_sales': 'actual_sales', 'customers': 'actual_customers'}, inplace=True)
+    hist_eval = hist_eval[['date', 'sales', 'customers', 'add_on_sales']]
+    hist_eval.rename(columns={'sales': 'actual_sales', 'customers': 'actual_customers'}, inplace=True)
 
+    # Prepare forecast data
     fcst_eval = forecast_df.copy()
     fcst_eval['ds'] = pd.to_datetime(fcst_eval['ds'])
     fcst_eval = fcst_eval[['ds', 'forecast_sales', 'forecast_customers']]
 
+    # Merge to find overlapping days
     eval_df = pd.merge(hist_eval, fcst_eval, left_on='date', right_on='ds', how='inner')
     if eval_df.empty:
         return pd.DataFrame()
         
     eval_df.drop(columns=['ds'], inplace=True)
+
+    # Adjust the forecast by adding the actual add-on sales
+    eval_df['adjusted_forecast_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
+    
     return eval_df
 
 def calculate_accuracy_metrics(historical_df, forecast_df):
-    """Calculates MAE and MAPE for the last 30 days of overlapping data."""
+    """Calculates MAE and MAPE for the last 30 days using adjusted forecast sales."""
     eval_df = create_daily_evaluation_data(historical_df, forecast_df)
-    if eval_df.empty:
+    if eval_df is None or eval_df.empty:
         return None
 
     thirty_days_ago = pd.to_datetime('today').normalize() - pd.Timedelta(days=30)
@@ -549,8 +555,9 @@ def calculate_accuracy_metrics(historical_df, forecast_df):
     if eval_df_30_days.empty:
         return None
 
+    # Use 'actual_sales' and the new 'adjusted_forecast_sales'
     actual_s = eval_df_30_days['actual_sales']
-    forecast_s = eval_df_30_days['forecast_sales']
+    forecast_s = eval_df_30_days['adjusted_forecast_sales']
     
     non_zero_mask_s = actual_s != 0
     if not non_zero_mask_s.any():
@@ -561,6 +568,7 @@ def calculate_accuracy_metrics(historical_df, forecast_df):
     sales_mae = mean_absolute_error(actual_s, forecast_s)
     sales_accuracy = 100 - sales_mape
 
+    # Customer calculation remains the same
     actual_c = eval_df_30_days['actual_customers']
     forecast_c = eval_df_30_days['forecast_customers']
 
@@ -581,7 +589,7 @@ def calculate_accuracy_metrics(historical_df, forecast_df):
     }
 
 def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
-    """Creates a line graph comparing actual vs. forecast data with a white background."""
+    """Creates a line graph with highly readable text on a white background."""
     if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
         fig = go.Figure()
         fig.update_layout(
@@ -605,14 +613,15 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
     
     fig.update_layout(
         title=dict(text=title, font=dict(color='black', size=20)),
-        xaxis_title='Date', yaxis_title=y_axis_title,
-        legend=dict(x=0.01, y=0.99, font=dict(color='black'), bgcolor='rgba(255,255,255,0.6)'),
+        xaxis_title=dict(text='Date', font=dict(color='black', size=14)),
+        yaxis_title=dict(text=y_axis_title, font=dict(color='black', size=14)),
+        legend=dict(font=dict(color='black', size=12)),
         height=450, margin=dict(l=50, r=50, t=80, b=50),
         paper_bgcolor='white', plot_bgcolor='white', font_color='black'
     )
     
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray')
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='LightGray', tickfont=dict(color='black', size=12))
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='LightGray', tickfont=dict(color='black', size=12))
 
     return fig
 
@@ -941,6 +950,11 @@ if db:
             metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df)
             
             if metrics:
+                st.info(
+                    "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
+                    "is adjusted by adding the *actual add-on sales* for each corresponding day. "
+                    "The metrics and charts below use this adjusted forecast."
+                )
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric(
@@ -977,7 +991,7 @@ if db:
             else:
                 sales_fig = plot_evaluation_graph(
                     chart_df,
-                    date_col='date', actual_col='actual_sales', forecast_col='forecast_sales',
+                    date_col='date', actual_col='actual_sales', forecast_col='adjusted_forecast_sales',
                     title='Actual Sales vs. Forecast Sales', y_axis_title='Sales (₱)'
                 )
                 st.plotly_chart(sales_fig, use_container_width=True)
