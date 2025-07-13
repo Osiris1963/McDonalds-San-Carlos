@@ -520,26 +520,27 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     if forecast_df.empty or historical_df.empty:
         return pd.DataFrame()
 
-    # Select total sales, customers, and add_on_sales from historical data
     hist_eval = historical_df.copy()
     hist_eval['date'] = pd.to_datetime(hist_eval['date'])
     hist_eval = hist_eval[['date', 'sales', 'customers', 'add_on_sales']]
     hist_eval.rename(columns={'sales': 'actual_sales', 'customers': 'actual_customers'}, inplace=True)
 
-    # Prepare forecast data
     fcst_eval = forecast_df.copy()
     fcst_eval['ds'] = pd.to_datetime(fcst_eval['ds'])
     fcst_eval = fcst_eval[['ds', 'forecast_sales', 'forecast_customers']]
 
-    # Merge to find overlapping days
     eval_df = pd.merge(hist_eval, fcst_eval, left_on='date', right_on='ds', how='inner')
     if eval_df.empty:
         return pd.DataFrame()
         
     eval_df.drop(columns=['ds'], inplace=True)
 
+    # Robustly convert to numeric, coercing errors and filling NaNs before calculation
+    forecast_sales_numeric = pd.to_numeric(eval_df['forecast_sales'], errors='coerce').fillna(0)
+    add_on_sales_numeric = pd.to_numeric(eval_df['add_on_sales'], errors='coerce').fillna(0)
+
     # Adjust the forecast by adding the actual add-on sales
-    eval_df['adjusted_forecast_sales'] = eval_df['forecast_sales'] + eval_df['add_on_sales']
+    eval_df['adjusted_forecast_sales'] = forecast_sales_numeric + add_on_sales_numeric
     
     return eval_df
 
