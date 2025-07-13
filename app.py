@@ -5,7 +5,6 @@ import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression # For Stacking ATV
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -183,14 +182,13 @@ def get_user(db_client, username):
     return None
 
 def verify_password(plain_password, hashed_password):
-    # The hashed_password from Firestore is a string, it must be encoded to bytes
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 def hash_password(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
 # --- Data Processing and Feature Engineering ---
-@st.cache_data(ttl="1h") # Unified cache time
+@st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
     
@@ -205,7 +203,6 @@ def load_from_firestore(_db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    # Only perform date operations if a 'date' column exists
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         if pd.api.types.is_datetime64_any_dtype(df['date']):
@@ -232,9 +229,7 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
-    # Create 'base_sales' column to make the function self-contained and robust.
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
-    
     sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0)
     customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
@@ -292,27 +287,24 @@ def create_advanced_features(df):
 
     df = df.sort_values('date')
     
-    # Lag features for sales and customers
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
     if 'customers' in df.columns:
         df['customers_lag_7'] = df['customers'].shift(7)
     
-    # Rolling window features for sales and customers
     if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
     if 'customers' in df.columns:
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
 
-    # **NEW**: Add lag and rolling features for ATV if the column exists
+    # **FIX**: Add lag and rolling features specifically for ATV
     if 'atv' in df.columns:
         df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
         
     return df
-
 
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
@@ -375,8 +367,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     future_df_template = pd.DataFrame({'date': future_dates})
 
     full_df = pd.concat([df_train, future_df_template], ignore_index=True)
-    
-    # Feature engineering is now more comprehensive
     full_df_featured = create_advanced_features(full_df)
     
     if 'day_type' in full_df_featured.columns:
@@ -388,9 +378,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     
     # Drop rows with NaNs created by shift/rolling operations from the training set
-    df_featured.dropna(subset=[f'{target_col}_lag_7' if target_col == 'atv' else 'sales_lag_7'], inplace=True)
+    dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
+    if dropna_col in df_featured.columns:
+        df_featured.dropna(subset=[dropna_col], inplace=True)
 
-    # **MODIFIED**: Dynamic feature selection based on the target
+    # **FIX**: Dynamic feature selection based on the target
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
     
     if target_col == 'customers':
@@ -408,7 +400,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
         ]
 
-    features = [f for f in features if f in df_featured.columns]
+    features = [f for f in features if f in df_featured.columns and f in future_df_featured.columns]
     target = target_col
 
     X = df_featured[features]
@@ -468,7 +460,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     final_df = final_df.rename(columns={'date': 'ds'})
     
     return final_df
-
 
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
@@ -544,7 +535,6 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 def create_daily_evaluation_data(historical_df, forecast_df):
-    """Merges historical and forecast data for daily evaluation, adjusting forecast sales."""
     if forecast_df.empty or historical_df.empty:
         return pd.DataFrame()
 
@@ -571,7 +561,6 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     return eval_df
 
 def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
-    """Calculates MAE and MAPE for a specified number of past days."""
     eval_df = create_daily_evaluation_data(historical_df, forecast_df)
     if eval_df is None or eval_df.empty:
         return None
@@ -614,7 +603,6 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
     }
 
 def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
-    """Creates a line graph with highly readable text on a white background."""
     if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
         fig = go.Figure()
         fig.update_layout(
@@ -741,7 +729,6 @@ def render_activity_card(row, db_client, view_type='compact_list', access_level=
                                 st.rerun()
 
 def render_historical_record(row, db_client):
-    """Renders a single historical record with an editable form inside an expander."""
     date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     
@@ -851,7 +838,6 @@ if db:
                         if removed_count > 0:
                             st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
-                        # Calculate ATV after cleaning and before forecasting
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         ev_df = st.session_state.events_df.copy()
                         
@@ -869,14 +855,12 @@ if db:
                             else:
                                 st.error("Failed to generate customer forecast.")
                         
-                        # --- ATV FORECAST (REVISED: Simple Average Ensemble) ---
+                        # **FIX**: ATV FORECAST (Simple Average Ensemble)
                         atv_f = pd.DataFrame()
                         with st.spinner("Forecasting Average Sale (Simple Average)..."):
-                            # Train base models on the full historical data
                             prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                             xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                             
-                            # Combine using a simple average, just like the customer model
                             if not prophet_atv_f.empty and not xgb_atv_f.empty:
                                 atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
                                 atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
@@ -960,7 +944,6 @@ if db:
             eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
 
             def render_evaluation_content(days):
-                """Helper function to render metrics and charts for a given period."""
                 st.subheader(f"Accuracy Metrics for the Last {days} Days")
                 metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df, days=days)
                 
