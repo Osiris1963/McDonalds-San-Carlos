@@ -456,7 +456,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     return final_df
 
 
-
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
     if db_client is None: return
@@ -559,22 +558,21 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     
     return eval_df
 
-# --- MODIFICATION: Updated function to accept a 'days' parameter ---
-def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
-    """Calculates MAE and MAPE for a specified number of past days."""
+def calculate_accuracy_metrics(historical_df, forecast_df):
+    """Calculates MAE and MAPE for the last 30 days using adjusted forecast sales."""
     eval_df = create_daily_evaluation_data(historical_df, forecast_df)
     if eval_df is None or eval_df.empty:
         return None
 
-    period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-    eval_df_period = eval_df[eval_df['date'] >= period_start_date].copy()
+    thirty_days_ago = pd.to_datetime('today').normalize() - pd.Timedelta(days=30)
+    eval_df_30_days = eval_df[eval_df['date'] >= thirty_days_ago].copy()
 
-    if eval_df_period.empty:
+    if eval_df_30_days.empty:
         return None
 
     # Use 'actual_sales' and the new 'adjusted_forecast_sales'
-    actual_s = eval_df_period['actual_sales']
-    forecast_s = eval_df_period['adjusted_forecast_sales']
+    actual_s = eval_df_30_days['actual_sales']
+    forecast_s = eval_df_30_days['adjusted_forecast_sales']
     
     non_zero_mask_s = actual_s != 0
     if not non_zero_mask_s.any():
@@ -586,8 +584,8 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
     sales_accuracy = 100 - sales_mape
 
     # Customer calculation remains the same
-    actual_c = eval_df_period['actual_customers']
-    forecast_c = eval_df_period['forecast_customers']
+    actual_c = eval_df_30_days['actual_customers']
+    forecast_c = eval_df_30_days['forecast_customers']
 
     non_zero_mask_c = actual_c != 0
     if not non_zero_mask_c.any():
@@ -959,61 +957,66 @@ if db:
         
         with tabs[2]:
             st.header("📈 Forecast Performance Evaluator")
-            st.info(
-                "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
-                "is adjusted by adding the *actual add-on sales* for each corresponding day. "
-                "The metrics and charts below use this adjusted forecast."
-            )
+            st.markdown("---")
             
-            # --- MODIFICATION: Added tabs for 7-day and 30-day evaluation ---
-            eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
-
-            def render_evaluation_content(days):
-                """Helper function to render metrics and charts for a given period."""
-                st.subheader(f"Accuracy Metrics for the Last {days} Days")
-                metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df, days=days)
-                
-                if metrics:
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.metric(label="Sales MAPE (Accuracy)", value=f"{metrics['sales_accuracy']:.2f}%")
-                        st.metric(label="Sales MAE (Avg Error)", value=f"₱{metrics['sales_mae']:,.2f}")
-                    with col2:
-                        st.metric(label="Customer MAPE (Accuracy)", value=f"{metrics['customer_accuracy']:.2f}%")
-                        st.metric(label="Customer MAE (Avg Error)", value=f"{int(round(metrics['customer_mae']))} customers")
-                else:
-                    st.warning(f"Not enough overlapping data in the last {days} days to calculate metrics.")
-                
-                st.markdown("---")
-                st.subheader(f"Comparison Charts for the Last {days} Days")
-                
-                evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
-                period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-                chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= period_start_date]
-                
-                if chart_df.empty:
-                    st.info(f"No overlapping historical and forecast data found for the last {days} days to display charts.")
-                else:
-                    sales_fig = plot_evaluation_graph(
-                        chart_df,
-                        date_col='date', actual_col='actual_sales', forecast_col='adjusted_forecast_sales',
-                        title='Actual Sales vs. Forecast Sales', y_axis_title='Sales (₱)'
-                    )
-                    st.plotly_chart(sales_fig, use_container_width=True)
-
-                    cust_fig = plot_evaluation_graph(
-                        chart_df,
-                        date_col='date', actual_col='actual_customers', forecast_col='forecast_customers',
-                        title='Actual Customers vs. Forecast Customers', y_axis_title='Number of Customers'
-                    )
-                    st.plotly_chart(cust_fig, use_container_width=True)
-
-            with eval_tab_7:
-                render_evaluation_content(7)
+            # --- Accuracy Metrics ---
+            st.subheader("Accuracy Metrics for the Last 30 Days")
             
-            with eval_tab_30:
-                render_evaluation_content(30)
+            metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df)
+            
+            if metrics:
+                st.info(
+                    "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
+                    "is adjusted by adding the *actual add-on sales* for each corresponding day. "
+                    "The metrics and charts below use this adjusted forecast."
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        label="Sales MAPE (Accuracy)",
+                        value=f"{metrics['sales_accuracy']:.2f}%"
+                    )
+                    st.metric(
+                        label="Sales MAE (Avg Error)",
+                        value=f"₱{metrics['sales_mae']:,.2f}"
+                    )
+                with col2:
+                    st.metric(
+                        label="Customer MAPE (Accuracy)",
+                        value=f"{metrics['customer_accuracy']:.2f}%"
+                    )
+                    st.metric(
+                        label="Customer MAE (Avg Error)",
+                        value=f"{int(round(metrics['customer_mae']))} customers"
+                    )
+            else:
+                st.warning("Not enough overlapping data in the last 30 days to calculate metrics.")
+            
+            st.markdown("---")
+            
+            # --- Comparison Charts ---
+            st.subheader("Comparison Charts")
+            
+            evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
+            thirty_days_ago = pd.to_datetime('today').normalize() - pd.Timedelta(days=30)
+            chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= thirty_days_ago]
+            
+            if chart_df.empty:
+                st.info("No overlapping historical and forecast data found for the last 30 days to display charts.")
+            else:
+                sales_fig = plot_evaluation_graph(
+                    chart_df,
+                    date_col='date', actual_col='actual_sales', forecast_col='adjusted_forecast_sales',
+                    title='Actual Sales vs. Forecast Sales', y_axis_title='Sales (₱)'
+                )
+                st.plotly_chart(sales_fig, use_container_width=True)
 
+                cust_fig = plot_evaluation_graph(
+                    chart_df,
+                    date_col='date', actual_col='actual_customers', forecast_col='forecast_customers',
+                    title='Actual Customers vs. Forecast Customers', y_axis_title='Number of Customers'
+                )
+                st.plotly_chart(cust_fig, use_container_width=True)
         
         with tabs[3]:
             if st.session_state['access_level'] <= 2:
