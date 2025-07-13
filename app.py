@@ -269,7 +269,6 @@ def train_and_forecast_prophet(historical_df, events_df, recurring_events_df, pe
 
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # --- MODIFICATION: Use specific dates from recurring events ---
     recurring_events_final = pd.DataFrame()
     if recurring_events_df is not None and not recurring_events_df.empty:
         recurring_events_final = recurring_events_df.copy()
@@ -449,6 +448,7 @@ def generate_insight_summary(day_data,selected_date):
     summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
 
 def render_activity_card(row, db_client, view_type='compact_list', access_level=3):
+    if 'doc_id' not in row: return # Safeguard against missing doc_id
     doc_id = row['doc_id']
     if view_type == 'compact_list':
         date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y'); summary_line = f"**{date_str}** | {row['activity_name']}"
@@ -483,6 +483,7 @@ def render_activity_card(row, db_client, view_type='compact_list', access_level=
                             delete_from_firestore(db, 'future_activities', doc_id); st.warning("Activity deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
 
 def render_historical_record(row, db_client):
+    if 'doc_id' not in row: return
     date_str = row['date'].strftime('%B %d, %Y'); expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}"); st.write(f"**Weather:** {row.get('weather', 'N/A')}")
@@ -549,15 +550,14 @@ if db:
                         if removed_count > 0: st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
                         hist_df_with_atv = calculate_atv(cleaned_df); ev_df = st.session_state.events_df.copy(); rec_ev_df = st.session_state.recurring_events_df.copy()
                         FORECAST_HORIZON = 15
+                        cust_f, atv_f = pd.DataFrame(), pd.DataFrame()
                         with st.spinner("Forecasting Customers..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, rec_ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-                            cust_f = pd.DataFrame()
                             if not prophet_cust_f.empty and not xgb_cust_f.empty:
                                 cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb')); cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
                             else: st.error("Failed to generate customer forecast.")
                         with st.spinner("Forecasting Average Sale..."):
-                            atv_f = pd.DataFrame()
                             VALIDATION_PERIOD = 30; train_df = hist_df_with_atv.iloc[:-VALIDATION_PERIOD]; validation_df = hist_df_with_atv.iloc[-VALIDATION_PERIOD:]
                             prophet_atv_val, _ = train_and_forecast_prophet(train_df, ev_df, rec_ev_df, VALIDATION_PERIOD, 'atv')
                             xgb_atv_val = train_and_forecast_xgboost_tuned(train_df, ev_df, VALIDATION_PERIOD, 'atv')
@@ -680,32 +680,39 @@ if db:
             else: st.warning("You do not have permission to add or edit data.")
         
         if st.session_state.get('show_recurring_events_dialog', False):
-            with st.dialog("Manage Recurring Events", width="small"):
-                with st.form("recurring_events_form"):
-                    st.subheader("Add New Recurring Event")
+            # --- MODIFICATION: Use a conditional block instead of st.dialog ---
+            dialog_cols = st.columns([1, 2, 1])
+            with dialog_cols[1]:
+                with st.container(border=True):
+                    st.subheader("Manage Recurring Events")
                     st.info("Add yearly events with specific dates that impact sales (e.g., local festivals, holidays with shifting dates).")
-                    event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
-                    event_date = st.date_input("Date of Event")
                     
-                    if st.form_submit_button("Add Event", use_container_width=True):
-                        if event_name and event_date:
-                            add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'date': event_date})
-                            st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1)
-                            st.session_state.show_recurring_events_dialog = False; st.rerun()
-                        else: st.warning("Event name and date are required.")
+                    with st.form("add_recurring_event_form"):
+                        event_name = st.text_input("Event Name", placeholder="e.g., Pintaflores Festival")
+                        event_date = st.date_input("Date of Event")
+                        if st.form_submit_button("Add Event", use_container_width=True):
+                            if event_name and event_date:
+                                add_to_firestore(db, 'recurring_events', {'event_name': event_name, 'date': event_date})
+                                st.success(f"Added '{event_name}' to recurring events."); st.cache_data.clear(); time.sleep(1)
+                                st.session_state.show_recurring_events_dialog = False; st.rerun()
+                            else: st.warning("Event name and date are required.")
 
-                st.markdown("---")
-                st.subheader("Existing Recurring Events")
-                recurring_df = st.session_state.recurring_events_df
-                if not recurring_df.empty:
-                    for index, row in recurring_df.iterrows():
-                        col1, col2 = st.columns([3,1])
-                        event_display_date = pd.to_datetime(row['date']).strftime('%B %d, %Y')
-                        col1.write(f"**{row['event_name']}** - {event_display_date}")
-                        if col2.button("Delete", key=f"delete_rec_{row['doc_id']}", use_container_width=True):
-                            delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1)
-                            st.session_state.show_recurring_events_dialog = False; st.rerun()
-                else: st.info("No recurring events added yet.")
+                    st.markdown("---")
+                    st.subheader("Existing Recurring Events")
+                    recurring_df = st.session_state.recurring_events_df
+                    if not recurring_df.empty:
+                        for index, row in recurring_df.iterrows():
+                            col1, col2 = st.columns([3,1])
+                            event_display_date = pd.to_datetime(row['date']).strftime('%B %d, %Y')
+                            col1.write(f"**{row['event_name']}** - {event_display_date}")
+                            if col2.button("Delete", key=f"delete_rec_{row['doc_id']}", use_container_width=True):
+                                delete_from_firestore(db, 'recurring_events', row['doc_id']); st.warning(f"Deleted '{row['event_name']}'."); st.cache_data.clear(); time.sleep(1)
+                                st.session_state.show_recurring_events_dialog = False; st.rerun()
+                    else: st.info("No recurring events added yet.")
+
+                    if st.button("Close", use_container_width=True):
+                        st.session_state.show_recurring_events_dialog = False
+                        st.rerun()
 
 
         with tabs[4]:
