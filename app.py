@@ -318,12 +318,10 @@ def create_advanced_features(df, target_column=None):
 
 
 # --- Core Forecasting Models ---
-
-# --- MODIFICATION ---: Removed the redundant dropna() line to prevent timeline de-synchronization.
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
-    
+
     if df_train.empty or len(df_train) < 15:
         return pd.DataFrame(), None, pd.DataFrame()
 
@@ -660,7 +658,8 @@ if db:
                 else:
                     spinner_text = "🧠 Building advanced forecast... This uses robust tuning and may take a few minutes."
                     with st.spinner(spinner_text):
-                        base_df = st.session_state.historical_df.copy()
+                        # --- MODIFICATION ---: Added drop_duplicates to ensure data integrity before forecasting
+                        base_df = st.session_state.historical_df.copy().drop_duplicates(subset=['date'])
                         base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                         cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
                         
@@ -670,15 +669,23 @@ if db:
                         hist_df_with_atv = calculate_atv(cleaned_df)
                         ev_df = st.session_state.events_df.copy()
                         
+                        # --- MODIFICATION ---: Replaced the forecast combination logic to be more robust.
                         def generate_hybrid_forecast(df, events, periods, target_col):
+                            # This function now uses date-based slicing and has a safeguard
+                            df = df.drop_duplicates(subset=['date']).reset_index(drop=True)
+
                             prophet_forecast, prophet_model, all_events = train_and_forecast_prophet(df, events, periods, target_col)
                             if prophet_forecast.empty: return pd.DataFrame(), None, None
 
-                            hist_prophet = prophet_forecast.iloc[:-periods]
+                            hist_prophet = prophet_forecast[prophet_forecast['ds'] <= df['date'].max()]
                             df_merged = pd.merge(df, hist_prophet[['ds', 'yhat']], left_on='date', right_on='ds')
                             
-                            df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
+                            if df_merged.empty:
+                                st.error(f"Could not merge historical data with Prophet forecast for {target_col}. Check for date alignment issues.")
+                                return pd.DataFrame(), None, None
 
+                            df_merged['residual'] = df_merged[target_col] - df_merged['yhat']
+                            
                             df_featured_train = create_advanced_features(df_merged.copy(), target_column='residual')
 
                             xgb_model = train_xgboost_on_residuals_tuned(df_featured_train, 'residual')
@@ -691,13 +698,27 @@ if db:
                             future_featured = create_advanced_features(future_df_base.copy(), target_column=None)
                             
                             train_cols = xgb_model.get_booster().feature_names
-                            
                             future_featured_aligned = future_featured.reindex(columns=train_cols, fill_value=0)
                             
                             future_residual_preds = xgb_model.predict(future_featured_aligned)
 
                             final_forecast = prophet_forecast.copy()
-                            final_forecast.loc[len(df):, 'yhat'] += future_residual_preds
+                            
+                            # Use a boolean mask based on date for robust slicing
+                            last_hist_date = df['date'].max()
+                            future_mask = final_forecast['ds'] > last_hist_date
+
+                            # Safeguard to prevent ValueError
+                            if future_mask.sum() != len(future_residual_preds):
+                                st.error(
+                                    f"Forecast component length mismatch for '{target_col}': "
+                                    f"Prophet future is {future_mask.sum()} days, "
+                                    f"XGBoost future is {len(future_residual_preds)} days. "
+                                    "Cannot combine models. This may be due to gaps in historical data."
+                                )
+                                return pd.DataFrame(), None, None
+
+                            final_forecast.loc[future_mask, 'yhat'] = final_forecast.loc[future_mask, 'yhat'].values + future_residual_preds
 
                             return final_forecast, prophet_model, all_events
 
