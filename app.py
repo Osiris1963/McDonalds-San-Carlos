@@ -878,6 +878,31 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
+                            # =================================================================
+                            # START: NEW LOGIC TO SAVE THE FORECAST
+                            # =================================================================
+                            try:
+                                with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
+                                    today_date = pd.to_datetime('today').normalize()
+                                    future_forecasts_to_log = combo_f[combo_f['ds'] > today_date]
+
+                                    for _, row in future_forecasts_to_log.iterrows():
+                                        log_entry = {
+                                            "generated_on": today_date,
+                                            "forecast_for_date": pd.to_datetime(row['ds']),
+                                            "predicted_sales": row['forecast_sales'],
+                                            "predicted_customers": row['forecast_customers']
+                                        }
+                                        # Add a unique document ID to prevent duplicates if run multiple times a day
+                                        doc_id = f"{today_date.strftime('%Y-%m-%d')}_{pd.to_datetime(row['ds']).strftime('%Y-%m-%d')}"
+                                        db.collection('forecast_log').document(doc_id).set(log_entry)
+                                st.info("Forecast log saved successfully.")
+                            except Exception as e:
+                                st.error(f"Failed to save forecast log: {e}")
+                            # =================================================================
+                            # END: NEW LOGIC
+                            # =================================================================
+                            
                             if prophet_model_cust:
                                 prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
                                 st.session_state.forecast_components = prophet_forecast_components
@@ -896,7 +921,7 @@ if db:
                 st.session_state['access_level'] = 0
                 st.rerun()
         
-        tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
+        tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "🎯 True Accuracy Report", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
         if st.session_state['access_level'] == 1:
             tab_list.append("👥 User Interface")
         
@@ -933,9 +958,8 @@ if db:
         with tabs[2]:
             st.header("📈 Forecast Performance Evaluator")
             st.info(
-                "ℹ️ **Comparison Logic**: To provide a direct comparison, the 'Forecast' sales value "
-                "is adjusted by adding the *actual add-on sales* for each corresponding day. "
-                "The metrics and charts below use this adjusted forecast."
+                "ℹ️ **Comparison Logic**: This report compares actual results against what the **currently trained model** *would have* predicted for past dates. "
+                "This is useful for diagnosing the current model's bias. For true historical accuracy, see the 'True Accuracy Report' tab."
             )
             
             eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
@@ -961,10 +985,9 @@ if db:
                 
                 evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
                 
-                # **FIX**: Add a check to prevent KeyError on empty or malformed dataframes.
                 if evaluation_df_daily.empty or 'date' not in evaluation_df_daily.columns:
                     st.info(f"No overlapping historical and forecast data found for the last {days} days to display charts.")
-                    return # Exit the function early
+                    return
 
                 period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
                 chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= period_start_date]
@@ -992,8 +1015,88 @@ if db:
             with eval_tab_30:
                 render_evaluation_content(30)
 
-        
         with tabs[3]:
+            st.header("🎯 True Historical Forecast Accuracy")
+            st.info(
+                "This report compares the actual results against the forecast that was generated **the day before**. "
+                "This provides a true measure of the model's day-ahead prediction accuracy."
+            )
+            
+            try:
+                # Load the forecast log
+                log_docs = db.collection('forecast_log').stream()
+                log_records = [doc.to_dict() for doc in log_docs]
+                if not log_records:
+                    st.warning("No forecast logs found. Please generate a forecast to begin logging.")
+                    raise StopIteration
+
+                forecast_log_df = pd.DataFrame(log_records)
+                forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date'])
+                forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on'])
+
+                # Filter for 1-day-ahead forecasts
+                forecast_log_df = forecast_log_df[
+                    forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)
+                ].copy()
+
+                if forecast_log_df.empty:
+                    st.warning("Not enough consecutive forecast logs to calculate true day-ahead accuracy.")
+                    raise StopIteration
+
+                # Load historical actuals
+                historical_actuals_df = st.session_state.historical_df[['date', 'sales', 'customers']].copy()
+                historical_actuals_df.rename(columns={'sales': 'actual_sales', 'customers': 'actual_customers'}, inplace=True)
+
+                # Merge actuals with the logged forecasts
+                true_accuracy_df = pd.merge(
+                    historical_actuals_df,
+                    forecast_log_df,
+                    left_on='date',
+                    right_on='forecast_for_date',
+                    how='inner'
+                )
+
+                if true_accuracy_df.empty:
+                    st.warning("No matching historical data for the logged forecasts.")
+                    raise StopIteration
+
+                # Display metrics and charts
+                st.subheader("Day-Ahead Performance Metrics")
+                
+                sales_mae = mean_absolute_error(true_accuracy_df['actual_sales'], true_accuracy_df['predicted_sales'])
+                cust_mae = mean_absolute_error(true_accuracy_df['actual_customers'], true_accuracy_df['predicted_customers'])
+                
+                # Calculate MAPE (Mean Absolute Percentage Error), handling division by zero
+                actual_sales_safe = true_accuracy_df['actual_sales'].replace(0, np.nan)
+                sales_mape = np.nanmean(np.abs((true_accuracy_df['actual_sales'] - true_accuracy_df['predicted_sales']) / actual_sales_safe)) * 100
+                
+                actual_cust_safe = true_accuracy_df['actual_customers'].replace(0, np.nan)
+                cust_mape = np.nanmean(np.abs((true_accuracy_df['actual_customers'] - true_accuracy_df['predicted_customers']) / actual_cust_safe)) * 100
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(label="True Sales Accuracy (100 - MAPE)", value=f"{100 - sales_mape:.2f}%")
+                    st.metric(label="True Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
+                with col2:
+                    st.metric(label="True Customer Accuracy (100 - MAPE)", value=f"{100 - cust_mape:.2f}%")
+                    st.metric(label="True Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
+
+                st.markdown("---")
+                st.subheader("True Performance Comparison Chart")
+                
+                sales_fig = plot_evaluation_graph(
+                    true_accuracy_df,
+                    date_col='date', actual_col='actual_sales', forecast_col='predicted_sales',
+                    title='Actual Sales vs. Day-Ahead Forecasted Sales', y_axis_title='Sales (₱)'
+                )
+                st.plotly_chart(sales_fig, use_container_width=True)
+
+            except StopIteration:
+                pass 
+            except Exception as e:
+                st.error(f"An error occurred while building the report: {e}")
+        
+        with tabs[4]:
             if st.session_state['access_level'] <= 2:
                 form_col, display_col = st.columns([2, 3], gap="large")
 
@@ -1057,7 +1160,7 @@ if db:
             else:
                 st.warning("You do not have permission to add or edit data in this tab.")
         
-        with tabs[4]:
+        with tabs[5]:
             def set_view_all(): st.session_state.show_all_activities = True
             def set_overview(): st.session_state.show_all_activities = False
 
@@ -1148,7 +1251,7 @@ if db:
                             render_activity_card(row, db, view_type='compact_list', access_level=st.session_state['access_level'])
 
 
-        with tabs[5]:
+        with tabs[6]:
             st.subheader("View & Edit Historical Data")
             df = st.session_state.historical_df.copy()
             if not df.empty and 'date' in df.columns:
@@ -1201,7 +1304,7 @@ if db:
                 st.write("No historical data to display.")
 
         if st.session_state['access_level'] == 1:
-            with tabs[6]:
+            with tabs[len(tab_list) - 1]:
                 st.subheader("User Management")
 
                 with st.expander("Add New User"):
