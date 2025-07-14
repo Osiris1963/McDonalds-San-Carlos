@@ -298,7 +298,6 @@ def create_advanced_features(df):
     if 'customers' in df.columns:
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
 
-    # **FIX**: Add lag and rolling features specifically for ATV
     if 'atv' in df.columns:
         df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
@@ -377,12 +376,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
     future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
     
-    # Drop rows with NaNs created by shift/rolling operations from the training set
     dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
     if dropna_col in df_featured.columns:
         df_featured.dropna(subset=[dropna_col], inplace=True)
 
-    # **FIX**: Dynamic feature selection based on the target
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
     
     if target_col == 'customers':
@@ -394,7 +391,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         features = base_features + [
             'atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7'
         ]
-    else: # Default to sales features
+    else: 
         features = base_features + [
             'sales_lag_7', 'customers_lag_7',
             'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
@@ -843,7 +840,6 @@ if db:
                         
                         FORECAST_HORIZON = 15
                         
-                        # --- CUSTOMER FORECAST (Simple Average Ensemble) ---
                         cust_f = pd.DataFrame()
                         with st.spinner("Forecasting Customers (Simple Average)..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
@@ -855,7 +851,6 @@ if db:
                             else:
                                 st.error("Failed to generate customer forecast.")
                         
-                        # **FIX**: ATV FORECAST (Simple Average Ensemble)
                         atv_f = pd.DataFrame()
                         with st.spinner("Forecasting Average Sale (Simple Average)..."):
                             prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
@@ -867,7 +862,6 @@ if db:
                             else:
                                 st.error("Failed to generate ATV forecast.")
 
-                        # --- FINAL COMBINATION ---
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -944,6 +938,7 @@ if db:
             eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
 
             def render_evaluation_content(days):
+                """Helper function to render metrics and charts for a given period."""
                 st.subheader(f"Accuracy Metrics for the Last {days} Days")
                 metrics = calculate_accuracy_metrics(st.session_state.historical_df, st.session_state.forecast_df, days=days)
                 
@@ -962,6 +957,12 @@ if db:
                 st.subheader(f"Comparison Charts for the Last {days} Days")
                 
                 evaluation_df_daily = create_daily_evaluation_data(st.session_state.historical_df, st.session_state.forecast_df)
+                
+                # **FIX**: Add a check to prevent KeyError on empty or malformed dataframes.
+                if evaluation_df_daily.empty or 'date' not in evaluation_df_daily.columns:
+                    st.info(f"No overlapping historical and forecast data found for the last {days} days to display charts.")
+                    return # Exit the function early
+
                 period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
                 chart_df = evaluation_df_daily[evaluation_df_daily['date'] >= period_start_date]
                 
