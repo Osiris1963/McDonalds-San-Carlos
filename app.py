@@ -361,21 +361,14 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     if df_train.empty:
         return pd.DataFrame()
 
-    last_date = df_train['date'].max()
-    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
-    future_df_template = pd.DataFrame({'date': future_dates})
-
-    full_df = pd.concat([df_train, future_df_template], ignore_index=True)
-    full_df_featured = create_advanced_features(full_df)
+    # --- Part 1: Feature Engineering and Model Training (Largely the same) ---
+    df_featured = create_advanced_features(df_train.copy())
     
-    if 'day_type' in full_df_featured.columns:
-        full_df_featured['is_not_normal_day'] = full_df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+    if 'day_type' in df_featured.columns:
+        df_featured['is_not_normal_day'] = df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
     else:
-        full_df_featured['is_not_normal_day'] = 0
+        df_featured['is_not_normal_day'] = 0
 
-    df_featured = full_df_featured[full_df_featured['date'] <= last_date].copy()
-    future_df_featured = full_df_featured[full_df_featured['date'] > last_date].copy()
-    
     dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
     if dropna_col in df_featured.columns:
         df_featured.dropna(subset=[dropna_col], inplace=True)
@@ -383,21 +376,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
     
     if target_col == 'customers':
-        features = base_features + [
-            'sales_lag_7', 'customers_lag_7',
-            'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
-        ]
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
     elif target_col == 'atv':
-        features = base_features + [
-            'atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7'
-        ]
+        features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7']
     else: 
-        features = base_features + [
-            'sales_lag_7', 'customers_lag_7',
-            'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7'
-        ]
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
 
-    features = [f for f in features if f in df_featured.columns and f in future_df_featured.columns]
+    features = [f for f in features if f in df_featured.columns]
     target = target_col
 
     X = df_featured[features]
@@ -407,56 +392,74 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame()
         
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-
-    X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
-        X, y, sample_weights, test_size=0.2, random_state=42, shuffle=False
-    )
-
-    def objective(trial):
-        params = {
-            'objective': 'reg:squarederror',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'random_state': 42,
-            'early_stopping_rounds': 50
-        }
-        
-        model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train, 
-                  sample_weight=weights_train,
-                  eval_set=[(X_test, y_test)],
-                  sample_weight_eval_set=[weights_test],
-                  verbose=False)
-        
-        preds = model.predict(X_test)
-        mae = mean_absolute_error(y_test, preds, sample_weight=weights_test)
-        return mae
-
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=50) 
-
-    best_params = study.best_params
-    best_params.pop('early_stopping_rounds', None)
+    # Using fixed parameters for speed, but you can re-enable Optuna if desired
+    # For a production app, you might save the best_params to avoid re-tuning every time.
+    best_params = {
+        'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
+        'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
+    }
     
     final_model = xgb.XGBRegressor(**best_params)
+    sample_weights = np.linspace(0.5, 1.0, len(y))
     final_model.fit(X, y, sample_weight=sample_weights)
 
-    X_future = future_df_featured[features]
-    future_predictions = final_model.predict(X_future)
+    # --- Part 2: Recursive Forecasting Loop (The Fix) ---
     
-    full_prediction_df = df_featured[['date']].copy()
-    full_prediction_df['yhat'] = final_model.predict(X)
+    future_predictions = []
+    # Start with the full history that was used for training
+    history_with_features = df_featured.copy()
+
+    for i in range(periods):
+        # 1. Prepare the feature set for the next day
+        # Get the last known date and add one day
+        last_date = history_with_features['date'].max()
+        next_date = last_date + timedelta(days=1)
+        
+        # Create a one-row dataframe for the next day to be predicted
+        future_step_df = pd.DataFrame([{'date': next_date}])
+
+        # Append this new day to our history
+        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
+        
+        # 2. Re-create features for the entire extended history
+        # The last row will now have correctly calculated lag and rolling features
+        extended_featured_df = create_advanced_features(extended_history)
+        
+        # Add the 'is_not_normal_day' feature manually for the future date
+        extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+        
+        # 3. Predict the next step
+        # Isolate the last row, which contains the features for the day we want to predict
+        X_future = extended_featured_df[features].tail(1)
+        prediction = final_model.predict(X_future)[0]
+        
+        # Store the prediction
+        future_predictions.append({'ds': next_date, 'yhat': prediction})
+        
+        # 4. Update history with the prediction to be used in the next loop
+        # This is the key step of the recursive strategy
+        history_with_features = extended_featured_df.copy()
+        history_with_features.loc[history_with_features.index.max(), target] = prediction
+
+        # If forecasting customers, we also need to update the sales column to help with features
+        # We can make a simple assumption, e.g., sales = predicted_customers * recent_atv
+        if target_col == 'customers':
+            recent_atv = history_with_features['atv'].dropna().tail(7).mean()
+            history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * recent_atv
+
+    # --- Part 3: Combine and Return ---
+    # Create the final forecast dataframe
+    final_df = pd.DataFrame(future_predictions)
+
+    # Also include the model's prediction on the historical data (in-sample forecast)
+    historical_predictions = df_featured[['date']].copy()
+    historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
+    historical_predictions['yhat'] = final_model.predict(X)
     
-    future_df_template['yhat'] = future_predictions
-    
-    final_df = pd.concat([full_prediction_df, future_df_template], ignore_index=True)
-    final_df = final_df.rename(columns={'date': 'ds'})
-    
-    return final_df
+    # Combine historical fit with future forecast
+    full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
+
+    return full_forecast_df
 
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
