@@ -1034,6 +1034,11 @@ if db:
                 forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date'])
                 forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on'])
 
+                # --- FIX: Normalize timezones before merging ---
+                forecast_log_df['forecast_for_date'] = forecast_log_df['forecast_for_date'].dt.tz_localize(None)
+                forecast_log_df['generated_on'] = forecast_log_df['generated_on'].dt.tz_localize(None)
+                # --- END FIX ---
+
                 # Filter for 1-day-ahead forecasts
                 forecast_log_df = forecast_log_df[
                     forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)
