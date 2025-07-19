@@ -187,7 +187,7 @@ def process_historical_data(records):
     # Fundamental date validation
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df.dropna(subset=['date'], inplace=True)
+        df.dropna(subset=['date'], inplace=True) # Drop rows where date is invalid
         df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
     else:
         return pd.DataFrame() # No date column, return empty
@@ -195,11 +195,18 @@ def process_historical_data(records):
     # Handle duplicates by keeping the last entry
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
     
-    # Ensure numeric columns are properly typed
-    numeric_cols = ['sales', 'customers', 'add_on_sales']
+    # --- DEFINITIVE FIX: Validate the complete numeric schema ---
+    # This ensures that rows with missing optional fields are handled correctly.
+    numeric_cols = [
+        'sales', 'customers', 'add_on_sales', 
+        'last_year_sales', 'last_year_customers'
+    ]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        else:
+            # If a column is missing entirely for all records, create it and fill with 0
+            df[col] = 0
     
     # Ensure day_type exists and has a default value
     if 'day_type' not in df.columns:
@@ -343,7 +350,7 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
     meta_model.fit(X_meta, y_meta)
 
     prophet_full_preds = train_and_forecast_prophet(historical_df, events_df, forecast_horizon, target_col)
-    xgb_full_preds = train_and_forecast_xgboost_tuned(historical_df, forecast_horizon, target_col)
+    xgb_full_preds = train_and_forecast_xgboost_tuned(historical_df, events_df, forecast_horizon, target_col)
     if prophet_full_preds.empty or xgb_full_preds.empty: return pd.DataFrame(), None
 
     unified_df = pd.merge(prophet_full_preds, xgb_full_preds, on='ds', suffixes=('_prophet', '_xgb'))
@@ -394,7 +401,6 @@ if db:
         st.info("Forecasting with a Meta-Model Ensemble (Prophet + XGBoost)")
 
         if st.button("🔄 Force Refresh All Data"):
-            # Clear all caches and session state to ensure a complete reload
             st.cache_data.clear()
             st.cache_resource.clear()
             st.session_state.clear()
@@ -506,8 +512,7 @@ if db:
                     if filtered_df.empty:
                         st.info("No data for the selected period.")
                     else:
-                        # Direct-Render Loop: Iterate through the cleaned and sorted DataFrame.
-                        # This guarantees that the data in each row belongs to the date being rendered.
+                        # Direct-Render Loop: Guarantees data integrity.
                         for index, row in filtered_df.iterrows():
                             render_historical_record(row)
         else:
