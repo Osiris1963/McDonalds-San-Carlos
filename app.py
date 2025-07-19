@@ -152,9 +152,10 @@ def initialize_state_firestore(db_client):
         st.session_state.db_client = db_client
 
     if 'historical_df' not in st.session_state:
-        df, timestamp = load_from_firestore(db_client, 'historical_data')
+        df, timestamp, duplicates = load_from_firestore(db_client, 'historical_data')
         st.session_state.historical_df = df
         st.session_state.data_last_loaded = timestamp
+        st.session_state.duplicate_warnings = duplicates
 
     if 'events_df' not in st.session_state:
         st.session_state.events_df = pd.DataFrame()
@@ -171,19 +172,25 @@ def initialize_state_firestore(db_client):
 # --- Data Processing and Feature Engineering ---
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
-    """Fetches data from Firestore and returns a timestamp of the operation."""
-    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC')
+    """Fetches data, cleans duplicates, and returns the cleaned data with a timestamp."""
+    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC'), pd.DataFrame()
+    
     docs = _db_client.collection(collection_name).stream()
     records = [doc.to_dict() for doc in docs]
-    
-    # Get the current time in UTC right after the fetch
     fetch_timestamp = pd.Timestamp.now(tz='UTC')
 
-    if not records: return pd.DataFrame(), fetch_timestamp
+    if not records: return pd.DataFrame(), fetch_timestamp, pd.DataFrame()
+    
     df = pd.DataFrame(records)
     if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None)
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
+        
+        # --- ROBUST SOLUTION: Detect and handle duplicates ---
+        duplicates_found = df[df.duplicated(subset=['date'], keep=False)].sort_values('date')
+        if not duplicates_found.empty:
+            df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+        
         if not df.empty:
             df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
             
@@ -192,7 +199,7 @@ def load_from_firestore(_db_client, collection_name):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
-    return df, fetch_timestamp
+    return df, fetch_timestamp, duplicates_found
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -384,7 +391,6 @@ if db:
 
         if st.button("🔄 Force Refresh All Data"):
             load_from_firestore.clear()
-            # Clear all compute caches as well
             train_and_forecast_prophet.clear()
             train_and_forecast_xgboost_tuned.clear()
             st.session_state.clear()
@@ -477,25 +483,28 @@ if db:
     with tabs[2]: # Historical Data
         st.subheader("View Historical Data")
         
-        # --- NEW: Data Freshness Indicator and Refresh Button ---
         col1, col2 = st.columns([3,1])
         with col1:
             if 'data_last_loaded' in st.session_state and st.session_state.data_last_loaded is not None:
                 last_loaded_time = st.session_state.data_last_loaded.tz_convert('Asia/Manila')
                 st.info(f"🕒 Data displayed was fetched from the database on: {last_loaded_time.strftime('%B %d, %Y at %I:%M %p')}.")
-            else:
-                st.info("🕒 Data is loaded from the database on startup.")
-        
         with col2:
             if st.button("🔄 Refresh Data Now", use_container_width=True):
                 load_from_firestore.clear()
                 st.session_state.pop('historical_df', None)
                 st.session_state.pop('data_last_loaded', None)
+                st.session_state.pop('duplicate_warnings', None)
                 st.success("Fetching latest data from Firestore...")
                 time.sleep(1)
                 st.rerun()
+
+        # --- NEW: Data Integrity Warning for Duplicates ---
+        if 'duplicate_warnings' in st.session_state and not st.session_state.duplicate_warnings.empty:
+            st.warning("⚠️ Data Integrity Warning")
+            st.write("Duplicate entries were found for the following dates and automatically cleaned (the last entry for each day was kept). Please review your source data in Firestore.")
+            st.dataframe(st.session_state.duplicate_warnings, use_container_width=True)
+        
         st.markdown("---")
-        # --- END NEW ---
         
         df_hist = st.session_state.historical_df.copy()
         if not df_hist.empty:
