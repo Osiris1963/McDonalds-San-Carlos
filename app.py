@@ -184,19 +184,22 @@ def process_historical_data(records):
     
     df = pd.DataFrame(records)
     
-    # Fundamental date validation
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df.dropna(subset=['date'], inplace=True) # Drop rows where date is invalid
-        df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
-    else:
-        return pd.DataFrame() # No date column, return empty
+    if 'date' not in df.columns:
+        return pd.DataFrame()
+        
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df.dropna(subset=['date'], inplace=True)
+    df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
 
-    # Handle duplicates by keeping the last entry
+    # --- DEFINITIVE FIX ---
+    # 1. Sort by date and data completeness to ensure the best record is chosen.
+    # A record with more fields is considered "better".
+    df['completeness'] = df.count(axis=1)
+    df.sort_values(['date', 'completeness'], ascending=[True, True], inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
-    # --- DEFINITIVE FIX: Validate the complete numeric schema ---
-    # This ensures that rows with missing optional fields are handled correctly.
+    df.drop(columns=['completeness'], inplace=True)
+
+    # 2. Validate the complete numeric schema to prevent errors from missing fields.
     numeric_cols = [
         'sales', 'customers', 'add_on_sales', 
         'last_year_sales', 'last_year_customers'
@@ -205,16 +208,15 @@ def process_historical_data(records):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         else:
-            # If a column is missing entirely for all records, create it and fill with 0
             df[col] = 0
     
-    # Ensure day_type exists and has a default value
+    # Ensure day_type exists and has a default value.
     if 'day_type' not in df.columns:
         df['day_type'] = 'Normal Day'
     else:
         df['day_type'].fillna('Normal Day', inplace=True)
 
-    # Final sort and index reset to guarantee data alignment
+    # 3. Final sort and index reset to guarantee data-to-index alignment.
     df = df.sort_values(by='date', ascending=True)
     df = df.reset_index(drop=True)
     
@@ -297,7 +299,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     return forecast[['ds', 'yhat']]
 
 @st.cache_resource
-def train_and_forecast_xgboost_tuned(historical_df, periods, target_col):
+def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy().dropna(subset=['date', target_col])
     if df_train.empty: return pd.DataFrame()
     
@@ -339,7 +341,7 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
     validation_df = historical_df.iloc[split_index:]
     
     prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
-    xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, len(validation_df), target_col).tail(len(validation_df))
+    xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     if prophet_val_preds.empty or xgb_val_preds.empty: return pd.DataFrame(), None
 
     meta_train_df = pd.merge(prophet_val_preds, xgb_val_preds, on='ds', suffixes=('_prophet', '_xgb'))
