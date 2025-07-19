@@ -9,7 +9,7 @@ import numpy as np
 import plotly.graph_objs as go
 import time
 import requests
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 import logging
@@ -153,6 +153,7 @@ def initialize_state_firestore(db_client):
 
     if 'historical_df' not in st.session_state:
         raw_records, timestamp = load_from_firestore(db_client, 'historical_data')
+        st.session_state.raw_records = raw_records # Store raw data for inspection
         st.session_state.historical_df = process_historical_data(raw_records)
         st.session_state.data_last_loaded = timestamp
 
@@ -191,15 +192,11 @@ def process_historical_data(records):
     df.dropna(subset=['date'], inplace=True)
     df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
 
-    # --- DEFINITIVE FIX ---
-    # 1. Sort by date and data completeness to ensure the best record is chosen.
-    # A record with more fields is considered "better".
     df['completeness'] = df.count(axis=1)
     df.sort_values(['date', 'completeness'], ascending=[True, True], inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
     df.drop(columns=['completeness'], inplace=True)
 
-    # 2. Validate the complete numeric schema to prevent errors from missing fields.
     numeric_cols = [
         'sales', 'customers', 'add_on_sales', 
         'last_year_sales', 'last_year_customers'
@@ -210,13 +207,11 @@ def process_historical_data(records):
         else:
             df[col] = 0
     
-    # Ensure day_type exists and has a default value.
     if 'day_type' not in df.columns:
         df['day_type'] = 'Normal Day'
     else:
         df['day_type'].fillna('Normal Day', inplace=True)
 
-    # 3. Final sort and index reset to guarantee data-to-index alignment.
     df = df.sort_values(by='date', ascending=True)
     df = df.reset_index(drop=True)
     
@@ -449,7 +444,8 @@ if db:
         st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
         st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
 
-    tabs = st.tabs(["🔮 Forecast Dashboard", "📅 Full Forecast", "📜 Historical Data"])
+    # Add the new diagnostic tab
+    tabs = st.tabs(["🔮 Forecast Dashboard", "📅 Full Forecast", "📜 Historical Data", "🔬 Raw Data Inspector"])
 
     with tabs[0]: # Forecast Dashboard
         if not st.session_state.forecast_df.empty:
@@ -514,8 +510,41 @@ if db:
                     if filtered_df.empty:
                         st.info("No data for the selected period.")
                     else:
-                        # Direct-Render Loop: Guarantees data integrity.
                         for index, row in filtered_df.iterrows():
                             render_historical_record(row)
         else:
             st.warning("No historical data found.")
+            
+    with tabs[3]: # Raw Data Inspector
+        st.header("🔬 Raw Data Inspector")
+        st.warning("This panel is for debugging purposes. It shows the raw data received from Firestore *before* any cleaning or processing is applied.")
+        
+        if 'raw_records' in st.session_state and st.session_state.raw_records:
+            # Filter to find the relevant records
+            problematic_records = []
+            for r in st.session_state.raw_records:
+                try:
+                    # Make the check robust in case 'date' field is missing
+                    record_date = r.get('date')
+                    if record_date:
+                        # Handle both datetime objects and strings
+                        if isinstance(record_date, str):
+                            record_date = datetime.fromisoformat(record_date)
+                        if isinstance(record_date, datetime):
+                            if record_date.month == 7 and record_date.day in [13, 14, 15] and record_date.year == 2025:
+                                problematic_records.append(r)
+                except Exception as e:
+                    st.error(f"Could not parse a record: {r}. Error: {e}")
+
+            if not problematic_records:
+                st.info("Could not find raw records for July 13-15, 2025.")
+            else:
+                st.write("Displaying raw records for July 13-15, 2025:")
+                for record in problematic_records:
+                    st.markdown("---")
+                    date_val = record.get('date', 'N/A')
+                    st.write(f"**Record with date value:** `{date_val}`")
+                    st.write(f"**Python data type of 'date' field:** `{type(date_val)}`")
+                    st.json(record)
+        else:
+            st.info("No raw records loaded in session state. Please use the 'Force Refresh' button in the sidebar.")
