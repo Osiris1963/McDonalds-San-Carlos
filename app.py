@@ -342,6 +342,7 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
     prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     
+    # --- DEFINITIVE FIX: Check for empty predictions before merging ---
     if prophet_val_preds.empty or xgb_val_preds.empty:
         st.warning(f"One of the base models failed to produce a validation forecast for '{target_col}'. Skipping meta-model.")
         return pd.DataFrame(), None
