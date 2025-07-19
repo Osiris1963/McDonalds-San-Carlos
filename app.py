@@ -187,9 +187,11 @@ def process_historical_data(records):
     if 'date' not in df.columns:
         return pd.DataFrame()
         
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
     df.dropna(subset=['date'], inplace=True)
-    df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
+
+    # --- DEFINITIVE FIX: Convert all dates to the local timezone BEFORE normalizing ---
+    df['date'] = df['date'].dt.tz_convert('Asia/Manila').dt.normalize()
 
     # Silently and robustly handle potential duplicates by keeping the most complete record for each day.
     df['completeness'] = df.count(axis=1)
