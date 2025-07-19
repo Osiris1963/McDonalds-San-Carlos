@@ -157,14 +157,13 @@ def initialize_state_firestore(db_client):
         st.session_state.data_last_loaded = timestamp
         st.session_state.duplicate_warnings = duplicates
 
-    if 'events_df' not in st.session_state:
-        st.session_state.events_df = pd.DataFrame()
-    if 'unified_forecast_cust' not in st.session_state:
-        st.session_state.unified_forecast_cust = pd.DataFrame()
-    if 'unified_forecast_atv' not in st.session_state:
-        st.session_state.unified_forecast_atv = pd.DataFrame()
-
-    defaults = {'forecast_df': pd.DataFrame(), 'name': "Store 688"}
+    defaults = {
+        'events_df': pd.DataFrame(),
+        'unified_forecast_cust': pd.DataFrame(),
+        'unified_forecast_atv': pd.DataFrame(),
+        'forecast_df': pd.DataFrame(),
+        'name': "Store 688"
+    }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -186,7 +185,6 @@ def load_from_firestore(_db_client, collection_name):
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
         
-        # --- ROBUST SOLUTION: Detect and handle duplicates ---
         duplicates_found = df[df.duplicated(subset=['date'], keep=False)].sort_values('date')
         if not duplicates_found.empty:
             df.drop_duplicates(subset=['date'], keep='last', inplace=True)
@@ -498,7 +496,6 @@ if db:
                 time.sleep(1)
                 st.rerun()
 
-        # --- NEW: Data Integrity Warning for Duplicates ---
         if 'duplicate_warnings' in st.session_state and not st.session_state.duplicate_warnings.empty:
             st.warning("⚠️ Data Integrity Warning")
             st.write("Duplicate entries were found for the following dates and automatically cleaned (the last entry for each day was kept). Please review your source data in Firestore.")
@@ -516,12 +513,20 @@ if db:
                 if all_months:
                     sel_month_str = st.selectbox("Select Month:", options=all_months, key="hist_month")
                     sel_month_num = pd.to_datetime(sel_month_str, format='%B').month
-                    filtered_df = df_year[df_year['date'].dt.month == sel_month_num].sort_values("date")
+                    filtered_df = df_year[df_year['date'].dt.month == sel_month_num]
                     
                     if filtered_df.empty:
                         st.info("No data for the selected period.")
                     else:
-                        for _, row in filtered_df.iterrows():
-                            render_historical_record(row)
+                        # --- ROBUST RENDERING LOGIC ---
+                        # Instead of iterating through a potentially messy dataframe,
+                        # we iterate through a unique, sorted list of dates.
+                        unique_dates = sorted(filtered_df['date'].unique())
+                        
+                        for entry_date in unique_dates:
+                            # For each unique date, get the single validated row.
+                            # The drop_duplicates in load_from_firestore ensures there's only one.
+                            row_to_render = filtered_df[filtered_df['date'] == entry_date].iloc[0]
+                            render_historical_record(row_to_render)
         else:
             st.warning("No historical data found.")
