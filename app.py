@@ -152,8 +152,8 @@ def initialize_state_firestore(db_client):
         st.session_state.db_client = db_client
 
     if 'historical_df' not in st.session_state:
-        df, timestamp = load_from_firestore(db_client, 'historical_data')
-        st.session_state.historical_df = df
+        raw_records, timestamp = load_from_firestore(db_client, 'historical_data')
+        st.session_state.historical_df = process_historical_data(raw_records)
         st.session_state.data_last_loaded = timestamp
 
     defaults = {
@@ -168,43 +168,50 @@ def initialize_state_firestore(db_client):
             st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
-@st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
-    """Fetches data from Firestore, validates dates, and sorts chronologically."""
-    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC')
+    """Fetches raw data from Firestore and returns it with a timestamp."""
+    if _db_client is None: return [], pd.Timestamp.now(tz='UTC')
     
     docs = _db_client.collection(collection_name).stream()
     records = [doc.to_dict() for doc in docs]
     fetch_timestamp = pd.Timestamp.now(tz='UTC')
+    return records, fetch_timestamp
 
-    if not records: return pd.DataFrame(), fetch_timestamp
+@st.cache_data(ttl="1h")
+def process_historical_data(records):
+    """Takes raw records, cleans them, and returns a validated, sorted DataFrame."""
+    if not records: return pd.DataFrame()
     
     df = pd.DataFrame(records)
     
-    # Fundamental date validation and chronological sorting
+    # Fundamental date validation
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df.dropna(subset=['date'], inplace=True) # Drop rows where date is invalid
+        df.dropna(subset=['date'], inplace=True)
         df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
-        
-        # This is now the primary logic: ensure data is clean and sorted by date.
-        # It relies on the source data being correct.
-        df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-        df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+    else:
+        return pd.DataFrame() # No date column, return empty
 
-    # Ensure numeric columns are properly typed, filling missing values with 0.
+    # Handle duplicates by keeping the last entry
+    df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+    
+    # Ensure numeric columns are properly typed
     numeric_cols = ['sales', 'customers', 'add_on_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-    # Fill missing day_type with a default for model stability.
+    
+    # Ensure day_type exists and has a default value
     if 'day_type' not in df.columns:
         df['day_type'] = 'Normal Day'
     else:
         df['day_type'].fillna('Normal Day', inplace=True)
 
-    return df, fetch_timestamp
+    # Final sort and index reset to guarantee data alignment
+    df = df.sort_values(by='date', ascending=True)
+    df = df.reset_index(drop=True)
+    
+    return df
 
 def calculate_atv(df):
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
@@ -387,11 +394,11 @@ if db:
         st.info("Forecasting with a Meta-Model Ensemble (Prophet + XGBoost)")
 
         if st.button("🔄 Force Refresh All Data"):
-            load_from_firestore.clear()
-            train_and_forecast_prophet.clear()
-            train_and_forecast_xgboost_tuned.clear()
+            # Clear all caches and session state to ensure a complete reload
+            st.cache_data.clear()
+            st.cache_resource.clear()
             st.session_state.clear()
-            st.success("All caches cleared. Rerunning.")
+            st.success("All caches and session state cleared. Rerunning to fetch fresh data.")
             time.sleep(1)
             st.rerun()
 
@@ -478,19 +485,9 @@ if db:
     with tabs[2]: # Historical Data
         st.subheader("View Historical Data")
         
-        col1, col2 = st.columns([3,1])
-        with col1:
-            if 'data_last_loaded' in st.session_state and st.session_state.data_last_loaded is not None:
-                last_loaded_time = st.session_state.data_last_loaded.tz_convert('Asia/Manila')
-                st.info(f"🕒 Data displayed was fetched from the database on: {last_loaded_time.strftime('%B %d, %Y at %I:%M %p')}.")
-        with col2:
-            if st.button("🔄 Refresh Data Now", use_container_width=True):
-                load_from_firestore.clear()
-                st.session_state.pop('historical_df', None)
-                st.session_state.pop('data_last_loaded', None)
-                st.success("Fetching latest data from Firestore...")
-                time.sleep(1)
-                st.rerun()
+        if 'data_last_loaded' in st.session_state and st.session_state.data_last_loaded is not None:
+            last_loaded_time = st.session_state.data_last_loaded.tz_convert('Asia/Manila')
+            st.info(f"🕒 Data displayed was fetched from the database on: {last_loaded_time.strftime('%B %d, %Y at %I:%M %p')}.")
         
         st.markdown("---")
         
@@ -509,10 +506,9 @@ if db:
                     if filtered_df.empty:
                         st.info("No data for the selected period.")
                     else:
-                        unique_dates = sorted(filtered_df['date'].unique())
-                        
-                        for entry_date in unique_dates:
-                            row_to_render = filtered_df[filtered_df['date'] == entry_date].iloc[0]
-                            render_historical_record(row_to_render)
+                        # Direct-Render Loop: Iterate through the cleaned and sorted DataFrame.
+                        # This guarantees that the data in each row belongs to the date being rendered.
+                        for index, row in filtered_df.iterrows():
+                            render_historical_record(row)
         else:
             st.warning("No historical data found.")
