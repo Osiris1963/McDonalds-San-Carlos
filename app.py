@@ -283,8 +283,12 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy().dropna(subset=['date', target_col])
     if df_train.empty or len(df_train) < 15: return pd.DataFrame()
     
-    # Prophet requires timezone-naive dates. The `process_historical_data` function already handled this.
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
+    
+    # --- DEFINITIVE FIX: Remove timezone for Prophet compatibility ---
+    # Prophet requires timezone-naive datetime objects.
+    if pd.api.types.is_datetime64_any_dtype(df_prophet['ds']) and df_prophet['ds'].dt.tz is not None:
+        df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(None)
     
     start_date = df_prophet['ds'].min()
     end_date = df_prophet['ds'].max() + timedelta(days=periods) if periods > 0 else df_prophet['ds'].max()
