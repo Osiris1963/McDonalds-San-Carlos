@@ -190,16 +190,13 @@ def process_historical_data(records):
     df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
     df.dropna(subset=['date'], inplace=True)
 
-    # Convert to local timezone first, then normalize to get the correct calendar day.
     df['date'] = df['date'].dt.tz_convert('Asia/Manila').dt.normalize()
 
-    # Silently and robustly handle potential duplicates by keeping the most complete record for each day.
     df['completeness'] = df.count(axis=1)
     df.sort_values(['date', 'completeness'], ascending=[True, True], inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
     df.drop(columns=['completeness'], inplace=True)
 
-    # Validate the complete numeric schema.
     numeric_cols = [
         'sales', 'customers', 'add_on_sales', 
         'last_year_sales', 'last_year_customers'
@@ -210,13 +207,11 @@ def process_historical_data(records):
         else:
             df[col] = 0
     
-    # Ensure day_type exists and has a default value.
     if 'day_type' not in df.columns:
         df['day_type'] = 'Normal Day'
     else:
         df['day_type'].fillna('Normal Day', inplace=True)
 
-    # Final sort and index reset to guarantee data-to-index alignment.
     df = df.sort_values(by='date', ascending=True)
     df = df.reset_index(drop=True)
     
@@ -285,8 +280,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # --- DEFINITIVE FIX: Remove timezone for Prophet compatibility ---
-    # Prophet requires timezone-naive datetime objects.
     if pd.api.types.is_datetime64_any_dtype(df_prophet['ds']) and df_prophet['ds'].dt.tz is not None:
         df_prophet['ds'] = df_prophet['ds'].dt.tz_localize(None)
     
@@ -348,7 +341,10 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
     
     prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
-    if prophet_val_preds.empty or xgb_val_preds.empty: return pd.DataFrame(), None
+    
+    if prophet_val_preds.empty or xgb_val_preds.empty:
+        st.warning(f"One of the base models failed to produce a validation forecast for '{target_col}'. Skipping meta-model.")
+        return pd.DataFrame(), None
 
     meta_train_df = pd.merge(prophet_val_preds, xgb_val_preds, on='ds', suffixes=('_prophet', '_xgb'))
     meta_train_df = pd.merge(meta_train_df, validation_df[['date', target_col]].rename(columns={'date': 'ds'}), on='ds')
@@ -359,7 +355,10 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
 
     prophet_full_preds = train_and_forecast_prophet(historical_df, events_df, forecast_horizon, target_col)
     xgb_full_preds = train_and_forecast_xgboost_tuned(historical_df, events_df, forecast_horizon, target_col)
-    if prophet_full_preds.empty or xgb_full_preds.empty: return pd.DataFrame(), None
+    
+    if prophet_full_preds.empty or xgb_full_preds.empty:
+        st.warning(f"One of the base models failed to produce a final forecast for '{target_col}'. Skipping meta-model.")
+        return pd.DataFrame(), None
 
     unified_df = pd.merge(prophet_full_preds, xgb_full_preds, on='ds', suffixes=('_prophet', '_xgb'))
     X_unified_meta = unified_df[['yhat_prophet', 'yhat_xgb']]
