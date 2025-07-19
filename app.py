@@ -190,7 +190,7 @@ def process_historical_data(records):
     df['date'] = pd.to_datetime(df['date'], errors='coerce', utc=True)
     df.dropna(subset=['date'], inplace=True)
 
-    # --- DEFINITIVE FIX: Convert all dates to the local timezone BEFORE normalizing ---
+    # Convert to local timezone first, then normalize to get the correct calendar day.
     df['date'] = df['date'].dt.tz_convert('Asia/Manila').dt.normalize()
 
     # Silently and robustly handle potential duplicates by keeping the most complete record for each day.
@@ -282,10 +282,12 @@ def create_advanced_features(df):
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy().dropna(subset=['date', target_col])
     if df_train.empty or len(df_train) < 15: return pd.DataFrame()
+    
+    # Prophet requires timezone-naive dates. The `process_historical_data` function already handled this.
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    start_date = df_train['date'].min()
-    end_date = df_train['date'].max() + timedelta(days=periods) if periods > 0 else df_train['date'].max()
+    start_date = df_prophet['ds'].min()
+    end_date = df_prophet['ds'].max() + timedelta(days=periods) if periods > 0 else df_prophet['ds'].max()
     recurring_events = generate_recurring_local_events(start_date, end_date)
     
     all_manual_events = pd.concat([events_df.rename(columns={'date':'ds', 'activity_name':'holiday'}), recurring_events])
