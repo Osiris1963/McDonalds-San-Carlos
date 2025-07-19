@@ -330,6 +330,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     if future_preds_list:
         future_preds = pd.DataFrame(future_preds_list)
         full_preds = pd.concat([full_preds, future_preds], ignore_index=True)
+    
+    # --- DEFINITIVE FIX: Ensure output is timezone-naive for merging ---
+    if pd.api.types.is_datetime64_any_dtype(full_preds['ds']) and full_preds['ds'].dt.tz is not None:
+        full_preds['ds'] = full_preds['ds'].dt.tz_localize(None)
         
     return full_preds
 
@@ -342,13 +346,17 @@ def train_and_forecast_with_meta_model(historical_df, events_df, target_col, for
     prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     
-    # --- DEFINITIVE FIX: Check for empty predictions before merging ---
     if prophet_val_preds.empty or xgb_val_preds.empty:
         st.warning(f"One of the base models failed to produce a validation forecast for '{target_col}'. Skipping meta-model.")
         return pd.DataFrame(), None
 
     meta_train_df = pd.merge(prophet_val_preds, xgb_val_preds, on='ds', suffixes=('_prophet', '_xgb'))
-    meta_train_df = pd.merge(meta_train_df, validation_df[['date', target_col]].rename(columns={'date': 'ds'}), on='ds')
+    
+    # Ensure validation_df is also timezone-naive for this merge
+    validation_df_naive = validation_df.copy()
+    validation_df_naive['date'] = validation_df_naive['date'].dt.tz_localize(None)
+    meta_train_df = pd.merge(meta_train_df, validation_df_naive[['date', target_col]].rename(columns={'date': 'ds'}), on='ds')
+    
     X_meta, y_meta = meta_train_df[['yhat_prophet', 'yhat_xgb']], meta_train_df[target_col]
 
     meta_model = LinearRegression()
@@ -376,6 +384,9 @@ def plot_unified_forecast(historical_df, unified_forecast_df, target_col):
     fig.add_trace(go.Scatter(x=historical_df['date'], y=historical_df[target_col], mode='lines', name='Historical Actuals', line=dict(color='#3b82f6', width=2.5)))
     
     last_hist_date = historical_df['date'].max()
+    # Ensure unified_forecast_df is timezone-naive for comparison
+    unified_forecast_df['ds'] = unified_forecast_df['ds'].dt.tz_localize(None)
+
     in_sample_fit = unified_forecast_df[unified_forecast_df['ds'] <= last_hist_date]
     future_forecast = unified_forecast_df[unified_forecast_df['ds'] > last_hist_date]
 
