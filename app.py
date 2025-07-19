@@ -127,7 +127,6 @@ def apply_custom_styling():
 def init_firestore():
     try:
         if not firebase_admin._apps:
-            # Correctly handle secrets for Streamlit Cloud
             creds_dict = {
               "type": st.secrets.firebase_credentials.type,
               "project_id": st.secrets.firebase_credentials.project_id,
@@ -149,34 +148,51 @@ def init_firestore():
 
 # --- App State Management ---
 def initialize_state_firestore(db_client):
-    if 'db_client' not in st.session_state: st.session_state.db_client = db_client
-    if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
-    if 'events_df' not in st.session_state: st.session_state.events_df = pd.DataFrame()
-    if 'unified_forecast_cust' not in st.session_state: st.session_state.unified_forecast_cust = pd.DataFrame()
-    if 'unified_forecast_atv' not in st.session_state: st.session_state.unified_forecast_atv = pd.DataFrame()
+    if 'db_client' not in st.session_state:
+        st.session_state.db_client = db_client
 
-    defaults = {'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688"}
+    if 'historical_df' not in st.session_state:
+        df, timestamp = load_from_firestore(db_client, 'historical_data')
+        st.session_state.historical_df = df
+        st.session_state.data_last_loaded = timestamp
+
+    if 'events_df' not in st.session_state:
+        st.session_state.events_df = pd.DataFrame()
+    if 'unified_forecast_cust' not in st.session_state:
+        st.session_state.unified_forecast_cust = pd.DataFrame()
+    if 'unified_forecast_atv' not in st.session_state:
+        st.session_state.unified_forecast_atv = pd.DataFrame()
+
+    defaults = {'forecast_df': pd.DataFrame(), 'name': "Store 688"}
     for key, value in defaults.items():
-        if key not in st.session_state: st.session_state[key] = value
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
-    if _db_client is None: return pd.DataFrame()
+    """Fetches data from Firestore and returns a timestamp of the operation."""
+    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC')
     docs = _db_client.collection(collection_name).stream()
     records = [doc.to_dict() for doc in docs]
-    if not records: return pd.DataFrame()
+    
+    # Get the current time in UTC right after the fetch
+    fetch_timestamp = pd.Timestamp.now(tz='UTC')
+
+    if not records: return pd.DataFrame(), fetch_timestamp
     df = pd.DataFrame(records)
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
         if not df.empty:
             df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+            
     numeric_cols = ['sales', 'customers', 'add_on_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    return df
+            
+    return df, fetch_timestamp
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -248,7 +264,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     if df_train.empty or len(df_train) < 15: return pd.DataFrame()
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # Generate events for the full period (history + future)
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods) if periods > 0 else df_train['date'].max()
     recurring_events = generate_recurring_local_events(start_date, end_date)
@@ -259,7 +274,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     model.add_country_holidays(country_name='PH')
     model.fit(df_prophet)
     
-    # Create future dataframe for both historical and future periods
     future = model.make_future_dataframe(periods=periods, include_history=True)
     forecast = model.predict(future)
     return forecast[['ds', 'yhat']]
@@ -278,11 +292,9 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col):
     model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=500, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
     model.fit(X_hist, y_hist)
 
-    # In-sample predictions
     hist_preds = model.predict(X_hist)
     full_preds = pd.DataFrame({'ds': df_featured['date'], 'yhat': hist_preds})
     
-    # Recursive out-of-sample predictions
     future_preds_list = []
     history = df_featured.copy()
     for _ in range(periods):
@@ -304,32 +316,25 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col):
 
 def train_and_forecast_with_meta_model(historical_df, events_df, target_col, forecast_horizon):
     """Orchestrates the training of base models and a meta-model for forecasting."""
-    # 1. Split data for meta-model training to prevent data leakage
     split_index = int(len(historical_df) * 0.8)
     train_df = historical_df.iloc[:split_index]
     validation_df = historical_df.iloc[split_index:]
     
-    # 2. Train base models and predict on the validation set
     prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
     xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, len(validation_df), target_col).tail(len(validation_df))
     if prophet_val_preds.empty or xgb_val_preds.empty: return pd.DataFrame(), None
 
-    # 3. Create the training set for the meta-model
     meta_train_df = pd.merge(prophet_val_preds, xgb_val_preds, on='ds', suffixes=('_prophet', '_xgb'))
     meta_train_df = pd.merge(meta_train_df, validation_df[['date', target_col]].rename(columns={'date': 'ds'}), on='ds')
     X_meta, y_meta = meta_train_df[['yhat_prophet', 'yhat_xgb']], meta_train_df[target_col]
 
-    # 4. Train the meta-model
     meta_model = LinearRegression()
     meta_model.fit(X_meta, y_meta)
 
-    # 5. Get predictions from base models on the FULL timeframe (historical + future)
-    full_period = len(historical_df) + forecast_horizon
     prophet_full_preds = train_and_forecast_prophet(historical_df, events_df, forecast_horizon, target_col)
     xgb_full_preds = train_and_forecast_xgboost_tuned(historical_df, forecast_horizon, target_col)
     if prophet_full_preds.empty or xgb_full_preds.empty: return pd.DataFrame(), None
 
-    # 6. Combine and apply the meta-model to the full set of predictions
     unified_df = pd.merge(prophet_full_preds, xgb_full_preds, on='ds', suffixes=('_prophet', '_xgb'))
     X_unified_meta = unified_df[['yhat_prophet', 'yhat_xgb']]
     unified_df['yhat'] = meta_model.predict(X_unified_meta)
@@ -342,18 +347,14 @@ def plot_unified_forecast(historical_df, unified_forecast_df, target_col):
     """Plots historical actuals, in-sample fit, and future forecast in one chart."""
     fig = go.Figure()
     
-    # 1. Historical Actuals
     fig.add_trace(go.Scatter(x=historical_df['date'], y=historical_df[target_col], mode='lines', name='Historical Actuals', line=dict(color='#3b82f6', width=2.5)))
     
-    # 2. Split forecast into in-sample and out-of-sample
     last_hist_date = historical_df['date'].max()
     in_sample_fit = unified_forecast_df[unified_forecast_df['ds'] <= last_hist_date]
     future_forecast = unified_forecast_df[unified_forecast_df['ds'] > last_hist_date]
 
-    # 3. Model's Fit on Historical Data
     fig.add_trace(go.Scatter(x=in_sample_fit['ds'], y=in_sample_fit['yhat'], mode='lines', name='Model Fit (In-Sample)', line=dict(color='#ffc72c', dash='dash')))
     
-    # 4. Future Forecast
     fig.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], mode='lines', name='Future Forecast', line=dict(color='#d62728', dash='dot')))
 
     title_text = f"Full Forecast View: {target_col.replace('_',' ').title()}"
@@ -381,9 +382,13 @@ if db:
         st.markdown("---")
         st.info("Forecasting with a Meta-Model Ensemble (Prophet + XGBoost)")
 
-        if st.button("🔄 Refresh Data from Firestore"):
-            st.cache_data.clear()
-            st.success("Data cache cleared. Rerunning.")
+        if st.button("🔄 Force Refresh All Data"):
+            load_from_firestore.clear()
+            # Clear all compute caches as well
+            train_and_forecast_prophet.clear()
+            train_and_forecast_xgboost_tuned.clear()
+            st.session_state.clear()
+            st.success("All caches cleared. Rerunning.")
             time.sleep(1)
             st.rerun()
 
@@ -471,6 +476,27 @@ if db:
 
     with tabs[2]: # Historical Data
         st.subheader("View Historical Data")
+        
+        # --- NEW: Data Freshness Indicator and Refresh Button ---
+        col1, col2 = st.columns([3,1])
+        with col1:
+            if 'data_last_loaded' in st.session_state and st.session_state.data_last_loaded is not None:
+                last_loaded_time = st.session_state.data_last_loaded.tz_convert('Asia/Manila')
+                st.info(f"🕒 Data displayed was fetched from the database on: {last_loaded_time.strftime('%B %d, %Y at %I:%M %p')}.")
+            else:
+                st.info("🕒 Data is loaded from the database on startup.")
+        
+        with col2:
+            if st.button("🔄 Refresh Data Now", use_container_width=True):
+                load_from_firestore.clear()
+                st.session_state.pop('historical_df', None)
+                st.session_state.pop('data_last_loaded', None)
+                st.success("Fetching latest data from Firestore...")
+                time.sleep(1)
+                st.rerun()
+        st.markdown("---")
+        # --- END NEW ---
+        
         df_hist = st.session_state.historical_df.copy()
         if not df_hist.empty:
             all_years = sorted(df_hist['date'].dt.year.unique(), reverse=True)
