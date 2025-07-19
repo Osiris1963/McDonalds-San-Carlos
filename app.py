@@ -3,15 +3,20 @@ import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
 import optuna
-from sklearn.metrics import mean_absolute_error
-from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
 import numpy as np
 import plotly.graph_objs as go
+import yaml
+from yaml.loader import SafeLoader
+import io
 import time
+import os
 import requests
 from datetime import timedelta, date
 import firebase_admin
 from firebase_admin import credentials, firestore
+import json
 import logging
 
 # --- Suppress Prophet's informational messages ---
@@ -148,101 +153,87 @@ def init_firestore():
 
 # --- App State Management ---
 def initialize_state_firestore(db_client):
-    if 'db_client' not in st.session_state:
-        st.session_state.db_client = db_client
-
-    if 'historical_df' not in st.session_state:
-        raw_records, timestamp = load_from_firestore(db_client, 'historical_data')
-        st.session_state.historical_df = process_historical_data(raw_records)
-        st.session_state.data_last_loaded = timestamp
+    if 'db_client' not in st.session_state: st.session_state.db_client = db_client
+    if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
+    
+    # Events are no longer managed via UI, initialize as empty.
+    if 'events_df' not in st.session_state: st.session_state.events_df = pd.DataFrame() 
 
     defaults = {
-        'events_df': pd.DataFrame(),
-        'unified_forecast_cust': pd.DataFrame(),
-        'unified_forecast_atv': pd.DataFrame(),
         'forecast_df': pd.DataFrame(),
-        'name': "Store 688"
+        'metrics': {},
+        'name': "Store 688",
+        'migration_done': False,
     }
     for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+        if key not in st.session_state: st.session_state[key] = value
 
 # --- Data Processing and Feature Engineering ---
-def load_from_firestore(_db_client, collection_name):
-    """Fetches raw data from Firestore and returns it with a timestamp."""
-    if _db_client is None: return [], pd.Timestamp.now(tz='UTC')
-    
-    docs = _db_client.collection(collection_name).stream()
-    records = [doc.to_dict() for doc in docs]
-    fetch_timestamp = pd.Timestamp.now(tz='UTC')
-    return records, fetch_timestamp
-
 @st.cache_data(ttl="1h")
-def process_historical_data(records):
-    """Takes raw records, cleans them, and returns a validated, sorted DataFrame."""
+def load_from_firestore(_db_client, collection_name):
+    if _db_client is None: return pd.DataFrame()
+
+    docs = _db_client.collection(collection_name).stream()
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+
     if not records: return pd.DataFrame()
-    
+
     df = pd.DataFrame(records)
-    
-    if 'date' not in df.columns:
-        return pd.DataFrame()
-        
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df.dropna(subset=['date'], inplace=True)
-    df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
 
-    # --- DEFINITIVE FIX ---
-    # 1. Sort by date and data completeness to ensure the best record is chosen.
-    # A record with more fields is considered "better".
-    df['completeness'] = df.count(axis=1)
-    df.sort_values(['date', 'completeness'], ascending=[True, True], inplace=True)
-    df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    df.drop(columns=['completeness'], inplace=True)
+    if 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        if pd.api.types.is_datetime64_any_dtype(df['date']):
+            df['date'] = df['date'].dt.tz_localize(None)
+        df.dropna(subset=['date'], inplace=True)
+        if not df.empty:
+            df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
 
-    # 2. Validate the complete numeric schema to prevent errors from missing fields.
-    numeric_cols = [
-        'sales', 'customers', 'add_on_sales', 
-        'last_year_sales', 'last_year_customers'
-    ]
+    numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        else:
-            df[col] = 0
-    
-    # Ensure day_type exists and has a default value.
-    if 'day_type' not in df.columns:
-        df['day_type'] = 'Normal Day'
-    else:
-        df['day_type'].fillna('Normal Day', inplace=True)
 
-    # 3. Final sort and index reset to guarantee data-to-index alignment.
-    df = df.sort_values(by='date', ascending=True)
-    df = df.reset_index(drop=True)
-    
     return df
+
+def remove_outliers_iqr(df, column='sales'):
+    Q1 = df[column].quantile(0.25)
+    Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1
+    upper_bound = Q3 + 1.5 * IQR
+    original_rows = len(df)
+    cleaned_df = df[df[column] <= upper_bound].copy()
+    removed_rows = original_rows - len(cleaned_df)
+    return cleaned_df, removed_rows, upper_bound
 
 def calculate_atv(df):
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        atv = np.divide(df['base_sales'], df['customers'])
+    sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0)
+    customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
+    with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
 @st.cache_data(ttl=3600)
 def get_weather_forecast(days=16):
     try:
-        params={"latitude":10.48,"longitude":123.42,"daily":"weather_code","timezone":"Asia/Manila","forecast_days":days}
-        response = requests.get("https://api.open-meteo.com/v1/forecast", params=params)
-        response.raise_for_status()
-        data = response.json()
-        df = pd.DataFrame(data['daily'])
-        df.rename(columns={'time':'date'}, inplace=True)
-        df['date'] = pd.to_datetime(df['date'])
-        df['weather'] = df['weather_code'].apply(map_weather_code)
-        return df[['date', 'weather']]
+        url="https://api.open-meteo.com/v1/forecast"
+        params={
+            "latitude":10.48,
+            "longitude":123.42,
+            "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
+            "timezone":"Asia/Manila",
+            "forecast_days":days,
+        }
+        response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
+        df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
+        df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
+        return df
     except requests.exceptions.RequestException as e:
-        st.error(f"Could not fetch weather data: {e}")
+        st.error(f"Could not fetch weather data. Please try again later. Error: {e}")
         return None
 
 def map_weather_code(code):
@@ -250,145 +241,226 @@ def map_weather_code(code):
     if code == 2: return "Partly Cloudy"
     if code == 3: return "Cloudy"
     if code in [45, 48]: return "Foggy"
-    if code in [51, 53, 55, 61, 63, 65, 80, 81, 82]: return "Rainy"
+    if code in [51, 53, 55, 61, 63, 65]: return "Rainy"
+    if code in [80, 81, 82]: return "Rain Showers"
     if code in [95, 96, 99]: return "Thunderstorm"
     return "Cloudy"
 
-def generate_recurring_local_events(start_date, end_date):
-    events = []
-    current_date = start_date
-    while current_date <= end_date:
-        if current_date.day in [15, 30]:
-            events.append({'holiday': 'Payday', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
-        if current_date.month == 7 and current_date.day == 1:
-            events.append({'holiday': 'San Carlos Charter Day', 'ds': current_date, 'lower_window': 0, 'upper_window': 0})
-        current_date += timedelta(days=1)
-    return pd.DataFrame(events)
+def generate_recurring_local_events(start_date,end_date):
+    local_events=[];current_date=start_date
+    while current_date<=end_date:
+        if current_date.day in[15,30]:local_events.append({'holiday':'Payday','ds':current_date,'lower_window':0,'upper_window':1});[local_events.append({'holiday':'Near_Payday','ds':current_date-timedelta(days=i),'lower_window':0,'upper_window':0})for i in range(1,3)]
+        if current_date.month==7 and current_date.day==1:local_events.append({'holiday':'San Carlos Charter Day','ds':current_date,'lower_window':0,'upper_window':0})
+        current_date+=timedelta(days=1)
+    return pd.DataFrame(local_events)
+
+# --- Core Forecasting Models ---
 
 def create_advanced_features(df):
+    """Creates time series, lag, and rolling window features from a datetime index."""
     df['date'] = pd.to_datetime(df['date'])
     df['dayofweek'] = df['date'].dt.dayofweek
+    df['quarter'] = df['date'].dt.quarter
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
+    df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+
     df = df.sort_values('date')
-    for col in ['sales', 'customers', 'atv']:
-        if col in df.columns:
-            df[f'{col}_lag_7'] = df[col].shift(7)
-            df[f'{col}_rolling_mean_7'] = df[col].shift(1).rolling(window=7, min_periods=1).mean()
+
+    if 'sales' in df.columns:
+        df['sales_lag_7'] = df['sales'].shift(7)
+    if 'customers' in df.columns:
+        df['customers_lag_7'] = df['customers'].shift(7)
+
+    if 'sales' in df.columns:
+        df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
+        df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
+    if 'customers' in df.columns:
+        df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
+
+    if 'atv' in df.columns:
+        df['atv_lag_7'] = df['atv'].shift(7)
+        df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
+        df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
+
     return df
 
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
-    df_train = historical_df.copy().dropna(subset=['date', target_col])
-    if df_train.empty or len(df_train) < 15: return pd.DataFrame()
+    df_train = historical_df.copy()
+    df_train.dropna(subset=['date', target_col], inplace=True)
+
+    if df_train.empty or len(df_train) < 15:
+        return pd.DataFrame(), None
+
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
-    
+
     start_date = df_train['date'].min()
-    end_date = df_train['date'].max() + timedelta(days=periods) if periods > 0 else df_train['date'].max()
+    end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
-    
-    all_manual_events = pd.concat([events_df.rename(columns={'date':'ds', 'activity_name':'holiday'}), recurring_events])
-    
-    model = Prophet(growth='linear', holidays=all_manual_events, weekly_seasonality=True, yearly_seasonality=len(df_train) >= 365, changepoint_prior_scale=0.15)
-    model.add_country_holidays(country_name='PH')
-    model.fit(df_prophet)
-    
-    future = model.make_future_dataframe(periods=periods, include_history=True)
-    forecast = model.predict(future)
-    return forecast[['ds', 'yhat']]
+
+    # Note: manual_events_renamed will likely be empty, which is handled correctly.
+    manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
+    all_manual_events = pd.concat([manual_events_renamed, recurring_events])
+    all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
+
+    if 'day_type' in historical_df.columns:
+        not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
+        if not not_normal_days_df.empty:
+            not_normal_events = pd.DataFrame({
+                'holiday': 'Unusual_Day',
+                'ds': pd.to_datetime(not_normal_days_df['date']),
+                'lower_window': 0,
+                'upper_window': 0,
+            })
+            all_manual_events = pd.concat([all_manual_events, not_normal_events])
+
+    use_yearly_seasonality = len(df_train) >= 365
+
+    prophet_model = Prophet(
+        growth='linear',
+        holidays=all_manual_events,
+        daily_seasonality=False,
+        weekly_seasonality=True,
+        yearly_seasonality=use_yearly_seasonality,
+        changepoint_prior_scale=0.15,
+        changepoint_range=0.9,
+    )
+    prophet_model.add_country_holidays(country_name='PH')
+    prophet_model.fit(df_prophet)
+
+    future = prophet_model.make_future_dataframe(periods=periods)
+    forecast = prophet_model.predict(future)
+
+    return forecast[['ds', 'yhat']], prophet_model
 
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
-    df_train = historical_df.copy().dropna(subset=['date', target_col])
-    if df_train.empty: return pd.DataFrame()
-    
-    df_featured = create_advanced_features(df_train)
-    features = ['dayofweek', 'month', 'year', 'weekofyear'] + [f for f in [f'{target_col}_lag_7', f'{target_col}_rolling_mean_7'] if f in df_featured.columns]
-    df_featured.dropna(subset=features, inplace=True)
-    X_hist, y_hist = df_featured[features], df_featured[target_col]
-    if X_hist.empty: return pd.DataFrame()
-    
-    model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=500, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42)
-    model.fit(X_hist, y_hist)
+    df_train = historical_df.copy()
+    df_train.dropna(subset=['date', target_col], inplace=True)
 
-    hist_preds = model.predict(X_hist)
-    full_preds = pd.DataFrame({'ds': df_featured['date'], 'yhat': hist_preds})
-    
-    future_preds_list = []
-    history = df_featured.copy()
-    for _ in range(periods):
-        last_date = history['date'].max()
+    if df_train.empty:
+        return pd.DataFrame()
+
+    # --- Part 1: Feature Engineering and Model Training (Largely the same) ---
+    df_featured = create_advanced_features(df_train.copy())
+
+    if 'day_type' in df_featured.columns:
+        df_featured['is_not_normal_day'] = df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+    else:
+        df_featured['is_not_normal_day'] = 0
+
+    dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
+    if dropna_col in df_featured.columns:
+        df_featured.dropna(subset=[dropna_col], inplace=True)
+
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
+
+    if target_col == 'customers':
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
+    elif target_col == 'atv':
+        features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7']
+    else:
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
+
+    features = [f for f in features if f in df_featured.columns]
+    target = target_col
+
+    X = df_featured[features]
+    y = df_featured[target]
+
+    if X.empty or len(X) < 10:
+        st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
+        return pd.DataFrame()
+
+    # Using fixed parameters for speed, but you can re-enable Optuna if desired
+    # For a production app, you might save the best_params to avoid re-tuning every time.
+    best_params = {
+        'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
+        'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
+    }
+
+    final_model = xgb.XGBRegressor(**best_params)
+    sample_weights = np.linspace(0.5, 1.0, len(y))
+    final_model.fit(X, y, sample_weight=sample_weights)
+
+    # --- Part 2: Recursive Forecasting Loop (The Fix) ---
+
+    future_predictions = []
+    # Start with the full history that was used for training
+    history_with_features = df_featured.copy()
+
+    for i in range(periods):
+        # 1. Prepare the feature set for the next day
+        # Get the last known date and add one day
+        last_date = history_with_features['date'].max()
         next_date = last_date + timedelta(days=1)
+
+        # Create a one-row dataframe for the next day to be predicted
         future_step_df = pd.DataFrame([{'date': next_date}])
-        extended_history = pd.concat([history, future_step_df], ignore_index=True)
-        extended_featured = create_advanced_features(extended_history)
-        X_future = extended_featured[features].tail(1)
-        pred = model.predict(X_future)[0]
-        future_preds_list.append({'ds': next_date, 'yhat': pred})
-        history = pd.concat([history, pd.DataFrame([{'date': next_date, target_col: pred}])], ignore_index=True)
 
-    if future_preds_list:
-        future_preds = pd.DataFrame(future_preds_list)
-        full_preds = pd.concat([full_preds, future_preds], ignore_index=True)
-        
-    return full_preds
+        # Append this new day to our history
+        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
 
-def train_and_forecast_with_meta_model(historical_df, events_df, target_col, forecast_horizon):
-    """Orchestrates the training of base models and a meta-model for forecasting."""
-    split_index = int(len(historical_df) * 0.8)
-    train_df = historical_df.iloc[:split_index]
-    validation_df = historical_df.iloc[split_index:]
-    
-    prophet_val_preds = train_and_forecast_prophet(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
-    xgb_val_preds = train_and_forecast_xgboost_tuned(train_df, events_df, len(validation_df), target_col).tail(len(validation_df))
-    if prophet_val_preds.empty or xgb_val_preds.empty: return pd.DataFrame(), None
+        # 2. Re-create features for the entire extended history
+        # The last row will now have correctly calculated lag and rolling features
+        extended_featured_df = create_advanced_features(extended_history)
 
-    meta_train_df = pd.merge(prophet_val_preds, xgb_val_preds, on='ds', suffixes=('_prophet', '_xgb'))
-    meta_train_df = pd.merge(meta_train_df, validation_df[['date', target_col]].rename(columns={'date': 'ds'}), on='ds')
-    X_meta, y_meta = meta_train_df[['yhat_prophet', 'yhat_xgb']], meta_train_df[target_col]
+        # Add the 'is_not_normal_day' feature manually for the future date
+        extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
 
-    meta_model = LinearRegression()
-    meta_model.fit(X_meta, y_meta)
+        # 3. Predict the next step
+        # Isolate the last row, which contains the features for the day we want to predict
+        X_future = extended_featured_df[features].tail(1)
+        prediction = final_model.predict(X_future)[0]
 
-    prophet_full_preds = train_and_forecast_prophet(historical_df, events_df, forecast_horizon, target_col)
-    xgb_full_preds = train_and_forecast_xgboost_tuned(historical_df, events_df, forecast_horizon, target_col)
-    if prophet_full_preds.empty or xgb_full_preds.empty: return pd.DataFrame(), None
+        # Store the prediction
+        future_predictions.append({'ds': next_date, 'yhat': prediction})
 
-    unified_df = pd.merge(prophet_full_preds, xgb_full_preds, on='ds', suffixes=('_prophet', '_xgb'))
-    X_unified_meta = unified_df[['yhat_prophet', 'yhat_xgb']]
-    unified_df['yhat'] = meta_model.predict(X_unified_meta)
+        # 4. Update history with the prediction to be used in the next loop
+        # This is the key step of the recursive strategy
+        history_with_features = extended_featured_df.copy()
+        history_with_features.loc[history_with_features.index.max(), target] = prediction
 
-    return unified_df[['ds', 'yhat']], meta_model
+        # If forecasting customers, we also need to update the sales column to help with features
+        # We can make a simple assumption, e.g., sales = predicted_customers * recent_atv
+        if target_col == 'customers':
+            recent_atv = history_with_features['atv'].dropna().tail(7).mean()
+            history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * recent_atv
 
+    # --- Part 3: Combine and Return ---
+    # Create the final forecast dataframe
+    final_df = pd.DataFrame(future_predictions)
+
+    # Also include the model's prediction on the historical data (in-sample forecast)
+    historical_predictions = df_featured[['date']].copy()
+    historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
+    historical_predictions['yhat'] = final_model.predict(X)
+
+    # Combine historical fit with future forecast
+    full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
+
+    return full_forecast_df
+
+# --- Plotting Functions & Data I/O ---
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-def plot_unified_forecast(historical_df, unified_forecast_df, target_col):
-    """Plots historical actuals, in-sample fit, and future forecast in one chart."""
-    fig = go.Figure()
-    
-    fig.add_trace(go.Scatter(x=historical_df['date'], y=historical_df[target_col], mode='lines', name='Historical Actuals', line=dict(color='#3b82f6', width=2.5)))
-    
-    last_hist_date = historical_df['date'].max()
-    in_sample_fit = unified_forecast_df[unified_forecast_df['ds'] <= last_hist_date]
-    future_forecast = unified_forecast_df[unified_forecast_df['ds'] > last_hist_date]
-
-    fig.add_trace(go.Scatter(x=in_sample_fit['ds'], y=in_sample_fit['yhat'], mode='lines', name='Model Fit (In-Sample)', line=dict(color='#ffc72c', dash='dash')))
-    
-    fig.add_trace(go.Scatter(x=future_forecast['ds'], y=future_forecast['yhat'], mode='lines', name='Future Forecast', line=dict(color='#d62728', dash='dot')))
-
-    title_text = f"Full Forecast View: {target_col.replace('_',' ').title()}"
-    fig.update_layout(title=title_text, xaxis_title='Date', yaxis_title=target_col.title(),
-                      legend=dict(x=0.01, y=0.99), height=500, paper_bgcolor='#2a2a2a', plot_bgcolor='#2a2a2a', font_color='white')
-    return fig
+def plot_full_comparison_chart(hist,fcst,metrics,target):
+    fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
+    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
 
 def render_historical_record(row):
-    date_str = pd.to_datetime(row['date']).strftime('%B %d, %Y')
+    date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-        st.write(f"**Day Type:** {row.get('day_type', 'Normal Day')}")
+        day_type = row.get('day_type', 'Normal Day')
+        st.write(f"**Day Type:** {day_type}")
+        if day_type == 'Not Normal Day':
+            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -398,15 +470,13 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("Sales Forecaster")
+        st.title(f"Sales Forecaster")
         st.markdown("---")
-        st.info("Forecasting with a Meta-Model Ensemble (Prophet + XGBoost)")
+        st.info("Forecasting with a Hybrid Ensemble Model")
 
-        if st.button("🔄 Force Refresh All Data"):
+        if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
-            st.cache_resource.clear()
-            st.session_state.clear()
-            st.success("All caches and session state cleared. Rerunning to fetch fresh data.")
+            st.success("Data cache cleared. Rerunning to get latest data.")
             time.sleep(1)
             st.rerun()
 
@@ -414,108 +484,141 @@ if db:
             if len(st.session_state.historical_df) < 50:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
-                base_df = st.session_state.historical_df.copy()
-                hist_df_with_atv = calculate_atv(base_df)
-                
-                FORECAST_HORIZON = 15
+                with st.spinner("🧠 Initializing Hybrid Forecast..."):
+                    base_df = st.session_state.historical_df.copy()
+                    base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
+                    cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
+                    if removed_count > 0:
+                        st.warning(f"Removed {removed_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
-                with st.spinner("Generating customer forecast..."):
-                    unified_cust_f, meta_model_cust = train_and_forecast_with_meta_model(hist_df_with_atv, st.session_state.events_df, 'customers', FORECAST_HORIZON)
-                    st.session_state.unified_forecast_cust = unified_cust_f
-                
-                with st.spinner("Generating average transaction forecast..."):
-                    unified_atv_f, meta_model_atv = train_and_forecast_with_meta_model(hist_df_with_atv, st.session_state.events_df, 'atv', FORECAST_HORIZON)
-                    st.session_state.unified_forecast_atv = unified_atv_f
+                    hist_df_with_atv = calculate_atv(cleaned_df)
+                    ev_df = st.session_state.events_df.copy() # Will be an empty DataFrame
+                    FORECAST_HORIZON = 15
 
-                if meta_model_cust:
-                    weights = meta_model_cust.coef_
-                    st.success(f"Customer Meta-Model Weights: Prophet={weights[0]:.2f}, XGBoost={weights[1]:.2f}")
-                if meta_model_atv:
-                    weights = meta_model_atv.coef_
-                    st.success(f"ATV Meta-Model Weights: Prophet={weights[0]:.2f}, XGBoost={weights[1]:.2f}")
+                    cust_f = pd.DataFrame()
+                    with st.spinner("Forecasting Customers (Simple Average)..."):
+                        prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
+                        xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
 
-                if not unified_cust_f.empty and not unified_atv_f.empty:
-                    combo_f = pd.merge(unified_cust_f.rename(columns={'yhat':'forecast_customers'}), unified_atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
-                    combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
-                    weather_df = get_weather_forecast()
-                    if weather_df is not None:
-                        combo_f = pd.merge(combo_f, weather_df, left_on='ds', right_on='date', how='left').drop(columns=['date'])
-                    st.session_state.forecast_df = combo_f
-                    st.balloons()
-                else:
-                    st.error("Forecast generation failed.")
+                        if not prophet_cust_f.empty and not xgb_cust_f.empty:
+                            cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
+                            cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
+                        else:
+                            st.error("Failed to generate customer forecast.")
+
+                    atv_f = pd.DataFrame()
+                    with st.spinner("Forecasting Average Sale (Simple Average)..."):
+                        prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                        xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+
+                        if not prophet_atv_f.empty and not xgb_atv_f.empty:
+                            atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
+                            atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
+                        else:
+                            st.error("Failed to generate ATV forecast.")
+
+                    if not cust_f.empty and not atv_f.empty:
+                        combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
+                        combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+
+                        with st.spinner("🛰️ Fetching live weather..."):
+                            weather_df = get_weather_forecast()
+                        if weather_df is not None:
+                            combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                        else:
+                            combo_f['weather'] = 'Not Available'
+                        
+                        st.session_state.forecast_df = combo_f
+                        st.success("Hybrid ensemble forecast generated successfully!")
+                    else:
+                        st.error("Forecast generation failed. One or more components could not be built.")
 
         st.markdown("---")
         st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
         st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
 
-    tabs = st.tabs(["🔮 Forecast Dashboard", "📅 Full Forecast", "📜 Historical Data"])
+    # --- Simplified Tab List ---
+    tab_list = ["🔮 Forecast Dashboard", "📜 Historical Data"]
+    tabs = st.tabs(tab_list)
 
-    with tabs[0]: # Forecast Dashboard
+    # --- Forecast Dashboard Tab ---
+    with tabs[0]:
         if not st.session_state.forecast_df.empty:
-            future_forecast_df = st.session_state.forecast_df[st.session_state.forecast_df['ds'].dt.date >= date.today()].copy()
-            if future_forecast_df.empty:
-                st.warning("Forecast contains no future dates.")
+            today=pd.to_datetime('today').normalize()
+            future_forecast_df=st.session_state.forecast_df[st.session_state.forecast_df['ds']>=today].copy()
+            if future_forecast_df.empty:st.warning("Forecast contains no future dates.")
             else:
-                disp_cols = {'ds': 'Date', 'forecast_customers': 'Predicted Customers', 'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)', 'weather': 'Predicted Weather'}
-                display_df = future_forecast_df.rename(columns=disp_cols)
-                final_cols_order = [v for k,v in disp_cols.items() if v in display_df.columns]
-                st.markdown("#### Future Forecasted Values")
-                st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}), use_container_width=True, height=560)
-                
-                st.markdown("#### Future Forecast Visualization")
-                fig_main = go.Figure()
-                fig_main.add_trace(go.Scatter(x=future_forecast_df['ds'], y=future_forecast_df['forecast_sales'], mode='lines+markers', name='Sales Forecast', line=dict(color='#ffc72c')))
-                fig_main.add_trace(go.Scatter(x=future_forecast_df['ds'], y=future_forecast_df['forecast_customers'], mode='lines+markers', name='Customer Forecast', yaxis='y2', line=dict(color='#c8102e')))
-                fig_main.update_layout(title='15-Day Sales & Customer Forecast', yaxis=dict(title='Predicted Sales (₱)'), yaxis2=dict(title='Predicted Customers', overlaying='y', side='right'), legend=dict(x=0.01,y=0.99), paper_bgcolor='#2a2a2a', plot_bgcolor='#2a2a2a', font_color='white')
-                st.plotly_chart(fig_main, use_container_width=True)
+                disp_cols={'ds':'Date','forecast_customers':'Predicted Customers','forecast_atv':'Predicted Avg Sale (₱)','forecast_sales':'Predicted Sales (₱)','weather':'Predicted Weather'}
+                existing_disp_cols={k:v for k,v in disp_cols.items()if k in future_forecast_df.columns}
+                display_df=future_forecast_df.rename(columns=existing_disp_cols)
+                final_cols_order=[v for k,v in disp_cols.items()if k in existing_disp_cols]
+                st.markdown("#### Forecasted Values")
+                st.dataframe(display_df[final_cols_order].set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
+                st.markdown("#### Forecast Visualization")
+                fig=go.Figure()
+                fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c')))
+                fig.add_trace(go.Scatter(x=future_forecast_df['ds'],y=future_forecast_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e')))
+                fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(x=0.01,y=0.99,orientation='h'),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white')
+                st.plotly_chart(fig,use_container_width=True)
+            
+            with st.expander("🔬 View Full Model Diagnostic Chart"):
+                st.info("This chart shows how the individual component models (Prophet and XGBoost) performed against historical data. This is useful for advanced diagnostics.")
+                d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"])
+                hist_atv=calculate_atv(st.session_state.historical_df.copy())
+                with d_t1:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_customers':'yhat'}),st.session_state.metrics.get('customers',{}),'customers'),use_container_width=True)
+                with d_t2:st.plotly_chart(plot_full_comparison_chart(hist_atv,st.session_state.forecast_df.rename(columns={'forecast_atv':'yhat'}),st.session_state.metrics.get('atv',{}),'atv'),use_container_width=True)
         else:
             st.info("Click the 'Generate Forecast' button to begin.")
 
-    with tabs[1]: # Full Forecast
-        st.header("Unified Historical and Forecast View")
-        st.info("This view shows historical actuals alongside the model's performance on that past data and its forecast for the future.")
-        if not st.session_state.unified_forecast_cust.empty and not st.session_state.unified_forecast_atv.empty:
-            hist_df_atv = calculate_atv(st.session_state.historical_df.copy())
-            
-            st.markdown("---")
-            st.subheader("Customer Count: Full View")
-            fig_cust = plot_unified_forecast(hist_df_atv, st.session_state.unified_forecast_cust, 'customers')
-            st.plotly_chart(fig_cust, use_container_width=True)
-
-            st.markdown("---")
-            st.subheader("Average Transaction Value (ATV): Full View")
-            fig_atv = plot_unified_forecast(hist_df_atv, st.session_state.unified_forecast_atv, 'atv')
-            st.plotly_chart(fig_atv, use_container_width=True)
-        else:
-            st.warning("Please generate a forecast first to see the full view.")
-
-    with tabs[2]: # Historical Data
+    # --- Historical Data Tab ---
+    with tabs[1]:
         st.subheader("View Historical Data")
-        
-        if 'data_last_loaded' in st.session_state and st.session_state.data_last_loaded is not None:
-            last_loaded_time = st.session_state.data_last_loaded.tz_convert('Asia/Manila')
-            st.info(f"🕒 Data displayed was fetched from the database on: {last_loaded_time.strftime('%B %d, %Y at %I:%M %p')}.")
-        
-        st.markdown("---")
-        
-        df_hist = st.session_state.historical_df.copy()
-        if not df_hist.empty:
-            all_years = sorted(df_hist['date'].dt.year.unique(), reverse=True)
+        df = st.session_state.historical_df.copy()
+        if not df.empty and 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df.dropna(subset=['date'], inplace=True)
+
+            all_years = sorted(df['date'].dt.year.unique(), reverse=True)
+
             if all_years:
-                sel_year = st.selectbox("Select Year:", options=all_years, key="hist_year")
-                df_year = df_hist[df_hist['date'].dt.year == sel_year]
-                all_months = sorted(df_year['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
+                filter_cols = st.columns(2)
+                with filter_cols[0]:
+                    selected_year = st.selectbox("Select Year to View:", options=all_years)
+
+                df_year_filtered = df[df['date'].dt.year == selected_year]
+                
+                all_months = sorted(df_year_filtered['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
+
                 if all_months:
-                    sel_month_str = st.selectbox("Select Month:", options=all_months, key="hist_month")
-                    sel_month_num = pd.to_datetime(sel_month_str, format='%B').month
-                    filtered_df = df_year[df_year['date'].dt.month == sel_month_num]
-                    
+                    with filter_cols[1]:
+                        selected_month_str = st.selectbox("Select Month to View:", options=all_months)
+
+                    selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
+
+                    filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy()
+
                     if filtered_df.empty:
-                        st.info("No data for the selected period.")
+                        st.info("No data for the selected month and year.")
                     else:
-                        # Direct-Render Loop: Guarantees data integrity.
-                        for index, row in filtered_df.iterrows():
-                            render_historical_record(row)
+                        df_first_half = filtered_df[filtered_df['date'].dt.day <= 15]
+                        df_second_half = filtered_df[filtered_df['date'].dt.day > 15]
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("##### Days 1-15")
+                            st.markdown("---")
+                            for index, row in df_first_half.iterrows():
+                                render_historical_record(row)
+                        
+                        with col2:
+                            st.markdown("##### Days 16-31")
+                            st.markdown("---")
+                            for index, row in df_second_half.iterrows():
+                                render_historical_record(row)
+                else:
+                    st.write(f"No data available for the year {selected_year}.")
+            else:
+                st.write("No historical data to display.")
         else:
-            st.warning("No historical data found.")
+            st.write("No historical data to display.")
