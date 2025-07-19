@@ -152,10 +152,11 @@ def initialize_state_firestore(db_client):
         st.session_state.db_client = db_client
 
     if 'historical_df' not in st.session_state:
-        df, timestamp, duplicates = load_from_firestore(db_client, 'historical_data')
+        df, timestamp, missing_day_types = load_from_firestore(db_client, 'historical_data')
         st.session_state.historical_df = df
         st.session_state.data_last_loaded = timestamp
-        st.session_state.duplicate_warnings = duplicates
+        st.session_state.missing_day_type_warnings = missing_day_types
+
 
     defaults = {
         'events_df': pd.DataFrame(),
@@ -171,23 +172,32 @@ def initialize_state_firestore(db_client):
 # --- Data Processing and Feature Engineering ---
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
-    """Fetches data, cleans duplicates, and returns the cleaned data with a timestamp."""
-    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC'), pd.DataFrame()
+    """Fetches data, validates for completeness, cleans duplicates, and returns results."""
+    if _db_client is None: return pd.DataFrame(), pd.Timestamp.now(tz='UTC'), pd.Series(dtype='object')
     
     docs = _db_client.collection(collection_name).stream()
     records = [doc.to_dict() for doc in docs]
     fetch_timestamp = pd.Timestamp.now(tz='UTC')
 
-    if not records: return pd.DataFrame(), fetch_timestamp, pd.DataFrame()
+    if not records: return pd.DataFrame(), fetch_timestamp, pd.Series(dtype='object')
     
     df = pd.DataFrame(records)
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
         df.dropna(subset=['date'], inplace=True)
         
-        duplicates_found = df[df.duplicated(subset=['date'], keep=False)].sort_values('date')
-        if not duplicates_found.empty:
+        # Silently handle duplicates by keeping the last entry
+        if df.duplicated(subset=['date']).any():
             df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+
+        # Validate day_type and default if missing
+        if 'day_type' not in df.columns:
+            missing_day_type_dates = df['date'] # All dates if column was missing
+            df['day_type'] = 'Normal Day'
+        else:
+            missing_mask = df['day_type'].isna() | (df['day_type'] == '')
+            missing_day_type_dates = df.loc[missing_mask, 'date']
+            df['day_type'].fillna('Normal Day', inplace=True)
         
         if not df.empty:
             df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
@@ -197,7 +207,7 @@ def load_from_firestore(_db_client, collection_name):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
-    return df, fetch_timestamp, duplicates_found
+    return df, fetch_timestamp, missing_day_type_dates
 
 def remove_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
@@ -491,15 +501,16 @@ if db:
                 load_from_firestore.clear()
                 st.session_state.pop('historical_df', None)
                 st.session_state.pop('data_last_loaded', None)
-                st.session_state.pop('duplicate_warnings', None)
+                st.session_state.pop('missing_day_type_warnings', None)
                 st.success("Fetching latest data from Firestore...")
                 time.sleep(1)
                 st.rerun()
 
-        if 'duplicate_warnings' in st.session_state and not st.session_state.duplicate_warnings.empty:
-            st.warning("⚠️ Data Integrity Warning")
-            st.write("Duplicate entries were found for the following dates and automatically cleaned (the last entry for each day was kept). Please review your source data in Firestore.")
-            st.dataframe(st.session_state.duplicate_warnings, use_container_width=True)
+        # Data Completeness Warning for missing day_type
+        if 'missing_day_type_warnings' in st.session_state and not st.session_state.missing_day_type_warnings.empty:
+            st.warning("📝 Data Completeness Note: Missing Day Type")
+            st.write("The `day_type` was missing for the following dates and has been defaulted to 'Normal Day'. This may impact forecast accuracy.")
+            st.dataframe(pd.DataFrame(st.session_state.missing_day_type_warnings).rename(columns={'date': 'Affected Date'}), use_container_width=True)
         
         st.markdown("---")
         
@@ -518,14 +529,9 @@ if db:
                     if filtered_df.empty:
                         st.info("No data for the selected period.")
                     else:
-                        # --- ROBUST RENDERING LOGIC ---
-                        # Instead of iterating through a potentially messy dataframe,
-                        # we iterate through a unique, sorted list of dates.
                         unique_dates = sorted(filtered_df['date'].unique())
                         
                         for entry_date in unique_dates:
-                            # For each unique date, get the single validated row.
-                            # The drop_duplicates in load_from_firestore ensures there's only one.
                             row_to_render = filtered_df[filtered_df['date'] == entry_date].iloc[0]
                             render_historical_record(row_to_render)
         else:
