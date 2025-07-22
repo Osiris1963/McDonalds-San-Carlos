@@ -290,12 +290,10 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     prophet_forecast = prophet_model.predict(future_dates)
     
     # --- 3. Train XGBoost on Prophet's Residuals (Base Model 2) ---
-    # Merge historical actuals with Prophet's historical fit
     df_prophet_fit = prophet_forecast[prophet_forecast['ds'] <= df_prophet['ds'].max()]
     df_residuals = pd.merge(df_prophet, df_prophet_fit[['ds', 'yhat']], on='ds')
     df_residuals['residuals'] = df_residuals['y'] - df_residuals['yhat']
     
-    # Create advanced features for the residual data
     df_train_with_target = df_train[['date', target_col]].copy()
     df_featured = create_advanced_features(df_train_with_target, target_col)
     df_featured = pd.merge(df_featured, df_residuals[['ds', 'residuals']], left_on='date', right_on='ds').drop(columns=['ds'])
@@ -306,46 +304,49 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     df_featured.dropna(inplace=True)
     X, y_res = df_featured[FEATURES], df_featured[TARGET_RESIDUAL]
 
-    if X.empty:
-        st.warning(f"XGBoost training data is empty for {target_col} after feature engineering. Skipping residual model.")
-        xgb_model_res = None
-    else:
+    xgb_model_res = None
+    if not X.empty:
         xgb_model_res = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=500, learning_rate=0.05, max_depth=5, random_state=42)
         xgb_model_res.fit(X, y_res)
+    else:
+        st.warning(f"XGBoost training data is empty for {target_col} after feature engineering. Skipping residual model.")
 
     # --- 4. Train Meta-Model (Stacking) ---
-    # Get Prophet's in-sample predictions
-    prophet_in_sample_preds = df_residuals['yhat']
-    # Get XGBoost's in-sample predictions of residuals
+    # Get XGBoost's in-sample predictions of residuals. This is already aligned with the dropped NaNs.
     xgb_in_sample_preds = pd.Series(xgb_model_res.predict(X), index=X.index) if xgb_model_res else pd.Series(0, index=X.index)
-    
-    # Create feature set for the meta-model
+
+    # Align Prophet's predictions and the actual target variable (y) with the data used for the XGBoost model.
+    aligned_dates = df_featured['date']
+    df_residuals_aligned = df_residuals[df_residuals['ds'].isin(aligned_dates)]
+
+    prophet_in_sample_preds = df_residuals_aligned['yhat']
+    y_meta = df_residuals_aligned['y']
+
+    # Create the feature set for the meta-model, ensuring all arrays have the same length.
     X_meta = pd.DataFrame({
         'prophet_pred': prophet_in_sample_preds.values,
         'xgb_residual_pred': xgb_in_sample_preds.values
     })
-    y_meta = df_residuals['y']
+
+    # Defensive reset_index to ensure perfect alignment before fitting.
+    y_meta = y_meta.reset_index(drop=True)
+    X_meta = X_meta.reset_index(drop=True)
     
     meta_model = LinearRegression()
     meta_model.fit(X_meta, y_meta)
 
     # --- 5. Generate Final Forecast ---
-    # Start with Prophet's full forecast (historical + future)
     final_forecast = prophet_forecast[['ds', 'yhat']].rename(columns={'yhat': 'prophet_pred'})
     
-    # Recursively predict residuals with XGBoost
     if xgb_model_res:
-        # Prepare the full dataframe for feature generation
         full_hist_df = df_train[['date', target_col]].copy()
         future_df_template = pd.DataFrame({'date': pd.to_datetime(final_forecast['ds'][final_forecast['ds'] > full_hist_df['date'].max()])})
         combined_df = pd.concat([full_hist_df, future_df_template], ignore_index=True)
         
-        # Generate features for the entire timeline
         combined_featured = create_advanced_features(combined_df, target_col)
         
-        # Isolate the part of the dataframe that has features for prediction
         xgb_pred_features = combined_featured[combined_featured['date'].isin(final_forecast['ds'])].copy()
-        xgb_pred_features.dropna(subset=[f'{target_col}_lag_7'], inplace=True) # Ensure lags are present
+        xgb_pred_features.dropna(subset=[f'{target_col}_lag_7'], inplace=True)
 
         if not xgb_pred_features.empty:
             X_to_predict = xgb_pred_features[FEATURES]
@@ -360,11 +361,9 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
         
     final_forecast['xgb_residual_pred'] = final_forecast['xgb_residual_pred'].fillna(0)
 
-    # Apply the meta-model to get the final forecast
     X_final_meta = final_forecast[['prophet_pred', 'xgb_residual_pred']]
     final_forecast['yhat'] = meta_model.predict(X_final_meta)
     
-    # Clip predictions at 0
     final_forecast['yhat'] = final_forecast['yhat'].clip(lower=0)
     
     return final_forecast[['ds', 'yhat']], prophet_model, xgb_model_res
