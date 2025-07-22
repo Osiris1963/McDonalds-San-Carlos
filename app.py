@@ -92,7 +92,6 @@ def apply_custom_styling():
 def init_firestore():
     try:
         if not firebase_admin._apps:
-            # Assumes secrets are set in Streamlit Cloud
             creds_dict = {
               "type": st.secrets.firebase_credentials.type,
               "project_id": st.secrets.firebase_credentials.project_id,
@@ -131,7 +130,11 @@ def initialize_state(db_client):
 def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
     docs = _db_client.collection(collection_name).stream()
-    records = [doc.to_dict() for doc in docs]
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id # Capture the document ID
+        records.append(record)
     if not records: return pd.DataFrame()
     df = pd.DataFrame(records)
     if 'date' in df.columns:
@@ -154,10 +157,13 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df
 
 def calculate_atv(df):
+    # Ensure customers column is not zero to avoid division by zero
+    df['customers'] = df['customers'].replace(0, np.nan)
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
     with np.errstate(divide='ignore', invalid='ignore'):
         atv = np.divide(df['base_sales'], df['customers'])
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
+    df['customers'] = df['customers'].fillna(0) # Restore zeros
     return df
 
 def create_advanced_features(df):
@@ -190,7 +196,7 @@ def generate_recurring_local_events(start_date, end_date):
 
 def train_prophet_model(df_train, events_df, target_col):
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
-    recurring_events = generate_recurring_local_events(df_train['date'].min(), df_train['date'].max())
+    recurring_events = generate_recurring_local_events(df_train['date'].min(), df_train['date'].max() + timedelta(days=30))
     manual_events = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_events = pd.concat([manual_events, recurring_events]).dropna(subset=['ds', 'holiday'])
 
@@ -211,21 +217,25 @@ def train_xgboost_model(df_train, target_col):
     features = [f for f in features if f in df_featured.columns and f != target_col]
     
     df_featured.dropna(subset=features, inplace=True)
-    if df_featured.empty: return None
+    if df_featured.empty: return None, None
 
     X, y = df_featured[features], df_featured[target_col]
     
     model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=500, learning_rate=0.05, max_depth=5, random_state=42)
     model.fit(X, y)
-    return model
+    return model, features
 
 def train_lstm_model(df_train, target_col, sequence_length=14):
     df_featured = create_advanced_features(df_train.copy())
-    features = ['dayofyear', 'dayofweek', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
-    features = [f for f in features if f in df_featured.columns]
+    # Define a consistent feature set for the LSTM
+    lstm_features = ['dayofyear', 'dayofweek', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
+    lstm_features = [f for f in lstm_features if f in df_featured.columns]
     
-    data = df_featured[[target_col] + features].dropna()
-    if len(data) < sequence_length + 1: return None, None
+    # The first column for the scaler must always be the target
+    cols_for_scaling = [target_col] + lstm_features
+    data = df_featured[cols_for_scaling].dropna()
+
+    if len(data) < sequence_length + 1: return None, None, None
 
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled_data = scaler.fit_transform(data)
@@ -236,7 +246,7 @@ def train_lstm_model(df_train, target_col, sequence_length=14):
         y.append(scaled_data[i + sequence_length, 0])
     X, y = np.array(X), np.array(y)
 
-    if X.shape[0] == 0: return None, None
+    if X.shape[0] == 0: return None, None, None
 
     model = Sequential([
         LSTM(units=50, return_sequences=True, input_shape=(X.shape[1], X.shape[2])),
@@ -249,10 +259,9 @@ def train_lstm_model(df_train, target_col, sequence_length=14):
     early_stopping = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
     model.fit(X, y, epochs=50, batch_size=32, verbose=0, callbacks=[early_stopping])
     
-    return model, scaler
+    return model, scaler, lstm_features
 
-def forecast_recursive(model, initial_history, periods, target_col, model_type='xgb'):
-    """Generic recursive forecasting for XGBoost and LSTM."""
+def forecast_recursive(model, initial_history, periods, target_col, model_type='xgb', features_list=None, scaler=None, sequence_length=14):
     history = initial_history.copy()
     predictions = []
 
@@ -260,58 +269,41 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
         last_date = history['date'].max()
         next_date = last_date + timedelta(days=1)
         
-        future_step_df = pd.DataFrame([{'date': next_date}])
-        extended_history = pd.concat([history, future_step_df], ignore_index=True)
+        future_step_df = pd.DataFrame([{'date': next_date, target_col: np.nan}], index=[history.index.max() + 1])
+        extended_history = pd.concat([history, future_step_df])
         extended_featured = create_advanced_features(extended_history)
         
         if model_type == 'xgb':
-            features_list = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
-            features_list = [f for f in features_list if f in extended_featured.columns and f != target_col]
             X_future = extended_featured[features_list].tail(1)
             prediction = model.predict(X_future)[0]
         
         elif model_type == 'lstm':
-            features_list = ['dayofyear', 'dayofweek', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
-            features_list = [f for f in features_list if f in extended_featured.columns]
+            cols_for_scaling = [target_col] + features_list
+            last_sequence_unscaled = extended_featured[cols_for_scaling].tail(sequence_length)
             
             # Use the scaler from training
-            scaler = model.scaler_
-            
-            # Get the last sequence from the history
-            last_sequence_unscaled = extended_featured[[target_col] + features_list].tail(model.input_shape[1] + 1)
             last_sequence_scaled = scaler.transform(last_sequence_unscaled)
+            input_seq = last_sequence_scaled.reshape(1, sequence_length, len(cols_for_scaling))
             
-            input_seq = last_sequence_scaled[:-1].reshape(1, model.input_shape[1], model.input_shape[2])
-            
-            # Predict the scaled value
             predicted_scaled = model.predict(input_seq, verbose=0)[0][0]
             
-            # Create a dummy array to inverse transform
-            dummy_for_inverse = np.zeros((1, scaler.n_features_in_))
+            dummy_for_inverse = np.zeros((1, len(cols_for_scaling)))
             dummy_for_inverse[0, 0] = predicted_scaled
             
-            # Inverse transform to get the actual value
             prediction = scaler.inverse_transform(dummy_for_inverse)[0, 0]
 
         predictions.append({'ds': next_date, 'yhat': prediction})
         
         # Update history with the new prediction for the next loop
-        new_row = extended_featured.tail(1).copy()
-        new_row.loc[new_row.index, target_col] = prediction
-        history = pd.concat([history, new_row.drop(columns=[col for col in new_row.columns if col not in history.columns], errors='ignore')], ignore_index=True)
+        history.loc[history.index.max(), target_col] = prediction
 
     return pd.DataFrame(predictions)
 
 # --- Main Stacking Ensemble Function ---
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def generate_stacked_forecast(_historical_df, _events_df, periods, target_col):
-    """
-    Trains base models (Prophet, XGBoost, LSTM) and a meta-model (Linear Regression)
-    for a sophisticated stacked ensemble forecast.
-    """
-    st.session_state.status_messages.append(f"Processing for target: **{target_col.title()}**")
+    st.session_state.status_messages.append(f"Processing target: **{target_col.title()}**")
     
-    # Use TimeSeriesSplit for robust validation
     tscv = TimeSeriesSplit(n_splits=2, test_size=periods)
     train_index, val_index = list(tscv.split(_historical_df))[-1]
     
@@ -320,95 +312,98 @@ def generate_stacked_forecast(_historical_df, _events_df, periods, target_col):
 
     meta_features = pd.DataFrame(index=df_val.index)
 
-    # 1. Prophet Model
+    # 1. Prophet
     st.session_state.status_messages.append("Training Prophet...")
     prophet_model = train_prophet_model(df_train, _events_df, target_col)
     future_val_prophet = prophet_model.make_future_dataframe(periods=len(df_val))
     forecast_val_prophet = prophet_model.predict(future_val_prophet)
     meta_features['prophet_preds'] = forecast_val_prophet['yhat'].tail(len(df_val)).values
     
-    # 2. XGBoost Model
+    # 2. XGBoost
     st.session_state.status_messages.append("Training XGBoost...")
-    xgb_model = train_xgboost_model(df_train, target_col)
+    xgb_model, xgb_features = train_xgboost_model(df_train, target_col)
     if xgb_model:
         df_val_featured = create_advanced_features(pd.concat([df_train, df_val]))
-        features = [f for f in xgb_model.get_booster().feature_names if f in df_val_featured.columns]
-        X_val = df_val_featured[features].tail(len(df_val))
+        X_val = df_val_featured[xgb_features].tail(len(df_val))
         meta_features['xgb_preds'] = xgb_model.predict(X_val)
     else:
-        meta_features['xgb_preds'] = 0 # Fallback
+        meta_features['xgb_preds'] = 0
 
-    # 3. LSTM Model
-    st.session_state.status_messages.append("Training LSTM Deep Learning model...")
-    lstm_model, lstm_scaler = train_lstm_model(df_train, target_col)
+    # 3. LSTM
+    st.session_state.status_messages.append("Training LSTM...")
+    lstm_model, lstm_scaler, lstm_features = train_lstm_model(df_train, target_col)
     if lstm_model:
-        lstm_model.scaler_ = lstm_scaler # Attach scaler for recursive forecast
+        cols_for_scaling = [target_col] + lstm_features
+        full_data_for_scaling = create_advanced_features(_historical_df)[cols_for_scaling].dropna()
         
-        # Create validation sequences
-        full_data_scaled = lstm_scaler.transform(create_advanced_features(_historical_df)[[target_col] + [f for f in features if f in _historical_df.columns]].dropna())
-        X_val_lstm = []
-        for i in range(len(df_train) - lstm_model.input_shape[1], len(_historical_df) - lstm_model.input_shape[1]):
-            X_val_lstm.append(full_data_scaled[i:i + lstm_model.input_shape[1]])
-        X_val_lstm = np.array(X_val_lstm)
-        
-        if X_val_lstm.shape[0] > 0:
-            preds_scaled = lstm_model.predict(X_val_lstm, verbose=0)
-            dummy_for_inverse = np.zeros((len(preds_scaled), lstm_scaler.n_features_in_))
-            dummy_for_inverse[:, 0] = preds_scaled.flatten()
-            meta_features['lstm_preds'] = lstm_scaler.inverse_transform(dummy_for_inverse)[:, 0]
+        if not full_data_for_scaling.empty:
+            full_data_scaled = lstm_scaler.transform(full_data_for_scaling)
+            
+            X_val_lstm = []
+            start_index = len(df_train) - lstm_model.input_shape[1]
+            end_index = len(full_data_for_scaling) - lstm_model.input_shape[1]
+            
+            for i in range(start_index, end_index):
+                 if i >= 0:
+                    X_val_lstm.append(full_data_scaled[i:i + lstm_model.input_shape[1]])
+
+            if X_val_lstm:
+                X_val_lstm = np.array(X_val_lstm)
+                preds_scaled = lstm_model.predict(X_val_lstm, verbose=0)
+                dummy = np.zeros((len(preds_scaled), len(cols_for_scaling)))
+                dummy[:, 0] = preds_scaled.flatten()
+                meta_features['lstm_preds'] = lstm_scaler.inverse_transform(dummy)[:, 0]
+            else:
+                 meta_features['lstm_preds'] = 0
         else:
             meta_features['lstm_preds'] = 0
     else:
-        meta_features['lstm_preds'] = 0 # Fallback
+        meta_features['lstm_preds'] = 0
 
     # 4. Train Meta-Model
-    st.session_state.status_messages.append("Training Meta-Model (Stacking)...")
+    st.session_state.status_messages.append("Training Meta-Model...")
     meta_model = LinearRegression()
     y_val = df_val[target_col]
     meta_model.fit(meta_features.fillna(0), y_val)
 
-    # 5. Final Forecast Generation
-    st.session_state.status_messages.append("Generating final blended forecast...")
-    
-    # Retrain base models on ALL data
+    # 5. Final Forecast
+    st.session_state.status_messages.append("Generating final forecast...")
     final_prophet_model = train_prophet_model(_historical_df, _events_df, target_col)
-    final_xgb_model = train_xgboost_model(_historical_df, target_col)
-    final_lstm_model, final_lstm_scaler = train_lstm_model(_historical_df, target_col)
+    final_xgb_model, final_xgb_features = train_xgboost_model(_historical_df, target_col)
+    final_lstm_model, final_lstm_scaler, final_lstm_features = train_lstm_model(_historical_df, target_col)
     
-    # Generate future predictions from each base model
     future_df = final_prophet_model.make_future_dataframe(periods=periods)
     prophet_future_preds = final_prophet_model.predict(future_df)['yhat'].tail(periods)
 
     xgb_future_preds = pd.Series(dtype='float64')
     if final_xgb_model:
-        xgb_future_preds = forecast_recursive(final_xgb_model, _historical_df, periods, target_col, model_type='xgb')['yhat']
+        xgb_future_preds = forecast_recursive(final_xgb_model, _historical_df, periods, target_col, model_type='xgb', features_list=final_xgb_features)
     
     lstm_future_preds = pd.Series(dtype='float64')
     if final_lstm_model:
-        final_lstm_model.scaler_ = final_lstm_scaler
-        lstm_future_preds = forecast_recursive(final_lstm_model, _historical_df, periods, target_col, model_type='lstm')['yhat']
+        lstm_future_preds = forecast_recursive(final_lstm_model, _historical_df, periods, target_col, model_type='lstm', features_list=final_lstm_features, scaler=final_lstm_scaler)
 
-    # Combine into a meta-feature DataFrame for the future
     future_meta_features = pd.DataFrame({
         'prophet_preds': prophet_future_preds.values,
         'xgb_preds': xgb_future_preds.values if not xgb_future_preds.empty else 0,
         'lstm_preds': lstm_future_preds.values if not lstm_future_preds.empty else 0
     })
 
-    # Get final stacked prediction
     final_predictions = meta_model.predict(future_meta_features.fillna(0))
     
-    forecast_df = pd.DataFrame({
-        'ds': future_df['ds'].tail(periods),
-        'yhat': final_predictions
-    })
-
-    # For breakdown chart, use the Prophet model's components
-    prophet_components_model = train_prophet_model(_historical_df, _events_df, target_col)
-    full_future = prophet_components_model.make_future_dataframe(periods=periods)
-    forecast_components = prophet_components_model.predict(full_future)
+    forecast_df = pd.DataFrame({'ds': future_df['ds'].tail(periods), 'yhat': final_predictions})
+    forecast_components = final_prophet_model.predict(future_df)
     
     return forecast_df, forecast_components
+
+# --- Firestore Data I/O ---
+def update_historical_record_in_firestore(db_client, doc_id, data):
+    if db_client is None: return
+    db_client.collection('historical_data').document(doc_id).update(data)
+
+def delete_from_firestore(db_client, collection_name, doc_id):
+    if db_client is None: return
+    db_client.collection(collection_name).document(doc_id).delete()
 
 # --- Plotting & UI Functions ---
 def plot_forecast_chart(df, title):
@@ -430,10 +425,8 @@ def plot_forecast_breakdown(components, selected_date):
     
     effects = {'Day of Week': 'weekly', 'Time of Year': 'yearly', 'Holidays/Events': 'holidays'}
     for name, key in effects.items():
-        if key in day_data and pd.notna(day_data[key]):
-            x_data.append(name)
-            y_data.append(day_data[key])
-            measure_data.append('relative')
+        if key in day_data and pd.notna(day_data[key]) and day_data[key] != 0:
+            x_data.append(name); y_data.append(day_data[key]); measure_data.append('relative')
             
     x_data.append('Final Forecast'); y_data.append(day_data['yhat']); measure_data.append('total')
     
@@ -445,6 +438,34 @@ def plot_forecast_breakdown(components, selected_date):
     ))
     fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A, %B %d')}", showlegend=False, paper_bgcolor='#2a2a2a', plot_bgcolor='#2a2a2a', font_color='white')
     return fig, day_data
+
+def render_historical_record(row, db_client):
+    date_str = row['date'].strftime('%B %d, %Y')
+    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    
+    with st.expander(expander_title):
+        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
+        
+        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+            st.markdown("**Edit Record**")
+            edit_cols = st.columns(3)
+            updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), format="%.2f", key=f"sales_{row['doc_id']}")
+            updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
+            updated_addons = edit_cols[2].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
+            
+            btn_cols = st.columns(2)
+            if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
+                update_data = {'sales': updated_sales, 'customers': updated_customers, 'add_on_sales': updated_addons}
+                update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
+                st.success(f"Record for {date_str} updated!")
+                st.cache_data.clear()
+                time.sleep(1); st.rerun()
+
+            if btn_cols[1].form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
+                delete_from_firestore(db_client, 'historical_data', row['doc_id'])
+                st.warning(f"Record for {date_str} deleted.")
+                st.cache_data.clear()
+                time.sleep(1); st.rerun()
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -461,18 +482,16 @@ if db:
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
-            st.success("Cache cleared. Rerunning...")
-            time.sleep(1)
-            st.rerun()
+            st.success("Cache cleared. Rerunning..."); time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", use_container_width=True):
-            if len(st.session_state.historical_df) < 90: # Need more data for LSTM
+            if len(st.session_state.historical_df) < 90:
                 st.error("Please provide at least 90 days of data for reliable forecasting.")
             else:
                 st.session_state.status_messages = []
                 status_placeholder = st.empty()
-
                 with st.spinner("🧠 Initializing Advanced AI Forecast..."):
+                    status_text = st.empty()
                     base_df = st.session_state.historical_df.copy()
                     base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                     cleaned_df = remove_outliers_iqr(base_df, column='base_sales')
@@ -481,35 +500,30 @@ if db:
                     
                     FORECAST_HORIZON = 15
                     
-                    # --- Customer Forecast ---
-                    status_placeholder.text("Running Customer Forecast...")
+                    status_text.text("Running Customer Forecast...")
                     cust_f, cust_components = generate_stacked_forecast(hist_df_with_atv.copy(), ev_df, FORECAST_HORIZON, 'customers')
                     
-                    # --- ATV Forecast ---
-                    status_placeholder.text("Running Average Transaction Forecast...")
+                    status_text.text("Running Average Transaction Forecast...")
                     atv_f, _ = generate_stacked_forecast(hist_df_with_atv.copy(), ev_df, FORECAST_HORIZON, 'atv')
                     
-                    status_placeholder.text("Combining forecasts...")
+                    status_text.text("Combining forecasts...")
                     if not cust_f.empty and not atv_f.empty:
                         combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                         combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
-                        
                         st.session_state.forecast_df = combo_f
                         st.session_state.forecast_components = cust_components
-                        
                         st.success("Advanced AI forecast generated successfully!")
                     else:
                         st.error("Forecast generation failed.")
-                status_placeholder.empty()
+                status_text.empty()
 
         st.markdown("---")
         st.download_button("📥 Download Forecast", st.session_state.forecast_df.to_csv(index=False), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
         st.download_button("📥 Download Historical", st.session_state.historical_df.to_csv(index=False), "historical_data.csv", "text/csv", use_container_width=True)
 
-    # --- Main Content Tabs ---
-    tabs = st.tabs(["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Add/Edit Data"])
+    tabs = st.tabs(["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Add/Edit Data", "📜 Historical Data"])
 
-    with tabs[0]:
+    with tabs[0]: # Forecast Dashboard
         if not st.session_state.forecast_df.empty:
             today = pd.to_datetime('today').normalize()
             future_forecast_df = st.session_state.forecast_df[st.session_state.forecast_df['ds'] >= today].copy()
@@ -520,15 +534,14 @@ if db:
                 display_df = future_forecast_df.rename(columns=disp_cols)[list(disp_cols.values())]
                 st.markdown("#### Forecasted Values")
                 st.dataframe(display_df.set_index('Date').style.format({'Predicted Customers':'{:,.0f}', 'Predicted Avg Sale (₱)':'₱{:,.2f}', 'Predicted Sales (₱)':'₱{:,.2f}'}), use_container_width=True, height=560)
-                
                 st.markdown("#### Forecast Visualization")
                 fig = plot_forecast_chart(future_forecast_df, '15-Day Sales & Customer Forecast')
                 st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Click the 'Generate Forecast' button in the sidebar to begin.")
+            st.info("Click the 'Generate Forecast' button to begin.")
 
-    with tabs[1]:
-        st.info("The breakdown below is generated by the Prophet model component, showing the main drivers of the customer forecast.")
+    with tabs[1]: # Forecast Insights
+        st.info("The breakdown below is from the Prophet model, showing the main drivers of the customer forecast.")
         if st.session_state.forecast_components.empty:
             st.info("Generate a forecast first to see insights.")
         else:
@@ -537,32 +550,47 @@ if db:
                 future_components['date_str'] = future_components['ds'].dt.strftime('%A, %B %d, %Y')
                 selected_date_str = st.selectbox("Select a day to analyze:", options=future_components['date_str'])
                 selected_date = future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0]
-                
                 breakdown_fig, _ = plot_forecast_breakdown(st.session_state.forecast_components, selected_date)
                 st.plotly_chart(breakdown_fig, use_container_width=True)
             else:
                 st.warning("No future dates available in the forecast to analyze.")
 
-    with tabs[2]:
+    with tabs[2]: # Add/Edit Data
         st.subheader("✍️ Add New Daily Record")
         with st.form("new_record_form", clear_on_submit=True, border=True):
             new_date = st.date_input("Date", date.today())
             new_sales = st.number_input("Total Sales (₱)", min_value=0.0, format="%.2f")
             new_customers = st.number_input("Customer Count", min_value=0)
             new_addons = st.number_input("Add-on Sales (₱)", min_value=0.0, format="%.2f")
-            
             if st.form_submit_button("✅ Save Record"):
-                new_rec = {
-                    "date": pd.to_datetime(new_date),
-                    "sales": new_sales,
-                    "customers": new_customers,
-                    "add_on_sales": new_addons
-                }
+                new_rec = {"date": pd.to_datetime(new_date), "sales": new_sales, "customers": new_customers, "add_on_sales": new_addons}
                 db.collection('historical_data').add(new_rec)
                 st.cache_data.clear()
-                st.success("Record added! Refresh data to include it in the next forecast.")
-                time.sleep(1)
-                st.rerun()
+                st.success("Record added! Refresh data to see changes."); time.sleep(1); st.rerun()
+    
+    with tabs[3]: # Historical Data
+        st.subheader("View & Edit Historical Data")
+        df = st.session_state.historical_df.copy()
+        if not df.empty and 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df.dropna(subset=['date'], inplace=True)
+            all_years = sorted(df['date'].dt.year.unique(), reverse=True)
+            if all_years:
+                filter_cols = st.columns(2)
+                selected_year = filter_cols[0].selectbox("Select Year:", options=all_years)
+                df_year = df[df['date'].dt.year == selected_year]
+                all_months = sorted(df_year['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
+                if all_months:
+                    selected_month_str = filter_cols[1].selectbox("Select Month:", options=all_months)
+                    selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
+                    filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].sort_values('date', ascending=False)
+                    if not filtered_df.empty:
+                        for _, row in filtered_df.iterrows():
+                            render_historical_record(row, db)
+                    else: st.info("No data for the selected month and year.")
+                else: st.info(f"No data available for the year {selected_year}.")
+            else: st.info("No historical data to display.")
+        else: st.info("No historical data available.")
 
 else:
     st.error("Failed to connect to the database. Please check your Firestore credentials in Streamlit Secrets.")
