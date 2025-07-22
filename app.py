@@ -269,9 +269,12 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
         last_date = history['date'].max()
         next_date = last_date + timedelta(days=1)
         
-        future_step_df = pd.DataFrame([{'date': next_date, target_col: np.nan}], index=[history.index.max() + 1])
-        extended_history = pd.concat([history, future_step_df])
-        extended_featured = create_advanced_features(extended_history)
+        # Use concat instead of append for creating the new row
+        future_step_df = pd.DataFrame([{'date': next_date, target_col: np.nan}])
+        history = pd.concat([history, future_step_df], ignore_index=True)
+        
+        # Re-create features for the updated history
+        extended_featured = create_advanced_features(history)
         
         if model_type == 'xgb':
             X_future = extended_featured[features_list].tail(1)
@@ -281,7 +284,6 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
             cols_for_scaling = [target_col] + features_list
             last_sequence_unscaled = extended_featured[cols_for_scaling].tail(sequence_length)
             
-            # Use the scaler from training
             last_sequence_scaled = scaler.transform(last_sequence_unscaled)
             input_seq = last_sequence_scaled.reshape(1, sequence_length, len(cols_for_scaling))
             
@@ -294,7 +296,7 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
 
         predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Update history with the new prediction for the next loop
+        # Update the last row of history with the new prediction
         history.loc[history.index.max(), target_col] = prediction
 
     return pd.DataFrame(predictions)
@@ -334,27 +336,22 @@ def generate_stacked_forecast(_historical_df, _events_df, periods, target_col):
     lstm_model, lstm_scaler, lstm_features = train_lstm_model(df_train, target_col)
     if lstm_model:
         cols_for_scaling = [target_col] + lstm_features
-        full_data_for_scaling = create_advanced_features(_historical_df)[cols_for_scaling].dropna()
+        full_featured_df = create_advanced_features(_historical_df)
+        data_for_scaling = full_featured_df[cols_for_scaling].dropna()
+        scaled_data = lstm_scaler.transform(data_for_scaling)
         
-        if not full_data_for_scaling.empty:
-            full_data_scaled = lstm_scaler.transform(full_data_for_scaling)
-            
-            X_val_lstm = []
-            start_index = len(df_train) - lstm_model.input_shape[1]
-            end_index = len(full_data_for_scaling) - lstm_model.input_shape[1]
-            
-            for i in range(start_index, end_index):
-                 if i >= 0:
-                    X_val_lstm.append(full_data_scaled[i:i + lstm_model.input_shape[1]])
+        X_full = []
+        for i in range(len(scaled_data) - lstm_model.input_shape[1]):
+            X_full.append(scaled_data[i:i + lstm_model.input_shape[1]])
+        X_full = np.array(X_full)
 
-            if X_val_lstm:
-                X_val_lstm = np.array(X_val_lstm)
-                preds_scaled = lstm_model.predict(X_val_lstm, verbose=0)
-                dummy = np.zeros((len(preds_scaled), len(cols_for_scaling)))
-                dummy[:, 0] = preds_scaled.flatten()
-                meta_features['lstm_preds'] = lstm_scaler.inverse_transform(dummy)[:, 0]
-            else:
-                 meta_features['lstm_preds'] = 0
+        if len(X_full) >= len(df_val):
+            X_val_lstm = X_full[-len(df_val):]
+            preds_scaled = lstm_model.predict(X_val_lstm, verbose=0)
+            dummy = np.zeros((len(preds_scaled), len(cols_for_scaling)))
+            dummy[:, 0] = preds_scaled.flatten()
+            lstm_predictions = lstm_scaler.inverse_transform(dummy)[:, 0]
+            meta_features['lstm_preds'] = lstm_predictions
         else:
             meta_features['lstm_preds'] = 0
     else:
@@ -440,7 +437,7 @@ def plot_forecast_breakdown(components, selected_date):
     return fig, day_data
 
 def render_historical_record(row, db_client):
-    date_str = row['date'].strftime('%B %d, %Y')
+    date_str = pd.to_datetime(row['date']).strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     
     with st.expander(expander_title):
