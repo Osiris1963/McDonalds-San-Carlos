@@ -374,17 +374,20 @@ def generate_stacked_forecast(_historical_df, _events_df, periods, target_col):
 
     xgb_future_preds = pd.Series(dtype='float64')
     if final_xgb_model:
-        xgb_future_preds = forecast_recursive(final_xgb_model, _historical_df, periods, target_col, model_type='xgb', features_list=final_xgb_features)
+        xgb_future_preds = forecast_recursive(final_xgb_model, _historical_df, periods, target_col, model_type='xgb', features_list=final_xgb_features)['yhat']
     
     lstm_future_preds = pd.Series(dtype='float64')
     if final_lstm_model:
-        lstm_future_preds = forecast_recursive(final_lstm_model, _historical_df, periods, target_col, model_type='lstm', features_list=final_lstm_features, scaler=final_lstm_scaler)
+        lstm_future_preds = forecast_recursive(final_lstm_model, _historical_df, periods, target_col, model_type='lstm', features_list=final_lstm_features, scaler=final_lstm_scaler)['yhat']
 
     future_meta_features = pd.DataFrame({
         'prophet_preds': prophet_future_preds.values,
-        'xgb_preds': xgb_future_preds.values if not xgb_future_preds.empty else 0,
-        'lstm_preds': lstm_future_preds.values if not lstm_future_preds.empty else 0
+        'xgb_preds': xgb_future_preds.values if not xgb_future_preds.empty else np.nan,
+        'lstm_preds': lstm_future_preds.values if not lstm_future_preds.empty else np.nan
     })
+
+    # Fill NaN with the mean of the other predictions for robustness
+    future_meta_features = future_meta_features.apply(lambda x: x.fillna(x.mean()), axis=1)
 
     final_predictions = meta_model.predict(future_meta_features.fillna(0))
     
