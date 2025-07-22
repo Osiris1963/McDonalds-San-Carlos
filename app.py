@@ -140,12 +140,12 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(events)
 
-# --- NEW: Component-Based Forecasting Engine ---
+# --- RE-ARCHITECTED: Component-Based Forecasting Engine ---
 @st.cache_resource(show_spinner="Generating component-based forecast...")
 def generate_component_forecast(_historical_df, _events_df, periods, target_col):
     df = _historical_df.copy()
-    if df.empty or len(df) < 365:
-        st.error(f"Not enough data for {target_col}. Need at least one full year of historical data.")
+    if df.empty or len(df) < 90: # Reduced data requirement
+        st.error(f"Not enough data for {target_col}. Need at least 90 days of historical data.")
         return pd.DataFrame(), pd.DataFrame()
 
     # --- 1. Create Future DataFrame ---
@@ -153,41 +153,34 @@ def generate_component_forecast(_historical_df, _events_df, periods, target_col)
     future_dates = pd.to_datetime([last_date + timedelta(days=i) for i in range(1, periods + 1)])
     future_df = pd.DataFrame({'date': future_dates})
 
-    # --- 2. Component: Last Year's Performance (Baseline) ---
-    df_with_last_year = df.copy()
-    df_with_last_year['last_year_date'] = df_with_last_year['date'] - pd.DateOffset(years=1)
-    # Merge with itself to find last year's data
-    merged = pd.merge(df_with_last_year, df[['date', target_col]], left_on='last_year_date', right_on='date', suffixes=('', '_last_year'), how='left')
-    future_df['last_year_date'] = future_df['date'] - pd.DateOffset(years=1)
-    future_merged = pd.merge(future_df, df[['date', target_col]], left_on='last_year_date', right_on='date', suffixes=('', '_last_year'), how='left')
-    
-    baseline_col = f'{target_col}_last_year'
-    future_merged[baseline_col] = future_merged[baseline_col].ffill().bfill() # Fill missing last year data
-    future_merged.rename(columns={baseline_col: 'baseline'}, inplace=True)
-    
-    # --- 3. Component: Year-over-Year Trend ---
-    today = pd.to_datetime(date.today())
-    last_90_days = df[(df['date'] > today - timedelta(days=90)) & (df['date'] <= today)]
-    prev_year_last_90_days = merged[(merged['date'] > today - timedelta(days=90)) & (merged['date'] <= today)]
-    
-    if not last_90_days.empty and not prev_year_last_90_days.empty:
-        yoy_trend_factor = last_90_days[target_col].mean() / prev_year_last_90_days[f'{target_col}_last_year'].mean()
-        yoy_trend_factor = max(0.8, min(1.2, yoy_trend_factor)) # Cap trend factor to be realistic
-    else:
-        yoy_trend_factor = 1.0 # Default to no trend if not enough data
-    
-    future_merged['trend_factor'] = yoy_trend_factor
+    # --- 2. Component: Trend Baseline (from Prophet) ---
+    prophet_df = df[['date', target_col]].rename(columns={'date': 'ds', target_col: 'y'})
+    all_events = pd.concat([generate_recurring_local_events(df['date'].min(), future_df['date'].max()), _events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})])
 
-    # --- 4. Component: Day-of-Week Power ---
+    # Model for trend and holidays
+    m_trend = Prophet(holidays=all_events, seasonality_mode='multiplicative')
+    m_trend.add_country_holidays(country_name='PH')
+    m_trend.fit(prophet_df)
+    
+    full_forecast = m_trend.predict(future_df[['date']].rename(columns={'date':'ds'}))
+    future_merged = pd.merge(future_df, full_forecast[['ds', 'trend', 'holidays']], left_on='date', right_on='ds', how='left')
+    future_merged.rename(columns={'trend': 'baseline'}, inplace=True)
+
+    # --- 3. Component: Day-of-Week Power ---
+    today = pd.to_datetime(date.today())
     df['dayofweek'] = df['date'].dt.dayofweek
     recent_df = df[df['date'] > today - timedelta(days=28)] # Use last 4 weeks
-    overall_mean = recent_df[target_col].mean()
-    dow_factors = recent_df.groupby('dayofweek')[target_col].mean() / overall_mean
     
+    if not recent_df.empty:
+        overall_mean = recent_df[target_col].mean()
+        dow_factors = recent_df.groupby('dayofweek')[target_col].mean() / overall_mean
+    else: # Fallback if no recent data
+        dow_factors = df.groupby('dayofweek')[target_col].mean() / df[target_col].mean()
+
     future_merged['dayofweek'] = future_merged['date'].dt.dayofweek
     future_merged['dow_factor'] = future_merged['dayofweek'].map(dow_factors).fillna(1.0)
     
-    # --- 5. Component: Weather Impact ---
+    # --- 4. Component: Weather Impact ---
     weather_df = get_weather_forecast(periods)
     if weather_df is not None:
         future_merged = pd.merge(future_merged, weather_df, on='date', how='left')
@@ -198,27 +191,17 @@ def generate_component_forecast(_historical_df, _events_df, periods, target_col)
     else:
         future_merged['weather_factor'] = 1.0
 
-    # --- 6. Component: Holiday & Event Impact (using Prophet) ---
-    prophet_df = df[['date', target_col]].rename(columns={'date': 'ds', target_col: 'y'})
-    all_events = pd.concat([generate_recurring_local_events(df['date'].min(), future_df['date'].max()), _events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})])
+    # --- 5. Combine Components for Final Forecast ---
+    future_merged['holiday_factor'] = future_merged['holidays'].fillna(0) + 1 # Convert additive to multiplicative factor
 
-    m_holidays = Prophet(holidays=all_events, seasonality_mode='multiplicative')
-    m_holidays.add_country_holidays(country_name='PH')
-    m_holidays.fit(prophet_df)
-    
-    holiday_forecast = m_holidays.predict(future_merged[['date']].rename(columns={'date':'ds'}))
-    future_merged['holiday_factor'] = holiday_forecast['holidays'].fillna(0) + 1 # Convert additive to multiplicative factor
-
-    # --- 7. Combine Components for Final Forecast ---
-    future_merged['yhat'] = future_merged['baseline'] * future_merged['trend_factor'] * future_merged['dow_factor'] * future_merged['weather_factor'] * future_merged['holiday_factor']
+    future_merged['yhat'] = future_merged['baseline'] * future_merged['dow_factor'] * future_merged['weather_factor'] * future_merged['holiday_factor']
     future_merged['yhat'] = future_merged['yhat'].clip(lower=0)
 
     # Prepare components for breakdown plot
     components = future_merged[['date', 'baseline']].rename(columns={'date':'ds'})
-    components['trend'] = (future_merged['trend_factor'] - 1) * future_merged['baseline']
-    components['day_of_week'] = (future_merged['dow_factor'] - 1) * (future_merged['baseline'] + components['trend'])
-    components['weather'] = (future_merged['weather_factor'] - 1) * (future_merged['baseline'] + components['trend'] + components['day_of_week'])
-    components['holidays'] = (future_merged['holiday_factor'] - 1) * (future_merged['baseline'] + components['trend'] + components['day_of_week'] + components['weather'])
+    components['day_of_week'] = (future_merged['dow_factor'] - 1) * future_merged['baseline']
+    components['weather'] = (future_merged['weather_factor'] - 1) * (future_merged['baseline'] + components['day_of_week'])
+    components['holidays'] = (future_merged['holiday_factor'] - 1) * (future_merged['baseline'] + components['day_of_week'] + components['weather'])
     components['yhat'] = future_merged['yhat']
 
     return future_merged[['date', 'yhat']].rename(columns={'date':'ds'}), components
@@ -242,9 +225,9 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
 
 def plot_forecast_breakdown(components,selected_date):
     day_data=components[components['ds']==selected_date].iloc[0]
-    x_data = ['Last Year\'s Baseline', 'YoY Trend', 'Day of Week Power', 'Weather Impact', 'Holidays/Events', 'Final Forecast']
-    y_data = [day_data.get('baseline', 0), day_data.get('trend', 0), day_data.get('day_of_week', 0), day_data.get('weather', 0), day_data.get('holidays', 0), day_data.get('yhat', 0)]
-    measure_data = ["absolute", "relative", "relative", "relative", "relative", "total"]
+    x_data = ['Seasonally-Adjusted Trend', 'Day of Week Power', 'Weather Impact', 'Holidays/Events', 'Final Forecast']
+    y_data = [day_data.get('baseline', 0), day_data.get('day_of_week', 0), day_data.get('weather', 0), day_data.get('holidays', 0), day_data.get('yhat', 0)]
+    measure_data = ["absolute", "relative", "relative", "relative", "total"]
     
     fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"₱{v:,.0f}" if i != len(y_data)-1 else f"₱{v:,.0f}" for i, v in enumerate(y_data)],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}))
     fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A, %B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white')
@@ -268,8 +251,8 @@ if db:
             st.cache_data.clear(); st.success("Cache cleared."); time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", use_container_width=True):
-            if len(st.session_state.historical_df) < 370:
-                st.error("Please provide at least 370 days of data for reliable year-over-year forecasting.")
+            if len(st.session_state.historical_df) < 90:
+                st.error("Please provide at least 90 days of data for reliable forecasting.")
             else:
                 with st.spinner("🧠 Engineering Forecast Components..."):
                     hist_df = st.session_state.historical_df.copy()
