@@ -285,23 +285,18 @@ def create_advanced_features(df):
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
 
-    df = df.sort_values('date')
+    df = df.sort_values('date').reset_index(drop=True)
     
-    # Lag features
+    # Only create lag/rolling features if the source column exists
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
-    if 'customers' in df.columns:
-        df['customers_lag_7'] = df['customers'].shift(7)
-    if 'atv' in df.columns:
-        df['atv_lag_7'] = df['atv'].shift(7)
-
-    # Rolling window features
-    if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
     if 'customers' in df.columns:
+        df['customers_lag_7'] = df['customers'].shift(7)
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
     if 'atv' in df.columns:
+        df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
         
@@ -353,7 +348,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
     
-    # Return both the full forecast and the model object
     return forecast, prophet_model
 
 
@@ -361,33 +355,25 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, periods, target_col):
     """
     Trains an XGBoost model using a direct multi-step forecasting strategy.
-    This function trains a separate model for each future day to predict.
-    It also uses the Prophet forecast as a feature (stacking).
+    This version correctly creates features for each future day.
     """
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty:
         return pd.DataFrame()
 
-    # --- Part 1: Feature Engineering & Stacking ---
+    # --- Part 1: Feature Engineering for Training Data ---
     df_featured = create_advanced_features(df_train.copy())
     
-    # STACKING: Merge Prophet's forecast as a feature
     prophet_trend = prophet_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
     df_featured = pd.merge(df_featured, prophet_trend, on='date', how='left')
 
-    if 'day_type' in df_featured.columns:
-        df_featured['is_not_normal_day'] = (df_featured['day_type'] == 'Not Normal Day').astype(int)
-    else:
-        df_featured['is_not_normal_day'] = 0
+    df_featured['is_not_normal_day'] = (df_featured['day_type'] == 'Not Normal Day').astype(int) if 'day_type' in df_featured.columns else 0
 
-    # --- Part 2: Create Targets for Direct Forecasting ---
-    # For each day `i` we want to forecast, create a target column `target_i`
-    # which is the actual value `i` days in the future.
+    # --- Part 2: Create Shifted Targets for Direct Forecasting ---
     for i in range(1, periods + 1):
         df_featured[f'target_{i}'] = df_featured[target_col].shift(-i)
 
-    # Define features to be used
     base_features = ['dayofweek', 'month', 'year', 'dayofyear', 'weekofyear', 'is_not_normal_day', 'prophet_trend']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7']
@@ -398,54 +384,63 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
     
     features = [f for f in features if f in df_featured.columns]
     
-    # --- Part 3: Train One Model Per Forecast Horizon ---
+    # --- Part 3: Train One Model Per Horizon ---
     models = {}
     for i in range(1, periods + 1):
         target_i = f'target_{i}'
-        
-        # Prepare data for this specific horizon
         df_horizon = df_featured.dropna(subset=[target_i] + features)
-        X = df_horizon[features]
-        y = df_horizon[target_i]
+        X, y = df_horizon[features], df_horizon[target_i]
         
         if X.empty: continue
-
-        # Train model for horizon `i`
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
         model.fit(X, y)
         models[i] = model
 
-    # --- Part 4: Generate Future Forecast ---
-    # Get the last row of data to use as the feature set for prediction
-    X_last = df_featured[features].tail(1)
-    
-    future_predictions = []
-    last_date = df_train['date'].max()
+    # --- Part 4: Create Future DataFrame and Features ---
+    last_historical_date = df_featured['date'].max()
+    future_dates = pd.to_datetime([last_historical_date + timedelta(days=i) for i in range(1, periods + 1)])
+    future_df = pd.DataFrame({'date': future_dates})
 
-    for i in range(1, periods + 1):
-        future_date = last_date + timedelta(days=i)
-        if i in models:
-            prediction = models[i].predict(X_last)[0]
-            future_predictions.append({'ds': future_date, 'yhat': prediction})
+    # Create time-based features for the future
+    future_df = create_advanced_features(future_df.copy())
+    
+    # Get last known values for lag/rolling features
+    last_known_features = df_featured.tail(1)
+    
+    # Forward-fill lag and rolling features
+    lag_rolling_cols = [f for f in features if 'lag' in f or 'rolling' in f]
+    for col in lag_rolling_cols:
+        future_df[col] = last_known_features[col].iloc[0]
+
+    # Merge future Prophet trend and other static features
+    future_prophet_trend = prophet_forecast_df[prophet_forecast_df['ds'] > last_historical_date][['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
+    future_df = pd.merge(future_df, future_prophet_trend, on='date', how='left')
+    future_df['prophet_trend'].fillna(method='ffill', inplace=True)
+    future_df['is_not_normal_day'] = 0 # Assume future days are normal unless specified
+
+    # --- Part 5: Predict Step-by-Step with Correct Features ---
+    future_predictions = []
+    for i, row in future_df.iterrows():
+        horizon = i + 1
+        if horizon in models:
+            model = models[horizon]
+            # Ensure feature order matches training
+            X_future_step = row[model.get_booster().feature_names].to_frame().T
+            prediction = model.predict(X_future_step)[0]
+            future_predictions.append({'ds': row['date'], 'yhat': prediction})
 
     future_forecast_df = pd.DataFrame(future_predictions)
 
-    # --- Part 5: Generate In-Sample Forecast for Diagnostics ---
-    # Use the 1-day-ahead model to predict on historical data
+    # Generate in-sample forecast for diagnostics using the 1-day-ahead model
     if 1 in models:
         df_featured_hist = df_featured.dropna(subset=features)
         historical_predictions = models[1].predict(df_featured_hist[features])
-        historical_forecast_df = pd.DataFrame({
-            'ds': df_featured_hist['date'],
-            'yhat': historical_predictions
-        })
+        historical_forecast_df = pd.DataFrame({'ds': df_featured_hist['date'], 'yhat': historical_predictions})
     else:
         historical_forecast_df = pd.DataFrame()
         
-    # Combine historical fit with future forecast
-    full_forecast_df = pd.concat([historical_forecast_df, future_forecast_df], ignore_index=True)
-    
-    return full_forecast_df
+    return pd.concat([historical_forecast_df, future_forecast_df], ignore_index=True)
+
 
 # --- Plotting Functions & Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data, historical_df):
@@ -838,8 +833,7 @@ if db:
                             if not prophet_cust_f_full.empty:
                                 xgb_cust_f = train_and_forecast_xgboost_direct(hist_df_with_atv, prophet_cust_f_full, FORECAST_HORIZON, 'customers')
                                 
-                                # Merge and apply weighted average
-                                cust_f = pd.merge(prophet_cust_f_full[['ds', 'yhat']], xgb_cust_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                cust_f = pd.merge(prophet_cust_f_full[['ds', 'yhat']], xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
                                 cust_f['yhat'] = (cust_f['yhat_prophet'] * PROPHET_WEIGHT) + (cust_f['yhat_xgb'] * XGB_WEIGHT)
                             else:
                                 st.error("Prophet customer forecast failed. Aborting.")
@@ -852,8 +846,7 @@ if db:
                             if not prophet_atv_f_full.empty:
                                 xgb_atv_f = train_and_forecast_xgboost_direct(hist_df_with_atv, prophet_atv_f_full, FORECAST_HORIZON, 'atv')
 
-                                # Merge and apply weighted average
-                                atv_f = pd.merge(prophet_atv_f_full[['ds', 'yhat']], xgb_atv_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                atv_f = pd.merge(prophet_atv_f_full[['ds', 'yhat']], xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
                                 atv_f['yhat'] = (atv_f['yhat_prophet'] * PROPHET_WEIGHT) + (atv_f['yhat_xgb'] * XGB_WEIGHT)
                             else:
                                 st.error("Prophet ATV forecast failed. Aborting.")
@@ -873,9 +866,6 @@ if db:
                                 
                             st.session_state.forecast_df = combo_f
                             
-                            # =================================================================
-                            # START: NEW LOGIC TO SAVE THE FORECAST
-                            # =================================================================
                             try:
                                 with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
                                     today_date = pd.to_datetime('today').normalize()
@@ -888,18 +878,14 @@ if db:
                                             "predicted_sales": row['forecast_sales'],
                                             "predicted_customers": row['forecast_customers']
                                         }
-                                        # Add a unique document ID to prevent duplicates if run multiple times a day
                                         doc_id = f"{today_date.strftime('%Y-%m-%d')}_{pd.to_datetime(row['ds']).strftime('%Y-%m-%d')}"
                                         db.collection('forecast_log').document(doc_id).set(log_entry)
                                 st.info("Forecast log saved successfully.")
                             except Exception as e:
                                 st.error(f"Failed to save forecast log: {e}")
-                            # =================================================================
-                            # END: NEW LOGIC
-                            # =================================================================
                             
                             if prophet_model_cust:
-                                prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f_full[['ds']])
+                                prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f_full)
                                 st.session_state.forecast_components = prophet_forecast_components
                                 st.session_state.all_holidays = prophet_model_cust.holidays
                             
@@ -916,7 +902,6 @@ if db:
                 st.session_state['access_level'] = 0
                 st.rerun()
         
-        # --- MODIFIED: Simplified tab list ---
         tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
         if st.session_state['access_level'] == 1:
             tab_list.append("👥 User Interface")
@@ -953,7 +938,6 @@ if db:
                     st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
                 else:st.warning("No future dates available in the forecast components to analyze.")
         
-        # --- MODIFIED: This is the new, combined "Forecast Evaluator" tab ---
         with tabs[2]:
             st.header("📈 Forecast Evaluator")
             st.info(
@@ -961,10 +945,8 @@ if db:
                 "This provides a true measure of the model's day-ahead prediction accuracy."
             )
 
-            # --- This function now contains the "True Accuracy" logic ---
             def render_true_accuracy_content(days):
                 try:
-                    # 1. Load the forecast log
                     log_docs = db.collection('forecast_log').stream()
                     log_records = [doc.to_dict() for doc in log_docs]
                     if not log_records:
@@ -975,7 +957,6 @@ if db:
                     forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
                     forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on']).dt.tz_localize(None)
 
-                    # 2. Filter for 1-day-ahead forecasts
                     forecast_log_df = forecast_log_df[
                         forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)
                     ].copy()
@@ -984,7 +965,6 @@ if db:
                         st.warning("Not enough consecutive forecast logs to calculate true day-ahead accuracy.")
                         raise StopIteration
 
-                    # 3. Load historical actuals and merge
                     historical_actuals_df = st.session_state.historical_df[['date', 'sales', 'customers', 'add_on_sales']].copy()
                     true_accuracy_df = pd.merge(
                         historical_actuals_df, forecast_log_df,
@@ -995,7 +975,6 @@ if db:
                         st.warning("No matching historical data for the logged forecasts.")
                         raise StopIteration
                     
-                    # 4. Filter for the selected time period (7 or 30 days)
                     period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
                     final_df = true_accuracy_df[true_accuracy_df['date'] >= period_start_date].copy()
 
@@ -1003,10 +982,8 @@ if db:
                         st.warning(f"No forecast data in the last {days} days to evaluate.")
                         raise StopIteration
 
-                    # 5. Display metrics and charts
                     st.subheader(f"Accuracy Metrics for the Last {days} Days")
                     
-                    # To calculate sales accuracy, we need to adjust the forecast by the actual add-on sales
                     final_df['adjusted_predicted_sales'] = final_df['predicted_sales'] - final_df['add_on_sales']
 
                     sales_mae = mean_absolute_error(final_df['sales'], final_df['adjusted_predicted_sales'])
