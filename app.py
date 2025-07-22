@@ -241,8 +241,8 @@ def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
         params={
-            "latitude":10.48,
-            "longitude":123.42,
+            "latitude": 10.48,
+            "longitude": 123.42,
             "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
             "timezone":"Asia/Manila",
             "forecast_days":days,
@@ -250,7 +250,7 @@ def get_weather_forecast(days=16):
         response=requests.get(url,params=params);response.raise_for_status();data=response.json();df=pd.DataFrame(data['daily'])
         df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
         df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
-        return df
+        return df[['date', 'weather', 'temp_max', 'precipitation', 'wind_speed']]
     except requests.exceptions.RequestException as e:
         st.error(f"Could not fetch weather data. Please try again later. Error: {e}")
         return None
@@ -287,19 +287,21 @@ def create_advanced_features(df):
 
     df = df.sort_values('date')
     
+    # Lag features
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
     if 'customers' in df.columns:
         df['customers_lag_7'] = df['customers'].shift(7)
-    
+    if 'atv' in df.columns:
+        df['atv_lag_7'] = df['atv'].shift(7)
+
+    # Rolling window features
     if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
     if 'customers' in df.columns:
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
-
     if 'atv' in df.columns:
-        df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
         
@@ -351,114 +353,98 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
     
-    return forecast[['ds', 'yhat']], prophet_model
+    # Return both the full forecast and the model object
+    return forecast, prophet_model
+
 
 @st.cache_resource
-def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col):
+def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, periods, target_col):
+    """
+    Trains an XGBoost model using a direct multi-step forecasting strategy.
+    This function trains a separate model for each future day to predict.
+    It also uses the Prophet forecast as a feature (stacking).
+    """
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
-    
     if df_train.empty:
         return pd.DataFrame()
 
-    # --- Part 1: Feature Engineering and Model Training (Largely the same) ---
+    # --- Part 1: Feature Engineering & Stacking ---
     df_featured = create_advanced_features(df_train.copy())
     
+    # STACKING: Merge Prophet's forecast as a feature
+    prophet_trend = prophet_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
+    df_featured = pd.merge(df_featured, prophet_trend, on='date', how='left')
+
     if 'day_type' in df_featured.columns:
-        df_featured['is_not_normal_day'] = df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+        df_featured['is_not_normal_day'] = (df_featured['day_type'] == 'Not Normal Day').astype(int)
     else:
         df_featured['is_not_normal_day'] = 0
 
-    dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
-    if dropna_col in df_featured.columns:
-        df_featured.dropna(subset=[dropna_col], inplace=True)
+    # --- Part 2: Create Targets for Direct Forecasting ---
+    # For each day `i` we want to forecast, create a target column `target_i`
+    # which is the actual value `i` days in the future.
+    for i in range(1, periods + 1):
+        df_featured[f'target_{i}'] = df_featured[target_col].shift(-i)
 
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
-    
+    # Define features to be used
+    base_features = ['dayofweek', 'month', 'year', 'dayofyear', 'weekofyear', 'is_not_normal_day', 'prophet_trend']
     if target_col == 'customers':
-        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7']
     elif target_col == 'atv':
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7']
-    else: 
-        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7']
-
+    else:
+        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
+    
     features = [f for f in features if f in df_featured.columns]
-    target = target_col
-
-    X = df_featured[features]
-    y = df_featured[target]
     
-    if X.empty or len(X) < 10:
-        st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
-        return pd.DataFrame()
+    # --- Part 3: Train One Model Per Forecast Horizon ---
+    models = {}
+    for i in range(1, periods + 1):
+        target_i = f'target_{i}'
         
-    # Using fixed parameters for speed, but you can re-enable Optuna if desired
-    # For a production app, you might save the best_params to avoid re-tuning every time.
-    best_params = {
-        'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
-        'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
-    }
-    
-    final_model = xgb.XGBRegressor(**best_params)
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-    final_model.fit(X, y, sample_weight=sample_weights)
+        # Prepare data for this specific horizon
+        df_horizon = df_featured.dropna(subset=[target_i] + features)
+        X = df_horizon[features]
+        y = df_horizon[target_i]
+        
+        if X.empty: continue
 
-    # --- Part 2: Recursive Forecasting Loop (The Fix) ---
+        # Train model for horizon `i`
+        model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
+        model.fit(X, y)
+        models[i] = model
+
+    # --- Part 4: Generate Future Forecast ---
+    # Get the last row of data to use as the feature set for prediction
+    X_last = df_featured[features].tail(1)
     
     future_predictions = []
-    # Start with the full history that was used for training
-    history_with_features = df_featured.copy()
+    last_date = df_train['date'].max()
 
-    for i in range(periods):
-        # 1. Prepare the feature set for the next day
-        # Get the last known date and add one day
-        last_date = history_with_features['date'].max()
-        next_date = last_date + timedelta(days=1)
-        
-        # Create a one-row dataframe for the next day to be predicted
-        future_step_df = pd.DataFrame([{'date': next_date}])
+    for i in range(1, periods + 1):
+        future_date = last_date + timedelta(days=i)
+        if i in models:
+            prediction = models[i].predict(X_last)[0]
+            future_predictions.append({'ds': future_date, 'yhat': prediction})
 
-        # Append this new day to our history
-        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        
-        # 2. Re-create features for the entire extended history
-        # The last row will now have correctly calculated lag and rolling features
-        extended_featured_df = create_advanced_features(extended_history)
-        
-        # Add the 'is_not_normal_day' feature manually for the future date
-        extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
-        
-        # 3. Predict the next step
-        # Isolate the last row, which contains the features for the day we want to predict
-        X_future = extended_featured_df[features].tail(1)
-        prediction = final_model.predict(X_future)[0]
-        
-        # Store the prediction
-        future_predictions.append({'ds': next_date, 'yhat': prediction})
-        
-        # 4. Update history with the prediction to be used in the next loop
-        # This is the key step of the recursive strategy
-        history_with_features = extended_featured_df.copy()
-        history_with_features.loc[history_with_features.index.max(), target] = prediction
+    future_forecast_df = pd.DataFrame(future_predictions)
 
-        # If forecasting customers, we also need to update the sales column to help with features
-        # We can make a simple assumption, e.g., sales = predicted_customers * recent_atv
-        if target_col == 'customers':
-            recent_atv = history_with_features['atv'].dropna().tail(7).mean()
-            history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * recent_atv
-
-    # --- Part 3: Combine and Return ---
-    # Create the final forecast dataframe
-    final_df = pd.DataFrame(future_predictions)
-
-    # Also include the model's prediction on the historical data (in-sample forecast)
-    historical_predictions = df_featured[['date']].copy()
-    historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
-    historical_predictions['yhat'] = final_model.predict(X)
-    
+    # --- Part 5: Generate In-Sample Forecast for Diagnostics ---
+    # Use the 1-day-ahead model to predict on historical data
+    if 1 in models:
+        df_featured_hist = df_featured.dropna(subset=features)
+        historical_predictions = models[1].predict(df_featured_hist[features])
+        historical_forecast_df = pd.DataFrame({
+            'ds': df_featured_hist['date'],
+            'yhat': historical_predictions
+        })
+    else:
+        historical_forecast_df = pd.DataFrame()
+        
     # Combine historical fit with future forecast
-    full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
-
+    full_forecast_df = pd.concat([historical_forecast_df, future_forecast_df], ignore_index=True)
+    
     return full_forecast_df
 
 # --- Plotting Functions & Firestore Data I/O ---
@@ -842,28 +828,37 @@ if db:
                         ev_df = st.session_state.events_df.copy()
                         
                         FORECAST_HORIZON = 15
+                        PROPHET_WEIGHT = 0.6
+                        XGB_WEIGHT = 0.4
                         
-                        cust_f = pd.DataFrame()
-                        with st.spinner("Forecasting Customers (Simple Average)..."):
-                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-                            xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-
-                            if not prophet_cust_f.empty and not xgb_cust_f.empty:
-                                cust_f = pd.merge(prophet_cust_f, xgb_cust_f, on='ds', suffixes=('_prophet', '_xgb'))
-                                cust_f['yhat'] = (cust_f['yhat_prophet'] + cust_f['yhat_xgb']) / 2
-                            else:
-                                st.error("Failed to generate customer forecast.")
-                        
-                        atv_f = pd.DataFrame()
-                        with st.spinner("Forecasting Average Sale (Simple Average)..."):
-                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
-                            xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                        # --- CUSTOMER FORECAST ---
+                        with st.spinner("Forecasting Customers (Prophet + XGBoost Direct)..."):
+                            prophet_cust_f_full, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                             
-                            if not prophet_atv_f.empty and not xgb_atv_f.empty:
-                                atv_f = pd.merge(prophet_atv_f, xgb_atv_f, on='ds', suffixes=('_prophet', '_xgb'))
-                                atv_f['yhat'] = (atv_f['yhat_prophet'] + atv_f['yhat_xgb']) / 2
+                            if not prophet_cust_f_full.empty:
+                                xgb_cust_f = train_and_forecast_xgboost_direct(hist_df_with_atv, prophet_cust_f_full, FORECAST_HORIZON, 'customers')
+                                
+                                # Merge and apply weighted average
+                                cust_f = pd.merge(prophet_cust_f_full[['ds', 'yhat']], xgb_cust_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                cust_f['yhat'] = (cust_f['yhat_prophet'] * PROPHET_WEIGHT) + (cust_f['yhat_xgb'] * XGB_WEIGHT)
                             else:
-                                st.error("Failed to generate ATV forecast.")
+                                st.error("Prophet customer forecast failed. Aborting.")
+                                cust_f = pd.DataFrame()
+
+                        # --- ATV FORECAST ---
+                        with st.spinner("Forecasting Average Sale (Prophet + XGBoost Direct)..."):
+                            prophet_atv_f_full, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+
+                            if not prophet_atv_f_full.empty:
+                                xgb_atv_f = train_and_forecast_xgboost_direct(hist_df_with_atv, prophet_atv_f_full, FORECAST_HORIZON, 'atv')
+
+                                # Merge and apply weighted average
+                                atv_f = pd.merge(prophet_atv_f_full[['ds', 'yhat']], xgb_atv_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
+                                atv_f['yhat'] = (atv_f['yhat_prophet'] * PROPHET_WEIGHT) + (atv_f['yhat_xgb'] * XGB_WEIGHT)
+                            else:
+                                st.error("Prophet ATV forecast failed. Aborting.")
+                                atv_f = pd.DataFrame()
+
 
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_customers'}), atv_f[['ds', 'yhat']].rename(columns={'yhat':'forecast_atv'}), on='ds')
@@ -904,7 +899,7 @@ if db:
                             # =================================================================
                             
                             if prophet_model_cust:
-                                prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f[['ds']])
+                                prophet_forecast_components = prophet_model_cust.predict(prophet_cust_f_full[['ds']])
                                 st.session_state.forecast_components = prophet_forecast_components
                                 st.session_state.all_holidays = prophet_model_cust.holidays
                             
