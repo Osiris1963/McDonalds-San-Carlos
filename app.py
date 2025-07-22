@@ -283,7 +283,7 @@ def create_advanced_features(df):
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
-    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype('int64') # Use consistent type
 
     df = df.sort_values('date').reset_index(drop=True)
     
@@ -355,7 +355,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, periods, target_col):
     """
     Trains an XGBoost model using a direct multi-step forecasting strategy.
-    This version correctly creates features for each future day.
+    This version correctly creates features for each future day and ensures dtype consistency.
     """
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
@@ -401,22 +401,24 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
     future_dates = pd.to_datetime([last_historical_date + timedelta(days=i) for i in range(1, periods + 1)])
     future_df = pd.DataFrame({'date': future_dates})
 
-    # Create time-based features for the future
     future_df = create_advanced_features(future_df.copy())
     
-    # Get last known values for lag/rolling features
     last_known_features = df_featured.tail(1)
     
-    # Forward-fill lag and rolling features
     lag_rolling_cols = [f for f in features if 'lag' in f or 'rolling' in f]
     for col in lag_rolling_cols:
         future_df[col] = last_known_features[col].iloc[0]
 
-    # Merge future Prophet trend and other static features
     future_prophet_trend = prophet_forecast_df[prophet_forecast_df['ds'] > last_historical_date][['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
     future_df = pd.merge(future_df, future_prophet_trend, on='date', how='left')
     future_df['prophet_trend'].fillna(method='ffill', inplace=True)
-    future_df['is_not_normal_day'] = 0 # Assume future days are normal unless specified
+    future_df['is_not_normal_day'] = 0
+
+    # --- FIX: Ensure dtype consistency between training and prediction DataFrames ---
+    training_dtypes = df_featured[features].dtypes.to_dict()
+    for col, dtype in training_dtypes.items():
+        if col in future_df.columns:
+            future_df[col] = future_df[col].astype(dtype)
 
     # --- Part 5: Predict Step-by-Step with Correct Features ---
     future_predictions = []
@@ -424,14 +426,13 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
         horizon = i + 1
         if horizon in models:
             model = models[horizon]
-            # Ensure feature order matches training
-            X_future_step = row[model.get_booster().feature_names].to_frame().T
+            feature_names = model.get_booster().feature_names
+            X_future_step = row[feature_names].to_frame().T
             prediction = model.predict(X_future_step)[0]
             future_predictions.append({'ds': row['date'], 'yhat': prediction})
 
     future_forecast_df = pd.DataFrame(future_predictions)
 
-    # Generate in-sample forecast for diagnostics using the 1-day-ahead model
     if 1 in models:
         df_featured_hist = df_featured.dropna(subset=features)
         historical_predictions = models[1].predict(df_featured_hist[features])
