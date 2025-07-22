@@ -250,6 +250,12 @@ def create_advanced_features(df, target_col):
     
     return df.reset_index()
 
+# --- FIX: Moved is_weekend to global scope ---
+def is_weekend(ds):
+    """Helper function to check if a date is a weekend (Fri, Sat, Sun)."""
+    date = pd.to_datetime(ds)
+    return date.weekday() >= 4 # Friday, Saturday, Sunday
+
 # --- ADVANCED FORECASTING MODELS ---
 @st.cache_resource(show_spinner="Training advanced forecasting models...")
 def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, target_col):
@@ -272,19 +278,14 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     manual_events = _events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_events = pd.concat([manual_events, recurring_events]).dropna(subset=['ds', 'holiday'])
 
-    # --- NEW: Custom seasonality for weekends ---
-    def is_weekend(ds):
-        date = pd.to_datetime(ds)
-        return date.weekday() >= 4 # Friday, Saturday, Sunday
-
     df_prophet['on_weekend'] = df_prophet['ds'].apply(is_weekend)
 
     prophet_model = Prophet(
         holidays=all_events,
         daily_seasonality=False,
-        weekly_seasonality=True, # Keep standard weekly, add stronger custom one
+        weekly_seasonality=True, 
         yearly_seasonality=len(df_train) >= 365,
-        changepoint_prior_scale=0.05, # Standard value
+        changepoint_prior_scale=0.05,
     )
     prophet_model.add_seasonality(name='weekend_boost', period=7, fourier_order=3, condition_name='on_weekend')
     prophet_model.add_country_holidays(country_name='PH')
@@ -324,15 +325,12 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     xgb_in_sample_preds = xgb_model_res.predict(aligned_df[FEATURES])
     y_meta = aligned_df['y']
 
-    # --- NEW: Add forecast_horizon as a feature for the meta-model ---
-    # For training, horizon is always 1 (predicting the same day)
     X_meta = pd.DataFrame({
         'prophet_pred': prophet_in_sample_preds.values,
         'xgb_residual_pred': xgb_in_sample_preds,
         'forecast_horizon': 1 
     })
     
-    # --- NEW: Use XGBoost for the meta-model to capture non-linear interactions ---
     meta_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, random_state=42)
     meta_model.fit(X_meta, y_meta)
 
@@ -356,7 +354,6 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     xgb_preds_df = pd.DataFrame({'ds': xgb_pred_features['date'], 'xgb_residual_pred': predicted_residuals})
     final_forecast = pd.merge(final_forecast, xgb_preds_df, on='ds', how='left').fillna(0)
 
-    # --- NEW: Create horizon feature for the final prediction ---
     final_forecast['forecast_horizon'] = (final_forecast['ds'] - final_forecast['ds'].min()).dt.days + 1
 
     X_final_meta = final_forecast[['prophet_pred', 'xgb_residual_pred', 'forecast_horizon']]
@@ -407,7 +404,6 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
     if 'weekly' in day_data and pd.notna(day_data['weekly']):
         x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
-    # --- NEW: Display custom weekend boost ---
     if 'weekend_boost' in day_data and pd.notna(day_data['weekend_boost']) and day_data['weekend_boost'] != 0:
          x_data.append('Weekend Boost');y_data.append(day_data['weekend_boost']);measure_data.append('relative')
     if 'yearly' in day_data and pd.notna(day_data['yearly']):
