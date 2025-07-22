@@ -256,9 +256,9 @@ def is_weekend(ds):
 
 # --- ADVANCED FORECASTING MODELS ---
 @st.cache_resource(show_spinner="Training advanced forecasting models...")
-def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col):
+def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col, growth_model='linear'):
     """
-    Trains a hybrid model: Prophet for baseline, XGBoost for residual error correction.
+    Trains a hybrid model with selectable growth: Prophet for baseline, XGBoost for residual error correction.
     """
     # --- 1. Prepare Data ---
     df_train = _historical_df.copy()
@@ -270,6 +270,12 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col)
     # --- 2. Train Prophet (Base Model) ---
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
+    # --- NEW: Dynamic growth model implementation ---
+    if growth_model == 'logistic':
+        # Set a dynamic cap based on historical max + 20% buffer
+        cap = df_prophet['y'].max() * 1.2
+        df_prophet['cap'] = cap
+    
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
@@ -279,6 +285,7 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col)
     df_prophet['on_weekend'] = df_prophet['ds'].apply(is_weekend)
 
     prophet_model = Prophet(
+        growth=growth_model, # Use the specified growth model
         holidays=all_events,
         daily_seasonality=False,
         weekly_seasonality=True, 
@@ -291,6 +298,9 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col)
 
     future_dates = prophet_model.make_future_dataframe(periods=periods)
     future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
+    if growth_model == 'logistic':
+        future_dates['cap'] = df_prophet['cap'].iloc[0] # Carry the cap forward
+
     prophet_forecast = prophet_model.predict(future_dates)
     
     # --- 3. Train XGBoost on Prophet's Residuals ---
@@ -432,9 +442,12 @@ if db:
                     
                     FORECAST_HORIZON = 15
                     
-                    # --- Run Models ---
-                    cust_f, prophet_model_cust = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-                    atv_f, _ = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                    # --- Run Models with specific growth settings ---
+                    st.info("Forecasting customers with Linear growth...")
+                    cust_f, prophet_model_cust = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', growth_model='linear')
+                    
+                    st.info("Forecasting ATV with Logistic growth...")
+                    atv_f, _ = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv', growth_model='logistic')
 
                     if not cust_f.empty and not atv_f.empty:
                         combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
