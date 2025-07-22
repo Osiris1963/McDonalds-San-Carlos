@@ -219,11 +219,15 @@ def create_advanced_features(df, target_col):
     df = df.sort_values('date').set_index('date')
 
     # Time-based features
-    df['dayofweek'] = df.index.dayofweek
+    df['dayofweek'] = df.index.dayofweek # Monday=0, Sunday=6
     df['month'] = df.index.month
     df['year'] = df.index.year
     df['dayofyear'] = df.index.dayofyear
     df['weekofyear'] = df.index.isocalendar().week.astype(int)
+    
+    # --- NEW: Explicit Weekend/Payday Features for XGBoost ---
+    df['is_weekend'] = df['dayofweek'].isin([4, 5, 6]).astype(int) # Friday, Saturday, Sunday
+    df['is_payday_period'] = df.index.day.isin([14, 15, 16, 29, 30, 31, 1]).astype(int)
 
     # Cyclical features
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
@@ -235,7 +239,7 @@ def create_advanced_features(df, target_col):
     for lag in [7, 14, 21]:
         df[f'{target_col}_lag_{lag}'] = df[target_col].shift(lag)
 
-    # Same-Day-of-Week Rolling Averages (e.g., avg of last 3 Mondays)
+    # Same-Day-of-Week Rolling Averages
     df[f'{target_col}_rolling_mean_dow'] = df.groupby('dayofweek')[target_col].transform(
         lambda x: x.shift(1).rolling(window=3, min_periods=1).mean()
     )
@@ -244,25 +248,19 @@ def create_advanced_features(df, target_col):
     df[f'{target_col}_rolling_mean_7'] = df[target_col].shift(1).rolling(window=7, min_periods=1).mean()
     df[f'{target_col}_rolling_std_7'] = df[target_col].shift(1).rolling(window=7, min_periods=1).std()
     
-    # Interaction features (example)
-    df['dayofweek_month_interaction'] = df['dayofweek'] * df['month']
-
     return df.reset_index()
 
 # --- ADVANCED FORECASTING MODELS ---
 @st.cache_resource(show_spinner="Training advanced forecasting models...")
 def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, target_col):
     """
-    Trains a stacked ensemble model:
-    1. Base Model 1: Prophet captures trends and seasonality.
-    2. Base Model 2: XGBoost models the residuals (errors) of Prophet.
-    3. Meta Model: Linear Regression learns to combine Prophet and XGBoost predictions.
+    Trains a horizon-aware stacked ensemble model.
     """
     # --- 1. Prepare Data ---
     df_train = _historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 30:
-        st.error(f"Not enough data for {target_col} to train advanced models. Need at least 30 data points.")
+        st.error(f"Not enough data for {target_col} to train. Need at least 30 data points.")
         return pd.DataFrame(), None, None
 
     # --- 2. Train Prophet (Base Model 1) ---
@@ -274,18 +272,26 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     manual_events = _events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_events = pd.concat([manual_events, recurring_events]).dropna(subset=['ds', 'holiday'])
 
+    # --- NEW: Custom seasonality for weekends ---
+    def is_weekend(ds):
+        date = pd.to_datetime(ds)
+        return date.weekday() >= 4 # Friday, Saturday, Sunday
+
+    df_prophet['on_weekend'] = df_prophet['ds'].apply(is_weekend)
+
     prophet_model = Prophet(
         holidays=all_events,
         daily_seasonality=False,
-        weekly_seasonality=True,
+        weekly_seasonality=True, # Keep standard weekly, add stronger custom one
         yearly_seasonality=len(df_train) >= 365,
-        changepoint_prior_scale=0.1,
-        changepoint_range=0.9,
+        changepoint_prior_scale=0.05, # Standard value
     )
+    prophet_model.add_seasonality(name='weekend_boost', period=7, fourier_order=3, condition_name='on_weekend')
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
 
     future_dates = prophet_model.make_future_dataframe(periods=periods)
+    future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
     prophet_forecast = prophet_model.predict(future_dates)
     
     # --- 3. Create Aligned Dataframe for Residual Modeling ---
@@ -296,17 +302,11 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     df_train_with_target = df_train[['date', target_col]].copy()
     df_featured = create_advanced_features(df_train_with_target, target_col)
     
-    # ROBUST ALIGNMENT: Merge feature data with residual data. Use an inner join
-    # to ensure we only have rows that exist in both, which guarantees alignment.
     aligned_df = pd.merge(
-        df_featured,
-        df_residuals,
-        left_on='date',
-        right_on='ds',
-        how='inner'
-    ).dropna() # Drop NaNs created by lag/rolling features
+        df_featured, df_residuals, left_on='date', right_on='ds', how='inner'
+    ).dropna()
 
-    FEATURES = [col for col in aligned_df.columns if col in df_featured.columns and col not in ['date', target_col, 'residuals', 'ds', 'y', 'yhat']]
+    FEATURES = [col for col in aligned_df.columns if col in df_featured.columns and col not in ['date', target_col]]
     
     xgb_model_res = None
     if not aligned_df.empty:
@@ -316,21 +316,24 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
         xgb_model_res = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=500, learning_rate=0.05, max_depth=5, random_state=42)
         xgb_model_res.fit(X, y_res)
     else:
-        st.warning(f"Training data is empty for {target_col} after feature engineering. Skipping residual model.")
+        st.warning(f"Training data empty for {target_col}. Skipping residual model.")
         return pd.DataFrame(), prophet_model, None
 
-    # --- 4. Train Meta-Model (Stacking) ---
-    # All data is now sourced from the perfectly aligned `aligned_df`
+    # --- 4. Train Horizon-Aware Meta-Model (Stacking) ---
     prophet_in_sample_preds = aligned_df['yhat']
     xgb_in_sample_preds = xgb_model_res.predict(aligned_df[FEATURES])
     y_meta = aligned_df['y']
 
+    # --- NEW: Add forecast_horizon as a feature for the meta-model ---
+    # For training, horizon is always 1 (predicting the same day)
     X_meta = pd.DataFrame({
         'prophet_pred': prophet_in_sample_preds.values,
-        'xgb_residual_pred': xgb_in_sample_preds
+        'xgb_residual_pred': xgb_in_sample_preds,
+        'forecast_horizon': 1 
     })
     
-    meta_model = LinearRegression()
+    # --- NEW: Use XGBoost for the meta-model to capture non-linear interactions ---
+    meta_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, random_state=42)
     meta_model.fit(X_meta, y_meta)
 
     # --- 5. Generate Final Forecast ---
@@ -342,25 +345,21 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     
     combined_featured = create_advanced_features(combined_df, target_col)
     
-    # Predict residuals for the entire history + future
     xgb_pred_features = combined_featured[combined_featured['date'].isin(final_forecast['ds'])].copy()
     
-    # Get the features that the model was trained on
-    final_features_for_prediction = [f for f in FEATURES if f in xgb_pred_features.columns]
-    
-    # Handle potential missing columns in future predictions
     for col in FEATURES:
-        if col not in xgb_pred_features.columns:
-            xgb_pred_features[col] = 0 # or some other default
+        if col not in xgb_pred_features.columns: xgb_pred_features[col] = 0
             
-    # Ensure column order is the same
-    X_to_predict = xgb_pred_features[FEATURES].fillna(0) # Fill any NaNs in future rows
+    X_to_predict = xgb_pred_features[FEATURES].fillna(0)
     predicted_residuals = xgb_model_res.predict(X_to_predict)
     
     xgb_preds_df = pd.DataFrame({'ds': xgb_pred_features['date'], 'xgb_residual_pred': predicted_residuals})
     final_forecast = pd.merge(final_forecast, xgb_preds_df, on='ds', how='left').fillna(0)
 
-    X_final_meta = final_forecast[['prophet_pred', 'xgb_residual_pred']]
+    # --- NEW: Create horizon feature for the final prediction ---
+    final_forecast['forecast_horizon'] = (final_forecast['ds'] - final_forecast['ds'].min()).dt.days + 1
+
+    X_final_meta = final_forecast[['prophet_pred', 'xgb_residual_pred', 'forecast_horizon']]
     final_forecast['yhat'] = meta_model.predict(X_final_meta)
     
     final_forecast['yhat'] = final_forecast['yhat'].clip(lower=0)
@@ -372,14 +371,6 @@ def add_to_firestore(db_client, collection_name, data):
     if db_client is None: return
     data['date'] = pd.to_datetime(data['date']).to_pydatetime()
     db_client.collection(collection_name).add(data)
-
-def update_in_firestore(db_client, collection_name, doc_id, data):
-    if db_client is None: return
-    db_client.collection(collection_name).document(doc_id).update(data)
-
-def delete_from_firestore(db_client, collection_name, doc_id):
-    if db_client is None: return
-    db_client.collection(collection_name).document(doc_id).delete()
 
 # --- Plotting and UI Functions ---
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
@@ -416,6 +407,9 @@ def plot_forecast_breakdown(components,selected_date,all_events):
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
     if 'weekly' in day_data and pd.notna(day_data['weekly']):
         x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
+    # --- NEW: Display custom weekend boost ---
+    if 'weekend_boost' in day_data and pd.notna(day_data['weekend_boost']) and day_data['weekend_boost'] != 0:
+         x_data.append('Weekend Boost');y_data.append(day_data['weekend_boost']);measure_data.append('relative')
     if 'yearly' in day_data and pd.notna(day_data['yearly']):
         x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
     if 'holidays' in day_data and pd.notna(day_data['holidays']):
@@ -436,7 +430,7 @@ if db:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
         st.title("Sales Forecaster")
         st.markdown("---")
-        st.info("Forecasting with a Hybrid Stacked Ensemble Model (Prophet + XGBoost).")
+        st.info("Forecasting with a Horizon-Aware Stacked Ensemble Model.")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -492,7 +486,9 @@ if db:
                         
                         # --- Store Prophet components for insights ---
                         if prophet_model_cust:
-                            st.session_state.forecast_components = prophet_model_cust.predict(prophet_model_cust.history)
+                            future_dates = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
+                            future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
+                            st.session_state.forecast_components = prophet_model_cust.predict(future_dates)
                             st.session_state.all_holidays = prophet_model_cust.holidays
                         
                         st.success("Advanced forecast generated successfully!")
@@ -539,7 +535,6 @@ if db:
 
         def render_true_accuracy_content(days):
             try:
-                # OPTIMIZED: Query only the last 40 days of logs
                 from_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=40)
                 log_docs = db.collection('forecast_log').where('generated_on', '>=', from_date).stream()
                 
@@ -551,24 +546,20 @@ if db:
                 forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
                 forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on']).dt.tz_localize(None)
 
-                # Filter for 1-day-ahead forecasts
                 forecast_log_df = forecast_log_df[forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)].copy()
                 if forecast_log_df.empty:
                     st.warning("Not enough consecutive logs to calculate day-ahead accuracy."); raise StopIteration
 
-                # Merge with historical actuals
                 historical_actuals_df = st.session_state.historical_df[['date', 'sales', 'customers', 'add_on_sales']].copy()
                 true_accuracy_df = pd.merge(historical_actuals_df, forecast_log_df, left_on='date', right_on='forecast_for_date', how='inner')
                 if true_accuracy_df.empty:
                     st.warning("No matching historical data for logged forecasts."); raise StopIteration
                 
-                # Filter for the selected time period
                 period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
                 final_df = true_accuracy_df[true_accuracy_df['date'] >= period_start_date].copy()
                 if final_df.empty:
                     st.warning(f"No forecast data in the last {days} days to evaluate."); raise StopIteration
 
-                # Calculate and display metrics
                 st.subheader(f"Accuracy Metrics for the Last {days} Days")
                 final_df['adjusted_predicted_sales'] = final_df['predicted_sales'] - final_df['add_on_sales']
                 sales_mae = mean_absolute_error(final_df['sales'], final_df['adjusted_predicted_sales'])
@@ -609,30 +600,24 @@ if db:
                 st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
 
     with tabs[4]: # Future Activities
-        def set_view_all(): st.session_state.show_all_activities = True
-        def set_overview(): st.session_state.show_all_activities = False
-
-        if st.session_state.get('show_all_activities'):
-            st.button("⬅️ Back to Overview", on_click=set_overview)
-            # Full view logic can be added here if needed
-        else:
-            col1, col2 = st.columns([1, 2], gap="large")
-            with col1:
-                st.markdown("##### Add New Activity")
-                with st.form("new_activity_form", clear_on_submit=True, border=True):
-                    activity_name = st.text_input("Activity/Event Name")
-                    activity_date = st.date_input("Date of Activity", min_value=date.today())
-                    potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
-                    if st.form_submit_button("✅ Save Activity", use_container_width=True):
-                        if activity_name and activity_date:
-                            new_activity = {"activity_name": activity_name, "date": activity_date, "potential_sales": float(potential_sales)}
-                            add_to_firestore(db, 'future_activities', new_activity)
-                            st.cache_data.clear(); st.success("Activity saved!"); time.sleep(1); st.rerun()
-            with col2:
-                st.markdown("##### Upcoming Activities")
-                activities_df = st.session_state.events_df
-                upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
-                st.dataframe(upcoming_df, use_container_width=True, hide_index=True)
+        st.subheader("📅 Manage Future Activities")
+        col1, col2 = st.columns([1, 2], gap="large")
+        with col1:
+            st.markdown("##### Add New Activity")
+            with st.form("new_activity_form", clear_on_submit=True, border=True):
+                activity_name = st.text_input("Activity/Event Name")
+                activity_date = st.date_input("Date of Activity", min_value=date.today())
+                potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
+                if st.form_submit_button("✅ Save Activity", use_container_width=True):
+                    if activity_name and activity_date:
+                        new_activity = {"activity_name": activity_name, "date": activity_date, "potential_sales": float(potential_sales)}
+                        add_to_firestore(db, 'future_activities', new_activity)
+                        st.cache_data.clear(); st.success("Activity saved!"); time.sleep(1); st.rerun()
+        with col2:
+            st.markdown("##### Upcoming Activities")
+            activities_df = st.session_state.events_df
+            upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+            st.dataframe(upcoming_df, use_container_width=True, hide_index=True)
 
 else:
     st.error("Failed to connect to Firestore. Please check your configuration and network.")
