@@ -156,7 +156,7 @@ def remove_outliers_iqr(df, column='sales'):
     cleaned_df = df[df[column] <= upper_bound].copy()
     return cleaned_df
 
-def calculate_atv(df):
+def calculate_base_sales(df):
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
     return df
 
@@ -173,7 +173,6 @@ def create_advanced_features(df):
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
 
-    # --- NEW: Interaction Features ---
     df['weekend_month_interaction'] = df['is_weekend'] * df['month']
     df['ber_month'] = (df['month'] >= 9).astype(int)
     df['weekend_ber_interaction'] = df['is_weekend'] * df['ber_month']
@@ -222,7 +221,7 @@ def train_xgboost_model(df_train, target_col):
         'dayofyear', 'month', 'year', 'weekofyear', 
         'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
         'is_weekend', 'dayofweek_sin', 'dayofweek_cos',
-        'weekend_month_interaction', 'weekend_ber_interaction' # New interaction features
+        'weekend_month_interaction', 'weekend_ber_interaction'
     ]
     features = [f for f in features if f in df_featured.columns and f != target_col]
     
@@ -240,7 +239,7 @@ def train_lstm_model(df_train, target_col, sequence_length=14):
     lstm_features = [
         'dayofyear', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
         'is_weekend', 'dayofweek_sin', 'dayofweek_cos',
-        'weekend_month_interaction', 'weekend_ber_interaction' # New interaction features
+        'weekend_month_interaction', 'weekend_ber_interaction'
     ]
     lstm_features = [f for f in lstm_features if f in df_featured.columns]
     
@@ -502,33 +501,24 @@ if db:
                     status_text = st.empty()
                     base_df = st.session_state.historical_df.copy()
                     
-                    # Calculate base_sales for training
-                    hist_df_with_components = calculate_atv(base_df)
+                    hist_df_with_components = calculate_base_sales(base_df)
                     
                     ev_df = st.session_state.events_df.copy()
                     
                     FORECAST_HORIZON = 15
                     
-                    # --- FORECAST 1: Customers ---
                     status_text.text("Running Customer Forecast...")
                     cust_f, cust_components = generate_stacked_forecast(hist_df_with_components.copy(), ev_df, FORECAST_HORIZON, 'customers')
                     
-                    # --- FORECAST 2: Base Sales ---
                     status_text.text("Running Base Sales Forecast...")
                     sales_f, _ = generate_stacked_forecast(hist_df_with_components.copy(), ev_df, FORECAST_HORIZON, 'base_sales')
                     
                     status_text.text("Combining forecasts...")
                     if not cust_f.empty and not sales_f.empty:
-                        # Combine the two primary forecasts
-                        combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), sales_f.rename(columns={'yhat':'forecast_base_sales'}), on='ds')
+                        combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), sales_f.rename(columns={'yhat':'forecast_sales'}), on='ds')
                         
-                        # Derive ATV from the primary forecasts
-                        combo_f['forecast_atv'] = combo_f['forecast_base_sales'] / combo_f['forecast_customers'].replace(0, np.nan)
+                        combo_f['forecast_atv'] = combo_f['forecast_sales'] / combo_f['forecast_customers'].replace(0, np.nan)
                         combo_f['forecast_atv'].fillna(0, inplace=True)
-
-                        # Estimate total sales by adding an average add-on value
-                        avg_add_on = hist_df_with_components['add_on_sales'].mean()
-                        combo_f['forecast_sales'] = combo_f['forecast_base_sales'] + avg_add_on
 
                         st.session_state.forecast_df = combo_f
                         st.session_state.forecast_components = cust_components
