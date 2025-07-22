@@ -174,6 +174,13 @@ def create_advanced_features(df):
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    
+    # --- ENHANCED WEEKEND FEATURES ---
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int) # 5=Saturday, 6=Sunday
+    # Cyclical features to represent the day of the week
+    df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
+    df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
+
     df = df.sort_values('date')
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
@@ -205,7 +212,8 @@ def train_prophet_model(df_train, events_df, target_col):
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=len(df_train) >= 365,
-        changepoint_prior_scale=0.15
+        changepoint_prior_scale=0.15,
+        weekly_fourier=20 # Increase flexibility for weekly patterns
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -213,7 +221,12 @@ def train_prophet_model(df_train, events_df, target_col):
 
 def train_xgboost_model(df_train, target_col):
     df_featured = create_advanced_features(df_train.copy())
-    features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
+    # --- ADDING NEW WEEKEND FEATURES TO XGBOOST ---
+    features = [
+        'dayofyear', 'month', 'year', 'weekofyear', 
+        'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
+        'is_weekend', 'dayofweek_sin', 'dayofweek_cos' # New features
+    ]
     features = [f for f in features if f in df_featured.columns and f != target_col]
     
     df_featured.dropna(subset=features, inplace=True)
@@ -227,11 +240,13 @@ def train_xgboost_model(df_train, target_col):
 
 def train_lstm_model(df_train, target_col, sequence_length=14):
     df_featured = create_advanced_features(df_train.copy())
-    # Define a consistent feature set for the LSTM
-    lstm_features = ['dayofyear', 'dayofweek', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7']
+    # --- ADDING NEW WEEKEND FEATURES TO LSTM ---
+    lstm_features = [
+        'dayofyear', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
+        'is_weekend', 'dayofweek_sin', 'dayofweek_cos' # New features
+    ]
     lstm_features = [f for f in lstm_features if f in df_featured.columns]
     
-    # The first column for the scaler must always be the target
     cols_for_scaling = [target_col] + lstm_features
     data = df_featured[cols_for_scaling].dropna()
 
@@ -269,11 +284,9 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
         last_date = history['date'].max()
         next_date = last_date + timedelta(days=1)
         
-        # Use concat instead of append for creating the new row
         future_step_df = pd.DataFrame([{'date': next_date, target_col: np.nan}])
         history = pd.concat([history, future_step_df], ignore_index=True)
         
-        # Re-create features for the updated history
         extended_featured = create_advanced_features(history)
         
         if model_type == 'xgb':
@@ -296,7 +309,6 @@ def forecast_recursive(model, initial_history, periods, target_col, model_type='
 
         predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Update the last row of history with the new prediction
         history.loc[history.index.max(), target_col] = prediction
 
     return pd.DataFrame(predictions)
@@ -386,7 +398,6 @@ def generate_stacked_forecast(_historical_df, _events_df, periods, target_col):
         'lstm_preds': lstm_future_preds.values if not lstm_future_preds.empty else np.nan
     })
 
-    # Fill NaN with the mean of the other predictions for robustness
     future_meta_features = future_meta_features.apply(lambda x: x.fillna(x.mean()), axis=1)
 
     final_predictions = meta_model.predict(future_meta_features.fillna(0))
