@@ -210,11 +210,13 @@ def train_prophet_model(df_train, events_df, target_col):
     prophet_model = Prophet(
         holidays=all_events,
         daily_seasonality=False,
-        weekly_seasonality=True,
+        weekly_seasonality=False, # Disable default to add a custom one
         yearly_seasonality=len(df_train) >= 365,
         changepoint_prior_scale=0.15,
-        weekly_fourier=20 # Increase flexibility for weekly patterns
     )
+    # --- CORRECTED: Add a more flexible custom weekly seasonality ---
+    prophet_model.add_seasonality(name='weekly', period=7, fourier_order=20)
+    
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     return prophet_model
