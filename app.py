@@ -157,13 +157,7 @@ def remove_outliers_iqr(df, column='sales'):
     return cleaned_df
 
 def calculate_atv(df):
-    # Ensure customers column is not zero to avoid division by zero
-    df['customers'] = df['customers'].replace(0, np.nan)
     df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        atv = np.divide(df['base_sales'], df['customers'])
-    df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
-    df['customers'] = df['customers'].fillna(0) # Restore zeros
     return df
 
 def create_advanced_features(df):
@@ -175,11 +169,14 @@ def create_advanced_features(df):
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     
-    # --- ENHANCED WEEKEND FEATURES ---
-    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int) # 5=Saturday, 6=Sunday
-    # Cyclical features to represent the day of the week
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
+
+    # --- NEW: Interaction Features ---
+    df['weekend_month_interaction'] = df['is_weekend'] * df['month']
+    df['ber_month'] = (df['month'] >= 9).astype(int)
+    df['weekend_ber_interaction'] = df['is_weekend'] * df['ber_month']
 
     df = df.sort_values('date')
     if 'sales' in df.columns:
@@ -214,20 +211,18 @@ def train_prophet_model(df_train, events_df, target_col):
         yearly_seasonality=len(df_train) >= 365,
         changepoint_prior_scale=0.15,
     )
-    # --- CORRECTED: Add a more flexible custom weekly seasonality ---
     prophet_model.add_seasonality(name='weekly', period=7, fourier_order=20)
-    
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
     return prophet_model
 
 def train_xgboost_model(df_train, target_col):
     df_featured = create_advanced_features(df_train.copy())
-    # --- ADDING NEW WEEKEND FEATURES TO XGBOOST ---
     features = [
         'dayofyear', 'month', 'year', 'weekofyear', 
         'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
-        'is_weekend', 'dayofweek_sin', 'dayofweek_cos' # New features
+        'is_weekend', 'dayofweek_sin', 'dayofweek_cos',
+        'weekend_month_interaction', 'weekend_ber_interaction' # New interaction features
     ]
     features = [f for f in features if f in df_featured.columns and f != target_col]
     
@@ -242,10 +237,10 @@ def train_xgboost_model(df_train, target_col):
 
 def train_lstm_model(df_train, target_col, sequence_length=14):
     df_featured = create_advanced_features(df_train.copy())
-    # --- ADDING NEW WEEKEND FEATURES TO LSTM ---
     lstm_features = [
         'dayofyear', 'month', 'sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7',
-        'is_weekend', 'dayofweek_sin', 'dayofweek_cos' # New features
+        'is_weekend', 'dayofweek_sin', 'dayofweek_cos',
+        'weekend_month_interaction', 'weekend_ber_interaction' # New interaction features
     ]
     lstm_features = [f for f in lstm_features if f in df_featured.columns]
     
@@ -506,23 +501,35 @@ if db:
                 with st.spinner("🧠 Initializing Advanced AI Forecast..."):
                     status_text = st.empty()
                     base_df = st.session_state.historical_df.copy()
-                    base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
-                    cleaned_df = remove_outliers_iqr(base_df, column='base_sales')
-                    hist_df_with_atv = calculate_atv(cleaned_df)
+                    
+                    # Calculate base_sales for training
+                    hist_df_with_components = calculate_atv(base_df)
+                    
                     ev_df = st.session_state.events_df.copy()
                     
                     FORECAST_HORIZON = 15
                     
+                    # --- FORECAST 1: Customers ---
                     status_text.text("Running Customer Forecast...")
-                    cust_f, cust_components = generate_stacked_forecast(hist_df_with_atv.copy(), ev_df, FORECAST_HORIZON, 'customers')
+                    cust_f, cust_components = generate_stacked_forecast(hist_df_with_components.copy(), ev_df, FORECAST_HORIZON, 'customers')
                     
-                    status_text.text("Running Average Transaction Forecast...")
-                    atv_f, _ = generate_stacked_forecast(hist_df_with_atv.copy(), ev_df, FORECAST_HORIZON, 'atv')
+                    # --- FORECAST 2: Base Sales ---
+                    status_text.text("Running Base Sales Forecast...")
+                    sales_f, _ = generate_stacked_forecast(hist_df_with_components.copy(), ev_df, FORECAST_HORIZON, 'base_sales')
                     
                     status_text.text("Combining forecasts...")
-                    if not cust_f.empty and not atv_f.empty:
-                        combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
-                        combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                    if not cust_f.empty and not sales_f.empty:
+                        # Combine the two primary forecasts
+                        combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), sales_f.rename(columns={'yhat':'forecast_base_sales'}), on='ds')
+                        
+                        # Derive ATV from the primary forecasts
+                        combo_f['forecast_atv'] = combo_f['forecast_base_sales'] / combo_f['forecast_customers'].replace(0, np.nan)
+                        combo_f['forecast_atv'].fillna(0, inplace=True)
+
+                        # Estimate total sales by adding an average add-on value
+                        avg_add_on = hist_df_with_components['add_on_sales'].mean()
+                        combo_f['forecast_sales'] = combo_f['forecast_base_sales'] + avg_add_on
+
                         st.session_state.forecast_df = combo_f
                         st.session_state.forecast_components = cust_components
                         st.success("Advanced AI forecast generated successfully!")
