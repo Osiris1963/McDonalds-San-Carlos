@@ -263,6 +263,10 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col,
     # --- 1. Prepare Data ---
     df_train = _historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
+    # Ensure y is > 0 for multiplicative seasonality
+    if df_train[target_col].min() <= 0:
+        df_train = df_train[df_train[target_col] > 0]
+        
     if df_train.empty or len(df_train) < 30:
         st.error(f"Not enough data for {target_col} to train. Need at least 30 data points.")
         return pd.DataFrame(), None
@@ -270,9 +274,7 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col,
     # --- 2. Train Prophet (Base Model) ---
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
-    # --- NEW: Dynamic growth model implementation ---
     if growth_model == 'logistic':
-        # Set a dynamic cap based on historical max + 20% buffer
         cap = df_prophet['y'].max() * 1.2
         df_prophet['cap'] = cap
     
@@ -285,21 +287,22 @@ def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col,
     df_prophet['on_weekend'] = df_prophet['ds'].apply(is_weekend)
 
     prophet_model = Prophet(
-        growth=growth_model, # Use the specified growth model
+        growth=growth_model,
         holidays=all_events,
         daily_seasonality=False,
-        weekly_seasonality=True, 
+        weekly_seasonality=False, # Disable default to use a stronger custom one
         yearly_seasonality=len(df_train) >= 365,
-        changepoint_prior_scale=0.05,
+        changepoint_prior_scale=0.25, # Increased flexibility
+        seasonality_mode='multiplicative' # Use multiplicative seasonality
     )
-    prophet_model.add_seasonality(name='weekend_boost', period=7, fourier_order=3, condition_name='on_weekend')
+    # Add a more powerful custom weekly seasonality
+    prophet_model.add_seasonality(name='weekly_multiplicative', period=7, fourier_order=10)
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
 
     future_dates = prophet_model.make_future_dataframe(periods=periods)
-    future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
     if growth_model == 'logistic':
-        future_dates['cap'] = df_prophet['cap'].iloc[0] # Carry the cap forward
+        future_dates['cap'] = df_prophet['cap'].iloc[0]
 
     prophet_forecast = prophet_model.predict(future_dates)
     
@@ -394,17 +397,20 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
     x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
-    if 'weekly' in day_data and pd.notna(day_data['weekly']):
-        x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
-    if 'weekend_boost' in day_data and pd.notna(day_data['weekend_boost']) and day_data['weekend_boost'] != 0:
-         x_data.append('Weekend Boost');y_data.append(day_data['weekend_boost']);measure_data.append('relative')
+    
+    # Check for custom seasonality name
+    if 'weekly_multiplicative' in day_data and pd.notna(day_data['weekly_multiplicative']):
+        x_data.append('Day of Week Effect');y_data.append(day_data['weekly_multiplicative']);measure_data.append('relative')
+    
     if 'yearly' in day_data and pd.notna(day_data['yearly']):
         x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
+        
     if 'holidays' in day_data and pd.notna(day_data['holidays']):
         holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
         x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
+        
     x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
-    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.2f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -478,7 +484,6 @@ if db:
                         # --- Store Prophet components for insights ---
                         if prophet_model_cust:
                             future_dates = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
-                            future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
                             st.session_state.forecast_components = prophet_model_cust.predict(future_dates)
                             st.session_state.all_holidays = prophet_model_cust.holidays
                         
