@@ -225,7 +225,6 @@ def create_advanced_features(df, target_col):
     df['dayofyear'] = df.index.dayofyear
     df['weekofyear'] = df.index.isocalendar().week.astype(int)
     
-    # --- NEW: Explicit Weekend/Payday Features for XGBoost ---
     df['is_weekend'] = df['dayofweek'].isin([4, 5, 6]).astype(int) # Friday, Saturday, Sunday
     df['is_payday_period'] = df.index.day.isin([14, 15, 16, 29, 30, 31, 1]).astype(int)
 
@@ -250,7 +249,6 @@ def create_advanced_features(df, target_col):
     
     return df.reset_index()
 
-# --- FIX: Moved is_weekend to global scope ---
 def is_weekend(ds):
     """Helper function to check if a date is a weekend (Fri, Sat, Sun)."""
     date = pd.to_datetime(ds)
@@ -258,18 +256,18 @@ def is_weekend(ds):
 
 # --- ADVANCED FORECASTING MODELS ---
 @st.cache_resource(show_spinner="Training advanced forecasting models...")
-def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, target_col):
+def train_hybrid_residual_model(_historical_df, _events_df, periods, target_col):
     """
-    Trains a horizon-aware stacked ensemble model.
+    Trains a hybrid model: Prophet for baseline, XGBoost for residual error correction.
     """
     # --- 1. Prepare Data ---
     df_train = _historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 30:
         st.error(f"Not enough data for {target_col} to train. Need at least 30 data points.")
-        return pd.DataFrame(), None, None
+        return pd.DataFrame(), None
 
-    # --- 2. Train Prophet (Base Model 1) ---
+    # --- 2. Train Prophet (Base Model) ---
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})[['ds', 'y']]
     
     start_date = df_train['date'].min()
@@ -295,7 +293,7 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     future_dates['on_weekend'] = future_dates['ds'].apply(is_weekend)
     prophet_forecast = prophet_model.predict(future_dates)
     
-    # --- 3. Create Aligned Dataframe for Residual Modeling ---
+    # --- 3. Train XGBoost on Prophet's Residuals ---
     df_prophet_fit = prophet_forecast[prophet_forecast['ds'] <= df_prophet['ds'].max()]
     df_residuals = pd.merge(df_prophet, df_prophet_fit[['ds', 'yhat']], on='ds')
     df_residuals['residuals'] = df_residuals['y'] - df_residuals['yhat']
@@ -318,23 +316,9 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
         xgb_model_res.fit(X, y_res)
     else:
         st.warning(f"Training data empty for {target_col}. Skipping residual model.")
-        return pd.DataFrame(), prophet_model, None
+        return pd.DataFrame(), prophet_model
 
-    # --- 4. Train Horizon-Aware Meta-Model (Stacking) ---
-    prophet_in_sample_preds = aligned_df['yhat']
-    xgb_in_sample_preds = xgb_model_res.predict(aligned_df[FEATURES])
-    y_meta = aligned_df['y']
-
-    X_meta = pd.DataFrame({
-        'prophet_pred': prophet_in_sample_preds.values,
-        'xgb_residual_pred': xgb_in_sample_preds,
-        'forecast_horizon': 1 
-    })
-    
-    meta_model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, random_state=42)
-    meta_model.fit(X_meta, y_meta)
-
-    # --- 5. Generate Final Forecast ---
+    # --- 4. Generate Final Forecast ---
     final_forecast = prophet_forecast[['ds', 'yhat']].rename(columns={'yhat': 'prophet_pred'})
     
     full_hist_df = df_train[['date', target_col]].copy()
@@ -354,14 +338,12 @@ def train_stacked_ensemble_and_forecast(_historical_df, _events_df, periods, tar
     xgb_preds_df = pd.DataFrame({'ds': xgb_pred_features['date'], 'xgb_residual_pred': predicted_residuals})
     final_forecast = pd.merge(final_forecast, xgb_preds_df, on='ds', how='left').fillna(0)
 
-    final_forecast['forecast_horizon'] = (final_forecast['ds'] - final_forecast['ds'].min()).dt.days + 1
-
-    X_final_meta = final_forecast[['prophet_pred', 'xgb_residual_pred', 'forecast_horizon']]
-    final_forecast['yhat'] = meta_model.predict(X_final_meta)
+    # --- Direct Combination: Prophet + Residual Correction ---
+    final_forecast['yhat'] = final_forecast['prophet_pred'] + final_forecast['xgb_residual_pred']
     
     final_forecast['yhat'] = final_forecast['yhat'].clip(lower=0)
     
-    return final_forecast[['ds', 'yhat']], prophet_model, xgb_model_res
+    return final_forecast[['ds', 'yhat']], prophet_model
 
 # --- Firestore Data I/O ---
 def add_to_firestore(db_client, collection_name, data):
@@ -426,7 +408,7 @@ if db:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
         st.title("Sales Forecaster")
         st.markdown("---")
-        st.info("Forecasting with a Horizon-Aware Stacked Ensemble Model.")
+        st.info("Forecasting with a Hybrid Residual Model (Prophet + XGBoost).")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -451,8 +433,8 @@ if db:
                     FORECAST_HORIZON = 15
                     
                     # --- Run Models ---
-                    cust_f, prophet_model_cust, _ = train_stacked_ensemble_and_forecast(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-                    atv_f, _, _ = train_stacked_ensemble_and_forecast(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                    cust_f, prophet_model_cust = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
+                    atv_f, _ = train_hybrid_residual_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
 
                     if not cust_f.empty and not atv_f.empty:
                         combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
