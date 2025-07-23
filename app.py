@@ -287,7 +287,6 @@ def create_advanced_features(df):
 
     df = df.sort_values('date').reset_index(drop=True)
     
-    # Only create lag/rolling features if the source column exists
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
@@ -355,7 +354,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, periods, target_col):
     """
     Trains an XGBoost model using a direct multi-step forecasting strategy.
-    This version correctly creates features for each future day and ensures dtype consistency.
+    This version uses a robust template-based method to ensure dtype and column consistency.
     """
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
@@ -364,13 +363,11 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
 
     # --- Part 1: Feature Engineering for Training Data ---
     df_featured = create_advanced_features(df_train.copy())
-    
     prophet_trend = prophet_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
     df_featured = pd.merge(df_featured, prophet_trend, on='date', how='left')
-
     df_featured['is_not_normal_day'] = (df_featured['day_type'] == 'Not Normal Day').astype(int) if 'day_type' in df_featured.columns else 0
 
-    # --- Part 2: Create Shifted Targets for Direct Forecasting ---
+    # --- Part 2: Create Shifted Targets and Define Feature Set ---
     for i in range(1, periods + 1):
         df_featured[f'target_{i}'] = df_featured[target_col].shift(-i)
 
@@ -384,8 +381,15 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
     
     features = [f for f in features if f in df_featured.columns]
     
-    # --- Part 3: Train One Model Per Horizon ---
+    # --- Part 3: Train Models and Create Training Template ---
     models = {}
+    # Use the features from a fully populated row as the definitive template
+    df_template = df_featured.dropna(subset=[f'target_{periods}'] + features)
+    if df_template.empty:
+        st.warning(f"Not enough data to create a training template for {target_col}. XGBoost part will be skipped.")
+        return pd.DataFrame()
+    X_template = df_template[features]
+
     for i in range(1, periods + 1):
         target_i = f'target_{i}'
         df_horizon = df_featured.dropna(subset=[target_i] + features)
@@ -393,49 +397,48 @@ def train_and_forecast_xgboost_direct(historical_df, prophet_forecast_df, period
         
         if X.empty: continue
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42)
-        model.fit(X, y)
+        model.fit(X.astype(X_template.dtypes), y) # Train with consistent types
         models[i] = model
 
     # --- Part 4: Create Future DataFrame and Features ---
     last_historical_date = df_featured['date'].max()
     future_dates = pd.to_datetime([last_historical_date + timedelta(days=i) for i in range(1, periods + 1)])
     future_df = pd.DataFrame({'date': future_dates})
-
     future_df = create_advanced_features(future_df.copy())
     
     last_known_features = df_featured.tail(1)
-    
     lag_rolling_cols = [f for f in features if 'lag' in f or 'rolling' in f]
     for col in lag_rolling_cols:
-        future_df[col] = last_known_features[col].iloc[0]
+        if col in last_known_features.columns:
+            future_df[col] = last_known_features[col].iloc[0]
 
     future_prophet_trend = prophet_forecast_df[prophet_forecast_df['ds'] > last_historical_date][['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'prophet_trend'})
     future_df = pd.merge(future_df, future_prophet_trend, on='date', how='left')
     future_df['prophet_trend'].fillna(method='ffill', inplace=True)
     future_df['is_not_normal_day'] = 0
 
-    # --- FIX: Ensure dtype consistency between training and prediction DataFrames ---
-    training_dtypes = df_featured[features].dtypes.to_dict()
-    for col, dtype in training_dtypes.items():
-        if col in future_df.columns:
-            future_df[col] = future_df[col].astype(dtype)
+    # --- DEFINITIVE FIX: Force future_df to match the training template ---
+    future_df_predict = future_df.reindex(columns=X_template.columns, fill_value=np.nan)
+    future_df_predict = future_df_predict.astype(X_template.dtypes)
 
-    # --- Part 5: Predict Step-by-Step with Correct Features ---
+    # --- Part 5: Predict Step-by-Step ---
     future_predictions = []
-    for i, row in future_df.iterrows():
+    for i in range(len(future_df_predict)):
         horizon = i + 1
         if horizon in models:
             model = models[horizon]
-            feature_names = model.get_booster().feature_names
-            X_future_step = row[feature_names].to_frame().T
+            X_future_step = future_df_predict.iloc[[i]] # Select row while keeping it a DataFrame
             prediction = model.predict(X_future_step)[0]
-            future_predictions.append({'ds': row['date'], 'yhat': prediction})
+            future_date = future_df.loc[i, 'date']
+            future_predictions.append({'ds': future_date, 'yhat': prediction})
 
     future_forecast_df = pd.DataFrame(future_predictions)
 
+    # In-sample forecast
     if 1 in models:
-        df_featured_hist = df_featured.dropna(subset=features)
-        historical_predictions = models[1].predict(df_featured_hist[features])
+        df_featured_hist = df_featured.dropna(subset=X_template.columns)
+        X_hist = df_featured_hist[X_template.columns].astype(X_template.dtypes)
+        historical_predictions = models[1].predict(X_hist)
         historical_forecast_df = pd.DataFrame({'ds': df_featured_hist['date'], 'yhat': historical_predictions})
     else:
         historical_forecast_df = pd.DataFrame()
