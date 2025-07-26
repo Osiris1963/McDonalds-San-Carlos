@@ -273,7 +273,9 @@ def create_advanced_features(df):
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
-    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    
+    # --- FIXED: Robustly convert weekofyear to a standard integer type ---
+    df['weekofyear'] = pd.to_numeric(df['date'].dt.isocalendar().week, downcast='integer')
 
     df = df.sort_values('date')
     
@@ -295,7 +297,6 @@ def create_advanced_features(df):
         
     return df
 
-# --- ADDED: Function to run Optuna hyperparameter tuning ---
 @st.cache_data(show_spinner=False)
 def run_hyperparameter_tuning(_X, _y, target_col_name):
     """
@@ -325,7 +326,7 @@ def run_hyperparameter_tuning(_X, _y, target_col_name):
             return mae
 
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=30) # 30 trials is a good balance for speed and performance
+        study.optimize(objective, n_trials=30) 
 
         return study.best_params
 
@@ -417,7 +418,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame()
 
-    # --- MODIFIED: Get best params from Optuna instead of hardcoding ---
     best_params = run_hyperparameter_tuning(X, y, target_col)
     
     final_model = xgb.XGBRegressor(**best_params)
