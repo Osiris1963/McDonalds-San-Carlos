@@ -5,7 +5,7 @@ import xgboost as xgb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression # Added for Stacking Ensemble
+from sklearn.linear_model import LinearRegression 
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -19,6 +19,8 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import logging
+import shap # ADDED: For model explainability
+import matplotlib.pyplot as plt # ADDED: For rendering SHAP plots
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -161,13 +163,16 @@ def initialize_state_firestore(db_client):
         'forecast_df': pd.DataFrame(), 
         'metrics': {}, 
         'name': "Store 688", 
-        'authentication_status': True, # Set to True by default
-        'access_level': 1, # Set to 1 (highest level) by default
-        'username': "Admin", # Default username
+        'authentication_status': True,
+        'access_level': 1,
+        'username': "Admin",
         'forecast_components': pd.DataFrame(), 
         'migration_done': False,
         'show_recent_entries': False,
-        'show_all_activities': False
+        'show_all_activities': False,
+        'shap_explainer_cust': None, # ADDED: For SHAP
+        'shap_values_cust': None,    # ADDED: For SHAP
+        'X_cust': None,              # ADDED: For SHAP
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -261,7 +266,6 @@ def generate_recurring_local_events(start_date,end_date):
 # --- Core Forecasting Models ---
 
 def create_advanced_features(df):
-    """Creates time series, lag, and rolling window features from a datetime index."""
     df['date'] = pd.to_datetime(df['date'])
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
@@ -338,14 +342,14 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# --- MODIFIED: Replaced with the improved version for robust recursive forecasting ---
+# MODIFIED: Now returns the trained model and feature set X for SHAP analysis
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
 
     if df_train.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None, pd.DataFrame()
 
     df_featured = create_advanced_features(df_train.copy())
 
@@ -375,7 +379,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     if X.empty or len(X) < 10:
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
-        return pd.DataFrame()
+        return pd.DataFrame(), None, pd.DataFrame()
 
     best_params = {
         'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
@@ -431,18 +435,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     historical_predictions['yhat'] = final_model.predict(X)
 
     full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
-    return full_forecast_df
+    return full_forecast_df, final_model, X
 
 
-# --- ADDED: New function for advanced Stacking Ensemble ---
 def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, target_col_name):
-    """
-    Combines Prophet and XGBoost predictions using a stacking ensemble with a meta-model.
-    """
-    # 1. Merge the base model forecasts
     base_forecasts = pd.merge(prophet_f[['ds', 'yhat']], xgb_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
-    
-    # 2. Prepare the training data for the meta-model
     training_data = pd.merge(base_forecasts, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
     
     X_meta = training_data[['yhat_prophet', 'yhat_xgb']]
@@ -454,11 +451,9 @@ def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, tar
         combined['yhat'] = (combined['yhat_prophet'] + combined['yhat_xgb']) / 2
         return combined[['ds', 'yhat']]
 
-    # 3. Train the meta-model (Linear Regression is a good choice)
     meta_model = LinearRegression()
     meta_model.fit(X_meta, y_meta)
     
-    # 4. Generate the final, stacked forecast
     X_future_meta = base_forecasts[['yhat_prophet', 'yhat_xgb']]
     stacked_prediction = meta_model.predict(X_future_meta)
     
@@ -796,7 +791,7 @@ if db:
     
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-        st.info("Forecasting with a Stacking Ensemble Model")
+        st.info("Forecasting with an Explainable AI Ensemble")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -808,7 +803,6 @@ if db:
             if len(st.session_state.historical_df) < 50:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
-                # --- MODIFIED: Replaced with the new Stacking Ensemble workflow ---
                 with st.spinner("🧠 Initializing Stacking Ensemble Forecast..."):
                     base_df = st.session_state.historical_df.copy()
                     
@@ -824,12 +818,10 @@ if db:
                     
                     FORECAST_HORIZON = 15
                     
-                    # Step 1: Get base forecasts for ATV
                     with st.spinner("Running base models for Average Sale (ATV)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
-                        xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                        xgb_atv_f, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv') # SHAP not needed for ATV
                     
-                    # Step 2: Create stacked forecast for ATV
                     atv_f = pd.DataFrame()
                     with st.spinner("Stacking ATV models for final prediction..."):
                         if not prophet_atv_f.empty and not xgb_atv_f.empty:
@@ -837,21 +829,26 @@ if db:
                         else:
                             st.error("Failed to generate base ATV forecasts.")
                     
-                    # Step 3: Get base forecasts for Customers
                     cust_f = pd.DataFrame()
-                    with st.spinner("Running base models for Customers..."):
+                    with st.spinner("Running base models for Customers and preparing explanations..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
-                        # IMPORTANT: Pass the final, stacked ATV forecast to the XGBoost customer model
-                        xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
-                    
-                    # Step 4: Create stacked forecast for Customers
+                        xgb_cust_f, xgb_cust_model, X_cust = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
+                        
+                        # --- ADDED: Generate and store SHAP values ---
+                        if xgb_cust_model:
+                            with st.spinner("Calculating SHAP values for XGBoost explainability..."):
+                                explainer = shap.TreeExplainer(xgb_cust_model)
+                                shap_values = explainer(X_cust) # Use explainer as a function for newer SHAP versions
+                                st.session_state.shap_explainer_cust = explainer
+                                st.session_state.shap_values_cust = shap_values
+                                st.session_state.X_cust = X_cust
+
                     with st.spinner("Stacking Customer models for final prediction..."):
                         if not prophet_cust_f.empty and not xgb_cust_f.empty:
                             cust_f = train_and_forecast_stacked_ensemble(prophet_cust_f, xgb_cust_f, hist_df_with_atv, 'customers')
                         else:
                             st.error("Failed to generate base customer forecasts.")
                     
-                    # Final Combination of Stacked Forecasts
                     if not cust_f.empty and not atv_f.empty:
                         combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                         combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -884,13 +881,12 @@ if db:
                             st.error(f"Failed to save forecast log: {e}")
                         
                         if prophet_model_cust:
-                            # Generate components from the base prophet model for explainability
                             base_prophet_full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
                             prophet_forecast_components = prophet_model_cust.predict(base_prophet_full_future)
                             st.session_state.forecast_components = prophet_forecast_components
                             st.session_state.all_holidays = prophet_model_cust.holidays
                         
-                        st.success("Stacking ensemble forecast generated successfully!")
+                        st.success("Explainable AI forecast generated successfully!")
                     else:
                         st.error("Forecast generation failed. One or more components could not be built.")
 
@@ -916,7 +912,6 @@ if db:
                 d_t1,d_t2=st.tabs(["Customer Analysis","Avg. Transaction Analysis"]);
                 hist_atv=calculate_atv(st.session_state.historical_df.copy())
                 
-                # Create a temporary df for plotting customers
                 customer_plot_df = st.session_state.forecast_df.rename(columns={'forecast_customers': 'yhat'})
                 atv_plot_df = st.session_state.forecast_df.rename(columns={'forecast_atv': 'yhat'})
 
@@ -925,23 +920,81 @@ if db:
         else:st.info("Click the 'Generate Forecast' button to begin.")
     
     with tabs[1]:
-        st.info("The breakdown below is generated by the Prophet model component, showing the foundational drivers like trend and seasonality before the final stacking process.")
-        if'forecast_components'not in st.session_state or st.session_state.forecast_components.empty:st.info("Generate a forecast first to see the breakdown of its drivers.")
+        # --- MODIFIED: Revamped the entire insights tab for SHAP integration ---
+        st.header("💡 Forecast Insights")
+        if st.session_state.forecast_components.empty:
+            st.info("Click 'Generate Forecast' to see a breakdown of what drives the daily predictions.")
         else:
-            future_components=st.session_state.forecast_components[st.session_state.forecast_components['ds']>=pd.to_datetime('today').normalize()].copy()
+            future_components = st.session_state.forecast_components[st.session_state.forecast_components['ds'] >= pd.to_datetime('today').normalize()].copy()
             if not future_components.empty:
-                # We need to merge the final 'yhat' from the customer forecast for the "Final Forecast" bar
                 cust_forecast_final = st.session_state.forecast_df[['ds', 'forecast_customers']].rename(columns={'forecast_customers': 'final_yhat'})
                 future_components = pd.merge(future_components, cust_forecast_final, on='ds', how='left')
-                future_components['yhat'] = future_components['final_yhat'].fillna(future_components['yhat']) # Use final yhat
+                future_components['yhat'] = future_components['final_yhat'].fillna(future_components['yhat'])
 
-                future_components['date_str']=future_components['ds'].dt.strftime('%A,%B %d,%Y')
-                selected_date_str=st.selectbox("Select a day to analyze its forecast drivers:",options=future_components['date_str'])
-                selected_date=future_components[future_components['date_str']==selected_date_str]['ds'].iloc[0]
-                breakdown_fig,day_data=plot_forecast_breakdown(st.session_state.forecast_components,selected_date,st.session_state.all_holidays)
-                st.plotly_chart(breakdown_fig,use_container_width=True);st.markdown("---");st.subheader("Insight Summary");st.markdown(generate_insight_summary(day_data,selected_date))
-            else:st.warning("No future dates available in the forecast components to analyze.")
-    
+                future_components['date_str'] = future_components['ds'].dt.strftime('%A, %B %d, %Y')
+                selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
+                selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
+
+                insight_tab1, insight_tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
+
+                with insight_tab1:
+                    st.subheader("Prophet Model Breakdown")
+                    st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
+                    breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                    st.plotly_chart(breakdown_fig, use_container_width=True)
+                    st.markdown("---")
+                    st.subheader("Prophet Insight Summary")
+                    st.markdown(generate_insight_summary(day_data, selected_date))
+
+                with insight_tab2:
+                    st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
+                    st.info("This waterfall chart shows exactly how each feature contributed to the **XGBoost base model's** customer prediction for the selected day. This reveals the impact of recent sales, weather, and other advanced features.")
+                    
+                    if st.session_state.shap_values_cust is None:
+                        st.warning("SHAP values not available. Please regenerate the forecast.")
+                    else:
+                        # Find the integer index for the selected date in the original feature dataframe
+                        X_cust_df = st.session_state.X_cust
+                        date_list = st.session_state.historical_df['date'].tolist()
+                        
+                        try:
+                            # We need to find the index in the *feature dataframe* X_cust, which is smaller than historical_df
+                            target_date = pd.to_datetime(selected_date).date()
+                            
+                            # Find the first date in X_cust's original index that matches
+                            matching_rows = st.session_state.historical_df[st.session_state.historical_df['date'].dt.date == target_date]
+
+                            if not matching_rows.empty:
+                                first_match_index = matching_rows.index[0]
+                                # Find the position of this index within the X_cust dataframe's index
+                                date_idx_loc = X_cust_df.index.get_loc(first_match_index)
+
+                                st.markdown(f"##### SHAP Explanation for {selected_date_str}")
+
+                                fig, ax = plt.subplots(figsize=(10, 5))
+                                shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
+                                plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
+                                plt.tight_layout()
+                                st.pyplot(fig)
+                                plt.clf()
+
+                                with st.expander("View Overall Feature Importance (Summary Plot)"):
+                                    st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
+                                    fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
+                                    shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
+                                    plt.tight_layout()
+                                    st.pyplot(fig_summary)
+                                    plt.clf()
+
+                            else:
+                                st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot.")
+                        
+                        except (KeyError, IndexError) as e:
+                            st.error(f"Error locating data for SHAP plot: {e}. The selected date might not have been used in the XGBoost model training (e.g., it was removed as an outlier or was too recent).")
+
+            else:
+                st.warning("No future dates available in the forecast components to analyze.")
+
     with tabs[2]:
         st.header("📈 Forecast Evaluator")
         st.info(
@@ -988,8 +1041,6 @@ if db:
 
                 st.subheader(f"Accuracy Metrics for the Last {days} Days")
                 
-                final_df['adjusted_predicted_sales'] = final_df['predicted_sales'] # No longer need to adjust for add-ons here as they are part of base sales now
-
                 sales_mae = mean_absolute_error(final_df['sales'], final_df['predicted_sales'])
                 cust_mae = mean_absolute_error(final_df['customers'], final_df['predicted_customers'])
                 
