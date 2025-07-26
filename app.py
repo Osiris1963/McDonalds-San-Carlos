@@ -21,7 +21,7 @@ import json
 import logging
 import shap
 import matplotlib.pyplot as plt
-from pkg_resources import parse_version
+from pkg_resources import parse_version # ROBUSTNESS FIX: For checking library versions
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -230,7 +230,6 @@ def calculate_atv(df):
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
-# FIXED: Changed to @st.cache_resource to prevent excessive API calls
 @st.cache_resource(ttl=3600)
 def get_weather_forecast(days=16):
     try:
@@ -416,7 +415,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
-            # FIXED: This logic is now robust to different xgboost versions
+            # ROBUSTNESS FIX: Conditionally add early_stopping_rounds based on xgboost version
             fit_params = {
                 "eval_set": [(X_val, y_val)],
                 "sample_weight": sample_weights,
@@ -940,7 +939,7 @@ if db:
                                         "generated_on": today_date,
                                         "forecast_for_date": pd.to_datetime(row['ds']),
                                         "predicted_sales": row['forecast_sales'],
-                                        "predicted_customers": row['forecast_customers'] # FIXED TYPO
+                                        "predicted_customers": row['forecast_customers']
                                     }
                                     doc_id = f"{today_date.strftime('%Y-%m-%d')}_{pd.to_datetime(row['ds']).strftime('%Y-%m-%d')}"
                                     db.collection('forecast_log').document(doc_id).set(log_entry)
