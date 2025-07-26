@@ -10,9 +10,7 @@ import numpy as np
 import plotly.graph_objs as go
 import yaml
 from yaml.loader import SafeLoader
-import io
 import time
-import os
 import requests
 from datetime import timedelta, date
 import firebase_admin
@@ -506,8 +504,13 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     
     if 'date' in data and pd.notna(data['date']):
         current_date = pd.to_datetime(data['date'])
-        last_year_date = current_date - timedelta(days=364)
-        
+        # ROBUSTNESS FIX: Correctly find the same date last year, accounting for leap years.
+        # This is more accurate than subtracting a fixed 364 days.
+        try:
+            last_year_date = current_date.replace(year=current_date.year - 1)
+        except ValueError: # Handles leap year case e.g., Feb 29
+            last_year_date = current_date.replace(year=current_date.year - 1, day=28)
+
         hist_copy = historical_df.copy()
         hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
         
@@ -620,7 +623,9 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
         sales_mape = np.mean(np.abs((actual_s[non_zero_mask_s] - forecast_s[non_zero_mask_s]) / actual_s[non_zero_mask_s])) * 100
         
     sales_mae = mean_absolute_error(actual_s, forecast_s)
-    sales_accuracy = 100 - sales_mape
+    # ROBUSTNESS FIX: Prevent negative accuracy if MAPE > 100
+    sales_accuracy = max(0, 100 - sales_mape)
+
 
     actual_c = eval_df_period['actual_customers']
     forecast_c = eval_df_period['forecast_customers']
@@ -632,7 +637,8 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
         customer_mape = np.mean(np.abs((actual_c[non_zero_mask_c] - forecast_c[non_zero_mask_c]) / actual_c[non_zero_mask_c])) * 100
 
     customer_mae = mean_absolute_error(actual_c, forecast_c)
-    customer_accuracy = 100 - customer_mape
+    # ROBUSTNESS FIX: Prevent negative accuracy if MAPE > 100
+    customer_accuracy = max(0, 100 - customer_mape)
     
     return {
         "sales_accuracy": sales_accuracy,
@@ -817,9 +823,14 @@ def render_historical_record(row, db_client):
             edit_cols2 = st.columns(2)
             updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
             
-            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
-            current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
+            # ROBUSTNESS FIX: Prevent ValueError if a weather condition exists in data but not in the options.
+            # Expanded list to include all possible values from the API mapping function.
+            weather_options = ["Sunny", "Partly Cloudy", "Cloudy", "Foggy", "Rainy", "Rain Showers", "Thunderstorm", "Storm"]
+            current_weather = row.get('weather', 'Cloudy') # Default to 'Cloudy' if missing
+            # Safely get the index, defaulting to 0 if the value is not in the list.
+            current_weather_index = weather_options.index(current_weather) if current_weather in weather_options else 0
             updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+
 
             day_type_options = ["Normal Day", "Not Normal Day"]
             current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
@@ -1047,7 +1058,8 @@ if db:
                         plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
                         plt.tight_layout()
                         st.pyplot(fig)
-                        plt.clf()
+                        # BUG FIX: Explicitly close the matplotlib figure to prevent memory leaks
+                        plt.close(fig)
 
                         with st.expander("View Overall Feature Importance (Summary Plot)"):
                             st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
@@ -1055,7 +1067,8 @@ if db:
                             shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
                             plt.tight_layout()
                             st.pyplot(fig_summary)
-                            plt.clf()
+                            # BUG FIX: Explicitly close the matplotlib figure to prevent memory leaks
+                            plt.close(fig_summary)
                     else:
                         st.warning(shap_error_message or "SHAP values not available. Please regenerate the forecast.")
 
@@ -1117,12 +1130,16 @@ if db:
                 actual_cust_safe = final_df['customers'].replace(0, np.nan)
                 cust_mape = np.nanmean(np.abs((final_df['customers'] - final_df['predicted_customers']) / actual_cust_safe)) * 100
 
+                # ROBUSTNESS FIX: Prevent negative accuracy from being displayed
+                sales_accuracy = max(0, 100 - sales_mape)
+                cust_accuracy = max(0, 100 - cust_mape)
+
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.metric(label="Sales MAPE (Accuracy)", value=f"{100 - sales_mape:.2f}%")
+                    st.metric(label="Sales Accuracy (vs MAPE)", value=f"{sales_accuracy:.2f}%")
                     st.metric(label="Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
                 with col2:
-                    st.metric(label="Customer MAPE (Accuracy)", value=f"{100 - cust_mape:.2f}%")
+                    st.metric(label="Customer Accuracy (vs MAPE)", value=f"{cust_accuracy:.2f}%")
                     st.metric(label="Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
 
                 st.markdown("---")
