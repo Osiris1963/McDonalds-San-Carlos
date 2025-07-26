@@ -19,13 +19,14 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import logging
-import shap # ADDED: For model explainability
-import matplotlib.pyplot as plt # ADDED: For rendering SHAP plots
+import shap
+import matplotlib.pyplot as plt
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+# Set Optuna verbosity to only show errors, keeping the console clean
+optuna.logging.set_verbosity(optuna.logging.ERROR)
 
 
 # --- Page Configuration ---
@@ -170,9 +171,9 @@ def initialize_state_firestore(db_client):
         'migration_done': False,
         'show_recent_entries': False,
         'show_all_activities': False,
-        'shap_explainer_cust': None, # ADDED: For SHAP
-        'shap_values_cust': None,    # ADDED: For SHAP
-        'X_cust': None,              # ADDED: For SHAP
+        'shap_explainer_cust': None,
+        'shap_values_cust': None,
+        'X_cust': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -294,6 +295,41 @@ def create_advanced_features(df):
         
     return df
 
+# --- ADDED: Function to run Optuna hyperparameter tuning ---
+@st.cache_data(show_spinner=False)
+def run_hyperparameter_tuning(_X, _y, target_col_name):
+    """
+    Performs Optuna hyperparameter search for an XGBoost model.
+    The results are cached to avoid re-running on every script run.
+    """
+    with st.info(f"🚀 Running first-time hyperparameter tuning for **{target_col_name}**. This may take a minute but will be cached for future forecasts..."):
+        # Time-series split for validation
+        X_train, X_val, y_train, y_val = train_test_split(_X, _y, test_size=0.2, shuffle=False)
+
+        def objective(trial):
+            params = {
+                'objective': 'reg:squarederror',
+                'n_estimators': trial.suggest_int('n_estimators', 400, 1500, step=100),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'gamma': trial.suggest_float('gamma', 0, 5),
+                'random_state': 42
+            }
+            
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+            preds = model.predict(X_val)
+            mae = mean_absolute_error(y_val, preds)
+            return mae
+
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=30) # 30 trials is a good balance for speed and performance
+
+        return study.best_params
+
+
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
@@ -342,7 +378,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# MODIFIED: Now returns the trained model and feature set X for SHAP analysis
+
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -381,11 +417,9 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame()
 
-    best_params = {
-        'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
-        'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
-    }
-
+    # --- MODIFIED: Get best params from Optuna instead of hardcoding ---
+    best_params = run_hyperparameter_tuning(X, y, target_col)
+    
     final_model = xgb.XGBRegressor(**best_params)
     sample_weights = np.linspace(0.5, 1.0, len(y))
     final_model.fit(X, y, sample_weight=sample_weights)
@@ -791,7 +825,7 @@ if db:
     
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-        st.info("Forecasting with an Explainable AI Ensemble")
+        st.info("Forecasting with a Self-Tuning, Explainable AI")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -803,7 +837,7 @@ if db:
             if len(st.session_state.historical_df) < 50:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
-                with st.spinner("🧠 Initializing Stacking Ensemble Forecast..."):
+                with st.spinner("🧠 Initializing Self-Tuning AI Forecast..."):
                     base_df = st.session_state.historical_df.copy()
                     
                     base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
@@ -820,7 +854,7 @@ if db:
                     
                     with st.spinner("Running base models for Average Sale (ATV)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
-                        xgb_atv_f, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv') # SHAP not needed for ATV
+                        xgb_atv_f, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                     
                     atv_f = pd.DataFrame()
                     with st.spinner("Stacking ATV models for final prediction..."):
@@ -834,11 +868,10 @@ if db:
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                         xgb_cust_f, xgb_cust_model, X_cust = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
                         
-                        # --- ADDED: Generate and store SHAP values ---
                         if xgb_cust_model:
                             with st.spinner("Calculating SHAP values for XGBoost explainability..."):
                                 explainer = shap.TreeExplainer(xgb_cust_model)
-                                shap_values = explainer(X_cust) # Use explainer as a function for newer SHAP versions
+                                shap_values = explainer(X_cust)
                                 st.session_state.shap_explainer_cust = explainer
                                 st.session_state.shap_values_cust = shap_values
                                 st.session_state.X_cust = X_cust
@@ -886,7 +919,7 @@ if db:
                             st.session_state.forecast_components = prophet_forecast_components
                             st.session_state.all_holidays = prophet_model_cust.holidays
                         
-                        st.success("Explainable AI forecast generated successfully!")
+                        st.success("Self-Tuning AI forecast generated successfully!")
                     else:
                         st.error("Forecast generation failed. One or more components could not be built.")
 
@@ -920,7 +953,6 @@ if db:
         else:st.info("Click the 'Generate Forecast' button to begin.")
     
     with tabs[1]:
-        # --- MODIFIED: Revamped the entire insights tab for SHAP integration ---
         st.header("💡 Forecast Insights")
         if st.session_state.forecast_components.empty:
             st.info("Click 'Generate Forecast' to see a breakdown of what drives the daily predictions.")
@@ -953,24 +985,14 @@ if db:
                     if st.session_state.shap_values_cust is None:
                         st.warning("SHAP values not available. Please regenerate the forecast.")
                     else:
-                        # Find the integer index for the selected date in the original feature dataframe
                         X_cust_df = st.session_state.X_cust
-                        date_list = st.session_state.historical_df['date'].tolist()
                         
                         try:
-                            # We need to find the index in the *feature dataframe* X_cust, which is smaller than historical_df
-                            target_date = pd.to_datetime(selected_date).date()
-                            
-                            # Find the first date in X_cust's original index that matches
-                            matching_rows = st.session_state.historical_df[st.session_state.historical_df['date'].dt.date == target_date]
-
-                            if not matching_rows.empty:
-                                first_match_index = matching_rows.index[0]
-                                # Find the position of this index within the X_cust dataframe's index
-                                date_idx_loc = X_cust_df.index.get_loc(first_match_index)
+                            matching_date_index = X_cust_df[X_cust_df.index.isin(st.session_state.historical_df[st.session_state.historical_df['date'] == selected_date].index)].index
+                            if not matching_date_index.empty:
+                                date_idx_loc = X_cust_df.index.get_loc(matching_date_index[0])
 
                                 st.markdown(f"##### SHAP Explanation for {selected_date_str}")
-
                                 fig, ax = plt.subplots(figsize=(10, 5))
                                 shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
                                 plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
@@ -985,16 +1007,15 @@ if db:
                                     plt.tight_layout()
                                     st.pyplot(fig_summary)
                                     plt.clf()
-
                             else:
-                                st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot.")
+                                st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot. This can happen for very recent dates not used in model training.")
                         
                         except (KeyError, IndexError) as e:
                             st.error(f"Error locating data for SHAP plot: {e}. The selected date might not have been used in the XGBoost model training (e.g., it was removed as an outlier or was too recent).")
 
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
-
+    
     with tabs[2]:
         st.header("📈 Forecast Evaluator")
         st.info(
