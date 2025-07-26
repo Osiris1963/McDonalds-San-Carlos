@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
-import lightgbm as lgb  # ADDED: For LightGBM model
-import catboost as cb   # ADDED: For CatBoost model
+import lightgbm as lgb
+import catboost as cb
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LinearRegression, Ridge # MODIFIED: Added Ridge for meta-learning
+from sklearn.linear_model import LinearRegression, Ridge
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -152,7 +152,6 @@ def init_firestore():
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
-    # MODIFIED: More specific exception handling
     except (ValueError, credentials.InvalidCredentialError) as e:
         st.error(f"Firestore Authentication Error: Please check your Streamlit Secrets. Details: {e}")
         return None
@@ -212,6 +211,12 @@ def load_from_firestore(_db_client, collection_name):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # Ensure 'day_type' exists and fill missing values
+    if 'day_type' not in df.columns:
+        df['day_type'] = 'Normal Day'
+    else:
+        df['day_type'] = df['day_type'].fillna('Normal Day')
 
     return df
 
@@ -354,8 +359,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 
     return forecast[['ds', 'yhat']], prophet_model
 
-
-# ADDED: New generic function for tree-based models (XGB, LGB, CatBoost)
 @st.cache_resource
 def train_and_forecast_tree_model(historical_df, events_df, periods, target_col, model_type='xgb', atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -365,10 +368,12 @@ def train_and_forecast_tree_model(historical_df, events_df, periods, target_col,
         return pd.DataFrame(), None, pd.DataFrame()
 
     df_featured = create_advanced_features(df_train.copy())
-    df_featured['day_type'] = df_featured['day_type'].astype('category') # For CatBoost/LGBM
+    df_featured['day_type'] = df_featured['day_type'].astype('category')
 
     if 'day_type' in df_featured.columns:
-        df_featured['is_not_normal_day'] = df_featured['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+        # --- THIS IS THE FIX ---
+        # Replaced the .apply method with a direct, vectorized boolean comparison
+        df_featured['is_not_normal_day'] = (df_featured['day_type'] == 'Not Normal Day').astype(int)
     else:
         df_featured['is_not_normal_day'] = 0
 
@@ -395,27 +400,21 @@ def train_and_forecast_tree_model(historical_df, events_df, periods, target_col,
         st.warning(f"Not enough data to train {model_type.upper()} for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame()
 
-    # Model Initialization
     if model_type == 'xgb':
         model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=1000, learning_rate=0.05,
-                                 max_depth=5, subsample=0.8, colsample_bytree=0.8, random_state=42,
-                                 enable_categorical=True) # Note: enable_categorical for newer versions
+                                 max_depth=5, subsample=0.8, colsample_bytree=0.8, random_state=42)
     elif model_type == 'lgb':
         model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=1000, learning_rate=0.05,
                                   num_leaves=31, max_depth=-1, subsample=0.8, colsample_bytree=0.8, random_state=42)
     elif model_type == 'cat':
-        # CatBoost handles categorical features automatically if they are of 'category' dtype
-        categorical_features_indices = [i for i, col in enumerate(X.columns) if X[col].dtype == 'category']
         model = cb.CatBoostRegressor(iterations=1000, learning_rate=0.05, depth=6, loss_function='MAE',
-                                     random_seed=42, verbose=0, cat_features=categorical_features_indices)
+                                     random_seed=42, verbose=0)
 
     sample_weights = np.linspace(0.5, 1.0, len(y))
     model.fit(X, y, sample_weight=sample_weights)
 
-    # --- Recursive Forecasting ---
     future_predictions = []
     history_with_features = df_featured.copy()
-
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
 
     for i in range(periods):
@@ -423,17 +422,15 @@ def train_and_forecast_tree_model(historical_df, events_df, periods, target_col,
         next_date = last_date + timedelta(days=1)
         future_step_df = pd.DataFrame([{'date': next_date}])
 
-        # Create features for the future step
         extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
         extended_featured_df = create_advanced_features(extended_history)
-        extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+        extended_featured_df['is_not_normal_day'] = (extended_featured_df['day_type'] == 'Not Normal Day').astype(int)
         extended_featured_df['day_type'] = extended_featured_df['day_type'].astype('category')
 
         X_future = extended_featured_df[features].tail(1)
         prediction = model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
 
-        # Update history with the new prediction for the next loop
         history_with_features = extended_featured_df.copy()
         history_with_features.loc[history_with_features.index.max(), target] = prediction
 
@@ -449,22 +446,16 @@ def train_and_forecast_tree_model(historical_df, events_df, periods, target_col,
     full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
     return full_forecast_df, model, X
 
-# ADDED: New function for advanced meta-ensemble
 @st.cache_resource
 def train_and_forecast_meta_ensemble(base_forecasts, historical_target, target_col_name):
-    """
-    Trains a meta-learner (Ridge Regression) on the predictions of base models.
-    """
-    # Combine all base model forecasts into one DataFrame
     final_df = base_forecasts[0].rename(columns={'yhat': 'yhat_0'})
     for i, f in enumerate(base_forecasts[1:], 1):
-        final_df = pd.merge(final_df, f.rename(columns={'yhat': f'yhat_{i}'}), on='ds')
+        if not f.empty:
+            final_df = pd.merge(final_df, f.rename(columns={'yhat': f'yhat_{i}'}), on='ds', how='left')
 
-    # Prepare training data for the meta-model
     training_data = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
-    if training_data.empty:
-        st.warning(f"Meta-ensemble for {target_col_name} failed: No overlapping historical data.")
-        # Fallback to simple average
+    if training_data.empty or training_data.filter(like='yhat').isnull().values.any():
+        st.warning(f"Meta-ensemble for {target_col_name} failed: Not enough data. Falling back to simple average.")
         combined = final_df.copy()
         combined['yhat'] = combined.filter(like='yhat').mean(axis=1)
         return combined[['ds', 'yhat']]
@@ -473,12 +464,10 @@ def train_and_forecast_meta_ensemble(base_forecasts, historical_target, target_c
     X_meta = training_data[meta_features]
     y_meta = training_data[target_col_name]
 
-    # Use Ridge regression as the meta-model for robustness
     meta_model = Ridge(alpha=1.0)
     meta_model.fit(X_meta, y_meta)
 
-    # Predict on the full forecast horizon
-    X_future_meta = final_df[meta_features]
+    X_future_meta = final_df[meta_features].fillna(0) # Fill NaNs before predicting
     stacked_prediction = meta_model.predict(X_future_meta)
 
     final_forecast = final_df[['ds']].copy()
@@ -486,10 +475,8 @@ def train_and_forecast_meta_ensemble(base_forecasts, historical_target, target_c
 
     return final_forecast
 
-# ADDED: Cached function for SHAP value generation
 @st.cache_data
 def get_shap_values(_model, _X):
-    """Calculates and caches SHAP values for XGBoost."""
     st.info("Cache miss: Calculating new SHAP values for the XGBoost model.")
     explainer = shap.TreeExplainer(_model)
     shap_values = explainer(_X)
@@ -823,7 +810,7 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-        st.info("Forecasting with an Advanced Hybrid Ensemble (Prophet, XGBoost, LightGBM, CatBoost)") # MODIFIED: Updated description
+        st.info("Forecasting with an Advanced Hybrid Ensemble (Prophet, XGBoost, LightGBM, CatBoost)")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -850,7 +837,6 @@ if db:
 
                     FORECAST_HORIZON = 15
 
-                    # --- Base Model Training: ATV ---
                     with st.spinner("Running base models for Average Sale (ATV)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                         xgb_atv_f, _, _ = train_and_forecast_tree_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv', model_type='xgb')
@@ -865,7 +851,6 @@ if db:
                         else:
                             st.error("Failed to generate one or more base ATV forecasts.")
 
-                    # --- Base Model Training: Customers ---
                     cust_f = pd.DataFrame()
                     with st.spinner("Running base models for Customers..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
@@ -873,7 +858,6 @@ if db:
                         lgb_cust_f, _, _ = train_and_forecast_tree_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', model_type='lgb', atv_forecast_df=atv_f)
                         cat_cust_f, _, _ = train_and_forecast_tree_model(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', model_type='cat', atv_forecast_df=atv_f)
 
-                        # --- MODIFIED: Use the cached function for SHAP values ---
                         if xgb_cust_model and not X_cust.empty:
                             explainer, shap_values = get_shap_values(xgb_cust_model, X_cust)
                             st.session_state.shap_explainer_cust = explainer
@@ -887,7 +871,6 @@ if db:
                         else:
                             st.error("Failed to generate one or more base customer forecasts.")
 
-                    # --- Final Combination ---
                     if not cust_f.empty and not atv_f.empty:
                         combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                         combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -994,19 +977,13 @@ if db:
                         X_cust_df = st.session_state.X_cust
                         
                         try:
-                            # The 'ds' in future_components corresponds to dates in X_cust's index (after being processed)
-                            # We need to find the correct index in the SHAP values array.
-                            # SHAP values and X_cust have the same order.
-                            hist_dates_in_X = create_advanced_features(st.session_state.historical_df.copy()).dropna(subset=['sales_lag_7'])['date']
                             date_to_find = pd.to_datetime(selected_date)
-
-                            # Find the integer position of the date
-                            matching_indices = hist_dates_in_X[hist_dates_in_X == date_to_find].index
-                            if not matching_indices.empty:
-                                date_idx_loc_in_X = matching_indices[0]
-                                date_idx_pos = X_cust_df.index.get_loc(date_idx_loc_in_X)
+                            # Find the integer position of the date in the original, processed dataframe's index
+                            date_idx_loc = X_cust_df[X_cust_df.index.isin(st.session_state.historical_df[st.session_state.historical_df['date'] == date_to_find].index)].index[0]
+                            date_idx_pos = X_cust_df.index.get_loc(date_idx_loc)
 
 
+                            if date_idx_pos is not None:
                                 st.markdown(f"##### SHAP Explanation for {selected_date_str}")
 
                                 fig, ax = plt.subplots(figsize=(10, 5))
@@ -1014,7 +991,7 @@ if db:
                                 plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
                                 plt.tight_layout()
                                 st.pyplot(fig)
-                                plt.clf() # Clear the figure to prevent it from being displayed again
+                                plt.clf()
 
                                 with st.expander("View Overall Feature Importance (Summary Plot)"):
                                     st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
@@ -1023,12 +1000,11 @@ if db:
                                     plt.tight_layout()
                                     st.pyplot(fig_summary)
                                     plt.clf()
-
                             else:
                                 st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot. The selected date might be in the future or was removed during data cleaning.")
 
                         except (KeyError, IndexError) as e:
-                            st.error(f"Error locating data for SHAP plot: {e}. The selected date might not have been used in the XGBoost model training (e.g., it was removed as an outlier or was too recent).")
+                            st.error(f"Error locating data for SHAP plot: {e}. The selected date might not have been used in the XGBoost model training (e.g., it was removed as an outlier).")
 
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
