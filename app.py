@@ -21,6 +21,7 @@ import json
 import logging
 import shap
 import matplotlib.pyplot as plt
+from pkg_resources import parse_version
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -210,7 +211,6 @@ def load_from_firestore(_db_client, collection_name):
     return df
 
 def cap_outliers_iqr(df, column='sales'):
-    """ REPLACES remove_outliers_iqr. Caps extreme values instead of dropping them. """
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
@@ -230,7 +230,8 @@ def calculate_atv(df):
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
-@st.cache_data(ttl=3600)
+# FIXED: Changed to @st.cache_resource to prevent excessive API calls
+@st.cache_resource(ttl=3600)
 def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
@@ -415,12 +416,16 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
-            # This is the correct implementation for modern (>=1.7.0) versions of xgboost
-            model.fit(X_train, y_train, 
-                      eval_set=[(X_val, y_val)], 
-                      early_stopping_rounds=50, 
-                      verbose=False,
-                      sample_weight=sample_weights)
+            # FIXED: This logic is now robust to different xgboost versions
+            fit_params = {
+                "eval_set": [(X_val, y_val)],
+                "sample_weight": sample_weights,
+                "verbose": False
+            }
+            if parse_version(xgb.__version__) >= parse_version("1.6.0"):
+                fit_params["early_stopping_rounds"] = 50
+            
+            model.fit(X_train, y_train, **fit_params)
                       
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
@@ -935,7 +940,7 @@ if db:
                                         "generated_on": today_date,
                                         "forecast_for_date": pd.to_datetime(row['ds']),
                                         "predicted_sales": row['forecast_sales'],
-                                        "predicted_customers": row['predicted_customers']
+                                        "predicted_customers": row['forecast_customers'] # FIXED TYPO
                                     }
                                     doc_id = f"{today_date.strftime('%Y-%m-%d')}_{pd.to_datetime(row['ds']).strftime('%Y-%m-%d')}"
                                     db.collection('forecast_log').document(doc_id).set(log_entry)
