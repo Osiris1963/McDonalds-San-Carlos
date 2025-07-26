@@ -297,12 +297,7 @@ def create_advanced_features(df):
 
 @st.cache_data(show_spinner=False)
 def run_hyperparameter_tuning(_X, _y, target_col_name):
-    """
-    Performs Optuna hyperparameter search for an XGBoost model.
-    The results are cached to avoid re-running on every script run.
-    """
     with st.info(f"🚀 Running first-time hyperparameter tuning for **{target_col_name}**. This may take a minute but will be cached for future forecasts..."):
-        # --- FIXED: Robustly convert all data to a standard float type before training ---
         X_clean = _X.astype('float32')
         y_clean = _y.astype('float32')
         
@@ -321,7 +316,8 @@ def run_hyperparameter_tuning(_X, _y, target_col_name):
             }
             
             model = xgb.XGBRegressor(**params)
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+            # --- FIXED: Removed early_stopping_rounds to resolve the TypeError ---
+            model.fit(X_train, y_train, verbose=False)
             preds = model.predict(X_val)
             mae = mean_absolute_error(y_val, preds)
             return mae
