@@ -273,8 +273,6 @@ def create_advanced_features(df):
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
-    
-    # --- FIXED: Robustly convert weekofyear to a standard integer type ---
     df['weekofyear'] = pd.to_numeric(df['date'].dt.isocalendar().week, downcast='integer')
 
     df = df.sort_values('date')
@@ -304,8 +302,11 @@ def run_hyperparameter_tuning(_X, _y, target_col_name):
     The results are cached to avoid re-running on every script run.
     """
     with st.info(f"🚀 Running first-time hyperparameter tuning for **{target_col_name}**. This may take a minute but will be cached for future forecasts..."):
-        # Time-series split for validation
-        X_train, X_val, y_train, y_val = train_test_split(_X, _y, test_size=0.2, shuffle=False)
+        # --- FIXED: Robustly convert all data to a standard float type before training ---
+        X_clean = _X.astype('float32')
+        y_clean = _y.astype('float32')
+        
+        X_train, X_val, y_train, y_val = train_test_split(X_clean, y_clean, test_size=0.2, shuffle=False)
 
         def objective(trial):
             params = {
