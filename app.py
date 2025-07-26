@@ -169,7 +169,12 @@ def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
     
     docs = _db_client.collection(collection_name).stream()
-    records = [doc.to_dict() for doc in docs]
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+
     if not records: return pd.DataFrame()
     
     df = pd.DataFrame(records)
@@ -379,7 +384,252 @@ def train_and_forecast_stacked_ensemble(prophet_f, model_f, historical_target, t
     
     return final_forecast
 
-# ... [All helper functions from add_to_firestore to render_historical_record are unchanged] ...
+# --- ADDED BACK: All helper functions for UI, plotting, and database I/O ---
+def add_to_firestore(db_client, collection_name, data, historical_df):
+    if db_client is None: return
+    
+    if 'date' in data and pd.notna(data['date']):
+        current_date = pd.to_datetime(data['date'])
+        last_year_date = current_date - timedelta(days=364)
+        
+        hist_copy = historical_df.copy()
+        hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
+        
+        last_year_record = hist_copy[hist_copy['date_only'] == last_year_date.date()]
+        
+        if not last_year_record.empty:
+            data['last_year_sales'] = last_year_record['sales'].iloc[0]
+            data['last_year_customers'] = last_year_record['customers'].iloc[0]
+        else:
+            data['last_year_sales'] = 0.0
+            data['last_year_customers'] = 0.0
+            
+        data['date'] = current_date.to_pydatetime()
+    else: 
+        return
+
+    all_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'weather', 'day_type', 'day_type_notes']
+    for col in all_cols:
+        if col in data and data[col] is not None:
+            if col not in ['weather', 'day_type', 'day_type_notes']:
+                 data[col] = float(pd.to_numeric(data[col], errors='coerce'))
+        else:
+            if col not in ['weather', 'day_type', 'day_type_notes']:
+                data[col] = 0.0
+            else:
+                data[col] = "N/A" if col == 'weather' else "Normal Day"
+
+    db_client.collection(collection_name).add(data)
+
+
+def update_historical_record_in_firestore(db_client, doc_id, data):
+    if db_client is None: return
+    db_client.collection('historical_data').document(doc_id).update(data)
+
+def update_activity_in_firestore(db_client, doc_id, data):
+    if db_client is None: return
+    if 'potential_sales' in data:
+        data['potential_sales'] = float(data['potential_sales'])
+    db_client.collection('future_activities').document(doc_id).update(data)
+
+def delete_from_firestore(db_client, collection_name, doc_id):
+    if db_client is None: return
+    db_client.collection(collection_name).document(doc_id).delete()
+
+def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
+
+def plot_full_comparison_chart(hist,fcst,metrics,target):
+    fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
+    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
+
+def plot_forecast_breakdown(components,selected_date,all_events):
+    day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
+    x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
+    if 'weekly' in day_data and pd.notna(day_data['weekly']):
+        x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
+    if 'daily' in day_data and pd.notna(day_data['daily']):
+        x_data.append('Time of Day Effect');y_data.append(day_data['daily']);measure_data.append('relative')
+    if 'yearly' in day_data and pd.notna(day_data['yearly']):
+        x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
+    if 'holidays' in day_data and pd.notna(day_data['holidays']):
+        holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
+        x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
+    x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+
+def create_daily_evaluation_data(historical_df, forecast_df):
+    if forecast_df.empty or historical_df.empty: return pd.DataFrame()
+    hist_eval = historical_df.copy(); hist_eval['date'] = pd.to_datetime(hist_eval['date']); hist_eval = hist_eval[['date', 'sales', 'customers', 'add_on_sales']]; hist_eval.rename(columns={'sales': 'actual_sales', 'customers': 'actual_customers'}, inplace=True)
+    fcst_eval = forecast_df.copy(); fcst_eval['ds'] = pd.to_datetime(fcst_eval['ds']); fcst_eval = fcst_eval[['ds', 'forecast_sales', 'forecast_customers']]
+    eval_df = pd.merge(hist_eval, fcst_eval, left_on='date', right_on='ds', how='inner')
+    if eval_df.empty: return pd.DataFrame()
+    eval_df.drop(columns=['ds'], inplace=True)
+    eval_df['adjusted_forecast_sales'] = pd.to_numeric(eval_df['forecast_sales'], errors='coerce').fillna(0) + pd.to_numeric(eval_df['add_on_sales'], errors='coerce').fillna(0)
+    return eval_df
+
+def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
+    eval_df = create_daily_evaluation_data(historical_df, forecast_df)
+    if eval_df is None or eval_df.empty: return None
+    period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
+    eval_df_period = eval_df[eval_df['date'] >= period_start_date].copy()
+    if eval_df_period.empty: return None
+    actual_s = eval_df_period['actual_sales']; forecast_s = eval_df_period['adjusted_forecast_sales']
+    non_zero_mask_s = actual_s != 0
+    sales_mape = np.mean(np.abs((actual_s[non_zero_mask_s] - forecast_s[non_zero_mask_s]) / actual_s[non_zero_mask_s])) * 100 if non_zero_mask_s.any() else float('inf')
+    sales_mae = mean_absolute_error(actual_s, forecast_s)
+    actual_c = eval_df_period['actual_customers']; forecast_c = eval_df_period['forecast_customers']
+    non_zero_mask_c = actual_c != 0
+    customer_mape = np.mean(np.abs((actual_c[non_zero_mask_c] - forecast_c[non_zero_mask_c]) / actual_c[non_zero_mask_c])) * 100 if non_zero_mask_c.any() else float('inf')
+    customer_mae = mean_absolute_error(actual_c, forecast_c)
+    return {"sales_accuracy": 100 - sales_mape, "sales_mae": sales_mae, "customer_accuracy": 100 - customer_mape, "customer_mae": customer_mae}
+
+def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
+    if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
+        fig = go.Figure(); fig.update_layout(title=title, paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white', xaxis={"visible": False}, yaxis={"visible": False}, annotations=[{"text": "No data available for this period.", "xref": "paper", "yref": "paper", "showarrow": False, "font": {"size": 16}}]); return fig
+    fig = go.Figure(); fig.add_trace(go.Scatter(x=df[date_col], y=df[actual_col], mode='lines+markers', name='Actual', line=dict(color='#3b82f6', width=2), marker=dict(symbol='circle', size=6))); fig.add_trace(go.Scatter(x=df[date_col], y=df[forecast_col], mode='lines+markers', name='Forecast', line=dict(color='#d62728', dash='dash', width=2), marker=dict(symbol='x', size=7)))
+    fig.update_layout(title=dict(text=title, font=dict(color='white', size=20)), xaxis_title=dict(text='Date', font=dict(color='white', size=14)), yaxis_title=dict(text=y_axis_title, font=dict(color='white', size=14)), legend=dict(font=dict(color='white', size=12)), height=450, margin=dict(l=50, r=50, t=80, b=50), paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white')
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#444', tickfont=dict(color='white', size=12)); fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#444', tickfont=dict(color='white', size=12)); return fig
+
+def generate_insight_summary(day_data,selected_date):
+    effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
+    significant_effects={k:v for k,v in effects.items()if abs(v)>1}
+    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
+    if not significant_effects: summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."; return summary
+    pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
+    if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
+    if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
+    summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
+
+def render_activity_card(row, db_client, view_type='compact_list'):
+    doc_id = row['doc_id']
+    
+    if view_type == 'compact_list':
+        date_str = pd.to_datetime(row['date']).strftime('%b %d, %Y')
+        summary_line = f"**{date_str}** | {row['activity_name']}"
+        
+        with st.expander(summary_line):
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E'
+            elif status == 'Needs Follow-up': color = '#F59E0B'
+            elif status == 'Tentative': color = '#38BDF8'
+            else: color = '#EF4444'
+            st.markdown(f"**Status:** <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
+            st.markdown(f"**Potential Sales:** ₱{row['potential_sales']:,.2f}")
+            
+            with st.form(key=f"compact_update_form_{doc_id}", border=False):
+                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                current_status_index = status_options.index(status) if status in status_options else 0
+                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"compact_sales_{doc_id}")
+                updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"compact_remarks_{doc_id}")
+                
+                update_col, delete_col = st.columns(2)
+                with update_col:
+                    if st.form_submit_button("💾 Update", use_container_width=True):
+                        update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                        update_activity_in_firestore(db, doc_id, update_data)
+                        st.success("Activity updated!")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+                with delete_col:
+                    if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                        delete_from_firestore(db, 'future_activities', doc_id)
+                        st.warning("Activity deleted.")
+                        st.cache_data.clear()
+                        time.sleep(1)
+                        st.rerun()
+    else: # 'grid' view
+        with st.container(border=True):
+            activity_date_formatted = pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')
+            
+            st.markdown(f"**{row['activity_name']}**")
+            st.markdown(f"<small>📅 {activity_date_formatted}</small>", unsafe_allow_html=True)
+            st.markdown(f"💰 ₱{row['potential_sales']:,.2f}")
+            status = row['remarks']
+            if status == 'Confirmed': color = '#22C55E'
+            elif status == 'Needs Follow-up': color = '#F59E0B'
+            elif status == 'Tentative': color = '#38BDF8'
+            else: color = '#EF4444'
+            st.markdown(f"Status: <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
+            
+            with st.expander("Edit / Manage"):
+                status_options = ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"]
+                current_status_index = status_options.index(status) if status in status_options else 0
+                with st.form(key=f"full_update_form_{doc_id}", border=False):
+                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"full_sales_{doc_id}")
+                    updated_remarks = st.selectbox("Status", options=status_options, index=current_status_index, key=f"full_remarks_{doc_id}")
+                    
+                    update_col, delete_col = st.columns(2)
+                    with update_col:
+                        if st.form_submit_button("💾 Update", use_container_width=True):
+                            update_data = {"potential_sales": updated_sales, "remarks": updated_remarks}
+                            update_activity_in_firestore(db, doc_id, update_data)
+                            st.success("Activity updated!")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                    with delete_col:
+                        if st.form_submit_button("🗑️ Delete", use_container_width=True):
+                            delete_from_firestore(db, 'future_activities', doc_id)
+                            st.warning("Activity deleted.")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+
+def render_historical_record(row, db_client):
+    date_str = row['date'].strftime('%B %d, %Y')
+    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    
+    with st.expander(expander_title):
+        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
+        st.write(f"**Weather:** {row.get('weather', 'N/A')}")
+        day_type = row.get('day_type', 'Normal Day')
+        st.write(f"**Day Type:** {day_type}")
+        if day_type == 'Not Normal Day':
+            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
+
+        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+            st.write("---")
+            st.markdown("**Edit Record**")
+            
+            edit_cols = st.columns(2)
+            updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), format="%.2f", key=f"sales_{row['doc_id']}")
+            updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
+            
+            edit_cols2 = st.columns(2)
+            updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
+            
+            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
+            current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
+            updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+
+            day_type_options = ["Normal Day", "Not Normal Day"]
+            current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
+            updated_day_type = st.selectbox("Day Type", options=day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
+            updated_day_type_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"notes_{row['doc_id']}")
+            
+            btn_cols = st.columns(2)
+            if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
+                update_data = {
+                    'sales': updated_sales,
+                    'customers': updated_customers,
+                    'add_on_sales': updated_addons,
+                    'weather': updated_weather,
+                    'day_type': updated_day_type,
+                    'day_type_notes': updated_day_type_notes if updated_day_type == 'Not Normal Day' else ''
+                }
+                update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
+                st.success(f"Record for {date_str} updated!")
+                st.cache_data.clear()
+                time.sleep(1)
+                st.rerun()
+
+            if btn_cols[1].form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
+                delete_from_firestore(db_client, 'historical_data', row['doc_id'])
+                st.warning(f"Record for {date_str} deleted.")
+                st.cache_data.clear()
+                time.sleep(1)
+                st.rerun()
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -395,7 +645,6 @@ if db:
             st.cache_data.clear(); st.cache_resource.clear(); st.success("Data cache cleared."); time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", use_container_width=True):
-            # --- FIXED: Automatically clear cache to ensure latest data is always used ---
             st.cache_data.clear()
             st.cache_resource.clear()
 
@@ -403,6 +652,7 @@ if db:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
                 with st.spinner("🧠 Initializing Deep Learning AI Forecast..."):
+                    # This logic is now robust and uses the adaptive LSTM
                     base_df = st.session_state.historical_df.copy()
                     base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                     cleaned_df, removed_count, upper_bound = remove_outliers_iqr(base_df, column='base_sales')
@@ -509,16 +759,292 @@ if db:
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
     
-    # ... [The remaining tabs (2 through 5) and their render functions are unchanged] ...
     with tabs[2]:
-        # ... Renders the Forecast Evaluator tab ...
-        pass
+        st.header("📈 Forecast Evaluator")
+        st.info(
+            "This report compares actual results against the forecast that was generated **the day before**. "
+            "This provides a true measure of the model's day-ahead prediction accuracy."
+        )
+
+        def render_true_accuracy_content(days):
+            try:
+                log_docs = db.collection('forecast_log').stream()
+                log_records = [doc.to_dict() for doc in log_docs]
+                if not log_records:
+                    st.warning("No forecast logs found. Please generate a forecast to begin logging.")
+                    raise StopIteration
+
+                forecast_log_df = pd.DataFrame(log_records)
+                forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
+                forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on']).dt.tz_localize(None)
+
+                forecast_log_df = forecast_log_df[
+                    forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)
+                ].copy()
+
+                if forecast_log_df.empty:
+                    st.warning("Not enough consecutive forecast logs to calculate true day-ahead accuracy.")
+                    raise StopIteration
+
+                historical_actuals_df = st.session_state.historical_df[['date', 'sales', 'customers', 'add_on_sales']].copy()
+                true_accuracy_df = pd.merge(
+                    historical_actuals_df, forecast_log_df,
+                    left_on='date', right_on='forecast_for_date', how='inner'
+                )
+
+                if true_accuracy_df.empty:
+                    st.warning("No matching historical data for the logged forecasts.")
+                    raise StopIteration
+                
+                period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
+                final_df = true_accuracy_df[true_accuracy_df['date'] >= period_start_date].copy()
+
+                if final_df.empty:
+                    st.warning(f"No forecast data in the last {days} days to evaluate.")
+                    raise StopIteration
+
+                st.subheader(f"Accuracy Metrics for the Last {days} Days")
+                
+                sales_mae = mean_absolute_error(final_df['sales'], final_df['predicted_sales'])
+                cust_mae = mean_absolute_error(final_df['customers'], final_df['predicted_customers'])
+                
+                actual_sales_safe = final_df['sales'].replace(0, np.nan)
+                sales_mape = np.nanmean(np.abs((final_df['sales'] - final_df['predicted_sales']) / actual_sales_safe)) * 100
+                
+                actual_cust_safe = final_df['customers'].replace(0, np.nan)
+                cust_mape = np.nanmean(np.abs((final_df['customers'] - final_df['predicted_customers']) / actual_cust_safe)) * 100
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(label="Sales MAPE (Accuracy)", value=f"{100 - sales_mape:.2f}%")
+                    st.metric(label="Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
+                with col2:
+                    st.metric(label="Customer MAPE (Accuracy)", value=f"{100 - cust_mape:.2f}%")
+                    st.metric(label="Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
+
+                st.markdown("---")
+                st.subheader(f"Comparison Charts for the Last {days} Days")
+                
+                sales_fig = plot_evaluation_graph(
+                    final_df, date_col='date', actual_col='sales', forecast_col='predicted_sales',
+                    title='Actual Sales vs. Day-Ahead Forecasted Sales', y_axis_title='Sales (₱)'
+                )
+                st.plotly_chart(sales_fig, use_container_width=True)
+                
+                cust_fig = plot_evaluation_graph(
+                    final_df, date_col='date', actual_col='customers', forecast_col='predicted_customers',
+                    title='Actual Customers vs. Day-Ahead Forecasted Customers', y_axis_title='Customers'
+                )
+                st.plotly_chart(cust_fig, use_container_width=True)
+
+            except StopIteration:
+                pass 
+            except Exception as e:
+                st.error(f"An error occurred while building the report: {e}")
+
+        eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
+        with eval_tab_7:
+            render_true_accuracy_content(7)
+        with eval_tab_30:
+            render_true_accuracy_content(30)
+
     with tabs[3]:
-        # ... Renders the Add/Edit Data tab ...
-        pass
+        form_col, display_col = st.columns([2, 3], gap="large")
+
+        with form_col:
+            st.subheader("✍️ Add New Daily Record")
+            with st.form("new_record_form",clear_on_submit=True, border=False):
+                new_date=st.date_input("Date", date.today())
+                new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+                new_customers=st.number_input("Customer Count",min_value=0)
+                new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
+                new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                
+                new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
+                new_day_type_notes = ""
+                if new_day_type == "Not Normal Day":
+                    new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage, unexpected local event...")
+
+                if st.form_submit_button("✅ Save Record"):
+                    new_rec={
+                        "date":new_date,
+                        "sales":new_sales,
+                        "customers":new_customers,
+                        "weather":new_weather,
+                        "add_on_sales":new_addons,
+                        "day_type": new_day_type,
+                        "day_type_notes": new_day_type_notes
+                    }
+                    add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
+                    st.cache_data.clear()
+                    st.success("Record added to Firestore!");
+                    time.sleep(1)
+                    st.rerun()
+        
+        with display_col:
+            if st.button("🗓️ Show/Hide Recent Entries"):
+                st.session_state.show_recent_entries = not st.session_state.show_recent_entries
+            
+            if st.session_state.show_recent_entries:
+                st.subheader("🗓️ Recent Entries")
+                with st.container(border=True):
+                    recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
+                    if not recent_df.empty:
+                        display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
+                        cols_to_show = [col for col in display_cols if col in recent_df.columns]
+                        
+                        st.dataframe(
+                            recent_df[cols_to_show],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                                "sales": st.column_config.NumberColumn("Sales (₱)", format="₱%.2f"),
+                                "customers": st.column_config.NumberColumn("Customers", format="%d"),
+                                "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
+                                "weather": "Weather",
+                                "day_type": "Day Type"
+                            }
+                        )
+                    else:
+                        st.info("No recent data to display.")
+    
     with tabs[4]:
-        # ... Renders the Future Activities tab ...
-        pass
+        def set_view_all(): st.session_state.show_all_activities = True
+        def set_overview(): st.session_state.show_all_activities = False
+
+        if st.session_state.get('show_all_activities'):
+            st.markdown("#### All Upcoming Activities")
+            st.button("⬅️ Back to Overview", on_click=set_overview)
+            
+            activities_df = load_from_firestore(db, 'future_activities')
+            all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
+            
+            if all_upcoming_df.empty:
+                st.info("No upcoming activities scheduled.")
+            else:
+                all_upcoming_df['month_year'] = all_upcoming_df['date'].dt.strftime('%B %Y')
+                sorted_months_df = all_upcoming_df.sort_values('date')
+                month_tabs_list = sorted_months_df['month_year'].unique().tolist()
+                
+                if month_tabs_list:
+                    month_tabs = st.tabs(month_tabs_list)
+                    for i, tab in enumerate(month_tabs):
+                        with tab:
+                            month_name = month_tabs_list[i]
+                            month_df = sorted_months_df[sorted_months_df['month_year'] == month_name]
+                            
+                            header_cols = st.columns([2, 1, 1])
+                            with header_cols[1]:
+                                total_sales = month_df['potential_sales'].sum()
+                                st.metric(label="Total Expected Sales", value=f"₱{total_sales:,.2f}")
+                            with header_cols[2]:
+                                unconfirmed_count = len(month_df[month_df['remarks'] != 'Confirmed'])
+                                st.metric(label="Unconfirmed Activities", value=unconfirmed_count)
+                            st.markdown("---")
+
+                            activities = month_df.to_dict('records')
+                            for i in range(0, len(activities), 4):
+                                cols = st.columns(4)
+                                row_activities = activities[i:i+4]
+                                for j, activity in enumerate(row_activities):
+                                    with cols[j]:
+                                        render_activity_card(activity, db, view_type='grid')
+
+        else:
+            col1, col2 = st.columns([1, 2], gap="large")
+
+            with col1:
+                st.markdown("##### Add New Activity")
+                with st.form("new_activity_form", clear_on_submit=True, border=True):
+                    activity_name = st.text_input("Activity/Event Name", placeholder="e.g., Catering for Birthday")
+                    activity_date = st.date_input("Date of Activity", min_value=date.today())
+                    potential_sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
+                    remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
+                    
+                    submitted = st.form_submit_button("✅ Save Activity", use_container_width=True)
+                    if submitted:
+                        if activity_name and activity_date:
+                            new_activity = {
+                                "activity_name": activity_name,
+                                "date": pd.to_datetime(activity_date).to_pydatetime(),
+                                "potential_sales": float(potential_sales),
+                                "remarks": remarks
+                            }
+                            db.collection('future_activities').add(new_activity)
+                            st.success(f"Activity '{activity_name}' saved!")
+                            st.cache_data.clear()
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.warning("Activity name and date are required.")
+
+            with col2:
+                st.markdown("##### Next 10 Upcoming Activities")
+                
+                btn_cols = st.columns(2)
+                btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True, on_click=st.rerun)
+                btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
+                
+                st.markdown("---",)
+                activities_df = load_from_firestore(db, 'future_activities')
+                upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
+                
+                if upcoming_df.empty:
+                    st.info("No upcoming activities scheduled.")
+                else:
+                    for _, row in upcoming_df.iterrows():
+                        render_activity_card(row, db, view_type='compact_list')
+
+
     with tabs[5]:
-        # ... Renders the Historical Data tab ...
-        pass
+        st.subheader("View & Edit Historical Data")
+        df = st.session_state.historical_df.copy()
+        if not df.empty and 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            df.dropna(subset=['date'], inplace=True)
+
+            all_years = sorted(df['date'].dt.year.unique(), reverse=True)
+
+            if all_years:
+                filter_cols = st.columns(2)
+                with filter_cols[0]:
+                    selected_year = st.selectbox("Select Year to View:", options=all_years)
+
+                df_year_filtered = df[df['date'].dt.year == selected_year]
+                
+                all_months = sorted(df_year_filtered['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True)
+
+                if all_months:
+                    with filter_cols[1]:
+                        selected_month_str = st.selectbox("Select Month to View:", options=all_months)
+
+                    selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
+
+                    filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy()
+
+                    if filtered_df.empty:
+                        st.info("No data for the selected month and year.")
+                    else:
+                        df_first_half = filtered_df[filtered_df['date'].dt.day <= 15]
+                        df_second_half = filtered_df[filtered_df['date'].dt.day > 15]
+
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.markdown("##### Days 1-15")
+                            st.markdown("---")
+                            for index, row in df_first_half.iterrows():
+                                render_historical_record(row, db)
+                        
+                        with col2:
+                            st.markdown("##### Days 16-31")
+                            st.markdown("---")
+                            for index, row in df_second_half.iterrows():
+                                render_historical_record(row, db)
+                else:
+                    st.write(f"No data available for the year {selected_year}.")
+            else:
+                st.write("No historical data to display.")
+        else:
+            st.write("No historical data to display.")
