@@ -13,3 +13,5 @@ scikit-learn
 optuna
 shap
 tensorflow
+lightgbm
+catboost
