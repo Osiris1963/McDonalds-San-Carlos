@@ -281,93 +281,70 @@ def create_advanced_features(df):
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
-
     df = df.sort_values('date')
-    
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
     if 'customers' in df.columns:
         df['customers_lag_7'] = df['customers'].shift(7)
-    
     if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
     if 'customers' in df.columns:
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
-
     if 'atv' in df.columns:
         df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
-        
     if 'sales' in df.columns:
         df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
         df['customers_ewm_7'] = df['customers'].shift(1).ewm(span=7, adjust=False).mean()
     if 'atv' in df.columns:
         df['atv_ewm_7'] = df['atv'].shift(1).ewm(span=7, adjust=False).mean()
-        
     return df
 
 @st.cache_resource
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
-    
     if df_train.empty or len(df_train) < 15:
         return pd.DataFrame()
-
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
-    
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
     recurring_events = generate_recurring_local_events(start_date, end_date)
-
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
-
     if 'day_type' in historical_df.columns:
         not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
         if not not_normal_days_df.empty:
             not_normal_events = pd.DataFrame({
                 'holiday': 'Unusual_Day',
                 'ds': pd.to_datetime(not_normal_days_df['date']),
-                'lower_window': 0,
-                'upper_window': 0,
+                'lower_window': 0, 'upper_window': 0,
             })
             all_manual_events = pd.concat([all_manual_events, not_normal_events])
-    
     use_yearly_seasonality = len(df_train) >= 365
-
     prophet_model = Prophet(
-        growth='linear',
-        holidays=all_manual_events,
-        daily_seasonality=False,
-        weekly_seasonality=True,
-        yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.5, 
-        changepoint_range=0.95,
+        growth='linear', holidays=all_manual_events, daily_seasonality=False,
+        weekly_seasonality=True, yearly_seasonality=use_yearly_seasonality, 
+        changepoint_prior_scale=0.5, changepoint_range=0.95,
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
-    
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
-    
     return forecast[['ds', 'yhat']], prophet_model
 
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, is_catboost=False):
     df_featured = historical_df.copy()
-    
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-
     features = [f for f in features if f in df_featured.columns]
-    
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
@@ -375,7 +352,6 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     
     final_model = model_class(**params)
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
-    
     if is_catboost:
         final_model.fit(X, y, sample_weight=sample_weights, verbose=0)
     else:
@@ -384,7 +360,6 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     future_predictions = []
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
-
     for i in range(periods):
         last_date = history_with_features['date'].max()
         next_date = last_date + timedelta(days=1)
@@ -395,23 +370,18 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
              extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
         else:
             extended_featured_df['is_not_normal_day'] = 0
-            
         X_future = extended_featured_df[features].tail(1)
-        
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
-        
         history_with_features = extended_featured_df.copy()
         history_with_features.loc[history_with_features.index.max(), target_col] = prediction
         if target_col == 'customers' and atv_lookup is not None:
             forecasted_atv = atv_lookup.get(pd.to_datetime(next_date), history_with_features['atv'].dropna().tail(7).mean())
             history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
-            
     final_df = pd.DataFrame(future_predictions)
     historical_predictions = df_featured.loc[X.index, ['date']].copy()
     historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
     historical_predictions['yhat'] = final_model.predict(X)
-
     return pd.concat([historical_predictions, final_df], ignore_index=True)
 
 @st.cache_resource
@@ -423,7 +393,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
     features = [f for f in features if f in df_featured.columns]
-    
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
@@ -431,11 +400,9 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     X_dates = df_featured.loc[X.index, 'date']
 
     if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
-    
     fit_params = inspect.signature(xgb.XGBRegressor.fit).parameters
     use_callbacks = 'callbacks' in fit_params
     use_early_stopping_rounds = 'early_stopping_rounds' in fit_params
-    
     def objective(trial):
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
@@ -456,7 +423,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
             fit_kwargs = {"eval_set": [(X_val, y_val)], "verbose": False, "sample_weight": sample_weights}
             if use_callbacks: fit_kwargs["callbacks"] = [XGBEarlyStopping(rounds=50, save_best=True)]
             elif use_early_stopping_rounds: fit_kwargs["early_stopping_rounds"] = 50
-            
             model.fit(X_train, y_train, **fit_kwargs)
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
@@ -469,7 +435,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     except Exception as e:
         st.warning(f"Optuna tuning failed for XGBoost. Using default parameters. Error: {e}")
         best_params = {}
-
     final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
     final_params.update(best_params)
     final_model = xgb.XGBRegressor(**final_params)
@@ -635,6 +600,8 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     forecast_df['yhat'] = stacked_prediction
     
     return forecast_df
+
+def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
 def plot_full_comparison_chart(hist, fcst, metrics, target):
     fig=go.Figure()
@@ -951,18 +918,18 @@ if db:
 
         st.markdown("---")
         st.download_button(
-            "📥 Download Forecast", 
-            convert_df_to_csv(st.session_state.forecast_df), 
-            "forecast_data.csv", 
-            "text/csv", 
-            use_container_width=True, 
+            "📥 Download Forecast",
+            convert_df_to_csv(st.session_state.forecast_df),
+            "forecast_data.csv",
+            "text/csv",
+            use_container_width=True,
             disabled=st.session_state.forecast_df.empty
         )
         st.download_button(
-            "📥 Download Historical", 
-            convert_df_to_csv(st.session_state.historical_df), 
-            "historical_data.csv", 
-            "text/csv", 
+            "📥 Download Historical",
+            convert_df_to_csv(st.session_state.historical_df),
+            "historical_data.csv",
+            "text/csv",
             use_container_width=True
         )
 
