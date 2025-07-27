@@ -362,7 +362,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -615,6 +615,76 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
     final_params.update(best_params)
     
     return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, is_catboost=True)
+
+@st.cache_data
+def prepare_data_for_tft(df, target_col, forecast_horizon):
+    df_prep = df.copy()
+    df_prep["time_idx"] = (df_prep["date"] - df_prep["date"].min()).dt.days
+    df_prep["group"] = "store_A"
+    df_prep[target_col] = df_prep[target_col].astype(float)
+    required_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']
+    for feat in required_features:
+        if feat not in df_prep.columns:
+            df_prep[feat] = 0
+    max_prediction_length = forecast_horizon
+    max_encoder_length = 60
+    training_cutoff = df_prep["time_idx"].max() - max_prediction_length
+    dataset = TimeSeriesDataSet(
+        df_prep[lambda x: x.time_idx <= training_cutoff],
+        time_idx="time_idx",
+        target=target_col,
+        group_ids=["group"],
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        static_categoricals=["group"],
+        time_varying_known_reals=["dayofyear", "dayofweek", "month", "year", "weekofyear"],
+        time_varying_unknown_reals=[target_col],
+        allow_missing_timesteps=True,
+        scalers={}
+    )
+    return dataset
+
+@st.cache_resource
+def train_and_forecast_tft(_historical_df, periods, target_col):
+    try:
+        dataset = prepare_data_for_tft(_historical_df, target_col, periods)
+        train_dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
+        val_dataloader = dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
+
+        early_stop_callback = PLEarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")
+        trainer = pl.Trainer(
+            max_epochs=30, accelerator="cpu", gradient_clip_val=0.1,
+            limit_train_batches=50, callbacks=[early_stop_callback],
+            enable_progress_bar=False, enable_model_summary=False
+        )
+        tft = TemporalFusionTransformer.from_dataset(
+            dataset, learning_rate=0.03, hidden_size=32, attention_head_size=1,
+            dropout=0.1, hidden_continuous_size=16, loss=QuantileLoss(), optimizer="Ranger"
+        )
+        trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
+        
+        best_model_path = trainer.checkpoint_callback.best_model_path
+        best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+        
+        encoder_data = _historical_df[_historical_df["time_idx"] > _historical_df["time_idx"].max() - 60]
+        last_data = _historical_df[_historical_df["time_idx"] == _historical_df["time_idx"].max()]
+        decoder_data = pd.concat(
+            [last_data.assign(date=lambda x: x.date + pd.DateOffset(days=i)) for i in range(1, periods + 1)],
+            ignore_index=True,
+        )
+        new_prediction_data = pd.concat([encoder_data, decoder_data], ignore_index=True)
+        new_prediction_data["time_idx"] = (new_prediction_data["date"] - _historical_df["date"].min()).dt.days
+
+        raw_predictions = best_tft.predict(new_prediction_data)
+        
+        forecast_df = pd.DataFrame({
+            'ds': new_prediction_data['date'].unique()[-periods:],
+            'yhat': raw_predictions[0].numpy()
+        })
+        return forecast_df
+    except Exception as e:
+        st.warning(f"TFT model training failed for {target_col}. It will be excluded from the ensemble. Error: {e}")
+        return pd.DataFrame()
 
 @st.cache_resource
 def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
@@ -926,7 +996,7 @@ if db:
                             
                             cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                             cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-
+                            
                             tft_atv_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'atv')
                             tft_cust_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'customers')
 
