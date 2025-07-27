@@ -631,10 +631,10 @@ def prepare_data_for_tft(_df, target_col, forecast_horizon):
     training_cutoff = df_prep["time_idx"].max() - max_prediction_length
     
     for col in df_prep.columns:
-        if df_prep[col].dtype == 'object':
-            df_prep[col] = df_prep[col].astype(str)
-        elif pd.api.types.is_integer_dtype(df_prep[col]):
+        if col != 'time_idx' and pd.api.types.is_integer_dtype(df_prep[col]):
             df_prep[col] = df_prep[col].astype(float)
+        elif df_prep[col].dtype == 'object':
+            df_prep[col] = df_prep[col].astype(str)
 
     dataset = TimeSeriesDataSet(
         df_prep[lambda x: x.time_idx <= training_cutoff],
@@ -680,13 +680,18 @@ def train_and_forecast_tft(_historical_df, periods, target_col):
         best_model_path = trainer.checkpoint_callback.best_model_path
         best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
         
-        encoder_data = _historical_df[_historical_df["time_idx"] > _historical_df["time_idx"].max() - max_encoder_length]
+        encoder_data = _historical_df[
+            _historical_df["time_idx"] > _historical_df["time_idx"].max() - max_encoder_length
+        ]
+        
         last_date = _historical_df['date'].max()
         future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
         decoder_data = pd.DataFrame({
-            "date": future_dates, "group": "store_A", target_col: 0.0
+            "date": future_dates,
+            "group": "store_A",
+            target_col: [0.0] * len(future_dates)
         })
-        
+
         new_prediction_data = pd.concat([encoder_data, decoder_data], ignore_index=True)
         new_prediction_data["time_idx"] = (pd.to_datetime(new_prediction_data["date"]) - _historical_df["date"].min()).dt.days
 
