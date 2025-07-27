@@ -13,4 +13,3 @@ shap
 lightgbm
 catboost
 tensorflow
-pkg_resources
