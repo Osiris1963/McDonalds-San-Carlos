@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
+from xgboost.callback import EarlyStopping
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -174,7 +175,6 @@ def initialize_state_firestore(db_client):
         'shap_values_cust': None,
         'X_cust': None,
         'X_cust_dates': None,
-        # IMPROVED: Added state to hold feature sets for future dates for on-demand SHAP explanations
         'future_X_cust': None,
     }
     for key, value in defaults.items():
@@ -357,7 +357,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# FIXED: Function signature updated to return future feature sets for SHAP.
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -385,8 +384,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     features = [f for f in features if f in df_featured.columns]
     target = target_col
     
-    # IMPROVED: Drop all rows with any NaNs in the feature set and align target variable.
-    # This prevents Optuna from failing due to NaNs passed during cross-validation.
     X = df_featured[features].copy()
     y = df_featured[target].copy()
     X.dropna(inplace=True)
@@ -400,12 +397,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     # --- Optuna Hyperparameter Tuning ---
     def objective(trial):
-        # FIXED: Added a guard to prevent Optuna from failing on very small data slices.
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
         for train_idx, val_idx in cv.split(X):
             if len(train_idx) < 10 or len(val_idx) < 10:
-                continue # Skip fold if too small
+                continue 
 
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
@@ -424,11 +420,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             model = xgb.XGBRegressor(**param)
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
+            early_stopping_callback = EarlyStopping(rounds=50, save_best=True)
+            
             model.fit(X_train, y_train, 
                       eval_set=[(X_val, y_val)], 
-                      early_stopping_rounds=50, 
                       verbose=False,
-                      sample_weight=sample_weights)
+                      sample_weight=sample_weights,
+                      callbacks=[early_stopping_callback])
                       
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
@@ -452,7 +450,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     # --- Recursive Forecasting Loop ---
     future_predictions = []
-    # IMPROVED: Dictionary to store the feature sets of future predictions for on-demand SHAP.
     future_feature_sets = {}
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
@@ -469,7 +466,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Store the feature set for this future date
         future_feature_sets[next_date.strftime('%Y-%m-%d')] = X_future
         
         history_with_features = extended_featured_df.copy()
@@ -480,12 +476,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     final_df = pd.DataFrame(future_predictions)
     historical_predictions = df_featured[['date']].copy()
-    historical_predictions = historical_predictions.loc[X.index] # Align with cleaned data
+    historical_predictions = historical_predictions.loc[X.index] 
     historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
     historical_predictions['yhat'] = final_model.predict(X)
 
     full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
-    # FIXED: Return the generated future feature sets.
     return full_forecast_df, final_model, X, X_dates, future_feature_sets
 
 
@@ -612,9 +607,6 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     eval_df['adjusted_forecast_sales'] = forecast_sales_numeric + add_on_sales_numeric
     
     return eval_df
-
-# FIXED: Removed the unused calculate_accuracy_metrics function to improve clarity.
-# The logic in the 'Forecast Evaluator' tab is superior as it evaluates true day-ahead accuracy.
 
 def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
     if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
@@ -845,7 +837,6 @@ if db:
                     with st.spinner("Running base models for Customers and preparing explanations..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                         
-                        # FIXED: Unpack the new `future_feature_sets` return value
                         xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
                         
                         if xgb_cust_model and not X_cust.empty:
@@ -856,7 +847,6 @@ if db:
                                 st.session_state.shap_values_cust = shap_values
                                 st.session_state.X_cust = X_cust
                                 st.session_state.X_cust_dates = X_cust_dates
-                                # FIXED: Store the future feature sets for on-demand SHAP plots
                                 st.session_state.future_X_cust = future_X_cust
 
                     with st.spinner("Stacking Customer models for final prediction..."):
@@ -965,7 +955,6 @@ if db:
                     st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
                     st.info("This waterfall chart shows exactly how each feature contributed to the **XGBoost base model's** customer prediction for the selected day. This reveals the impact of recent sales, weather, and other advanced features.")
                     
-                    # FIXED: This entire block is re-engineered to handle both historical and future dates correctly.
                     if st.session_state.shap_explainer_cust is None:
                         st.warning("SHAP values not available. Please regenerate the forecast.")
                     else:
