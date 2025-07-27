@@ -360,7 +360,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# MODIFIED: Removed Optuna and implemented robust fitting logic
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -392,34 +391,33 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     features = [f for f in features if f in df_featured.columns]
     target = target_col
 
-    X = df_featured[features].copy() # Use copy to avoid SettingWithCopyWarning
+    X = df_featured[features].copy()
     y = df_featured[target].copy()
     
-    # --- FIX: Explicitly ensure all data is numeric to prevent TypeError ---
     for col in features:
         X[col] = pd.to_numeric(X[col], errors='coerce')
     y = pd.to_numeric(y, errors='coerce')
 
-    # Combine and drop any NaNs that might have been introduced
     full_data = pd.concat([y, X], axis=1)
     full_data.dropna(inplace=True)
     
     y = full_data[target]
     X = full_data[features]
-    X_dates = df_featured.loc[X.index, 'date'] # Align dates with cleaned X
+    X_dates = df_featured.loc[X.index, 'date']
 
     if X.empty or len(X) < 50:
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering and cleaning.")
         return pd.DataFrame(), None, pd.DataFrame(), None
 
-    # Use fixed, robust hyperparameters
+    # --- FIX: Explicitly cast to a standard float type to guarantee compatibility ---
+    X = X.astype(np.float32)
+    y = y.astype(np.float32)
+
     best_params = {
         'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
         'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
     }
     
-    # --- FIX: Implement robust training with early stopping ---
-    # 1. Find optimal boosting rounds on a temporary split
     temp_model = xgb.XGBRegressor(**best_params)
     split_index = int(len(X) * 0.9)
     X_train, X_val = X.iloc[:split_index], X.iloc[split_index:]
@@ -427,18 +425,14 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     
     temp_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
     
-    # Get the best number of estimators
     best_n_estimators = temp_model.best_iteration if temp_model.best_iteration else best_params['n_estimators']
 
-    # 2. Train the final model on ALL historical data with the optimal number of estimators
     final_model_params = best_params.copy()
     final_model_params['n_estimators'] = best_n_estimators
     final_model = xgb.XGBRegressor(**final_model_params)
     final_model.fit(X, y, verbose=False)
 
-
-    # --- Recursive Forecasting Loop ---
-    history_with_features = df_featured.loc[X.index].copy() # Start with the cleaned data
+    history_with_features = df_featured.loc[X.index].copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
     future_predictions = []
 
@@ -453,7 +447,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Update history for the next recursive step
         new_row = extended_featured_df.iloc[-1:].copy()
         new_row[target] = prediction
         if target_col == 'customers' and atv_lookup is not None:
