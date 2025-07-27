@@ -390,15 +390,18 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame(), None
 
+    # Use a single train-validation split for faster tuning
+    train_size = int(len(X) * 0.8)
+    X_train, X_val = X[:train_size], X[train_size:]
+    y_train, y_val = y[:train_size], y[train_size:]
+
     def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
-        
         param = {
             'objective': 'reg:squarederror',
             'booster': 'gbtree',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500), # Reduced search space
             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
+            'max_depth': trial.suggest_int('max_depth', 3, 6), # Reduced search space
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
@@ -406,42 +409,40 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
 
         model = xgb.XGBRegressor(**param)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
-            sample_weights = np.linspace(0.1, 1.0, len(y_train))
-            
-            # Simplified logic now that xgboost version is pinned to 1.7.6
-            fit_params = {
-                "eval_set": [(X_val, y_val)],
-                "sample_weight": sample_weights,
-                "verbose": False,
-                "early_stopping_rounds": 50
-            }
-            
-            model.fit(X_train, y_train, **fit_params)
-                      
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-
-        return np.mean(scores)
+        
+        # Simplified and faster validation (no more 3-fold CV in the loop)
+        fit_params = {
+            "eval_set": [(X_val, y_val)],
+            "verbose": False,
+            "early_stopping_rounds": 50
+        }
+        
+        model.fit(X_train, y_train, **fit_params)
+                  
+        preds = model.predict(X_val)
+        rmse = mean_squared_error(y_val, preds, squared=False)
+        return rmse
 
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=10, timeout=300)
+        study.optimize(objective, n_trials=10, timeout=300) # Reduced from 25
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for {target_col}. Using default parameters. Error: {e}")
         best_params = {
-            'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
+            'objective': 'reg:squarederror', 'n_estimators': 300, 'learning_rate': 0.05,
             'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
         }
 
+    # Efficient Final Training with Early Stopping
     final_model = xgb.XGBRegressor(**best_params)
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-    final_model.fit(X, y, sample_weight=sample_weights)
+    final_fit_params = {
+        "eval_set": [(X_val, y_val)],
+        "verbose": False,
+        "early_stopping_rounds": 50
+    }
+    final_model.fit(X_train, y_train, **final_fit_params)
+
 
     future_predictions = []
     history_with_features = df_featured.copy()
@@ -503,10 +504,9 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     
     if 'date' in data and pd.notna(data['date']):
         current_date = pd.to_datetime(data['date'])
-        # ROBUSTNESS FIX: Correctly find the same date last year, accounting for leap years.
         try:
             last_year_date = current_date.replace(year=current_date.year - 1)
-        except ValueError: # Handles leap year case e.g., Feb 29
+        except ValueError: 
             last_year_date = current_date.replace(year=current_date.year - 1, day=28)
 
         hist_copy = historical_df.copy()
@@ -888,7 +888,7 @@ if db:
                     
                     FORECAST_HORIZON = 15
                     
-                    with st.spinner("Running base models for Average Sale (ATV)..."):
+                    with st.spinner("Optimizing & training ATV model..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                         xgb_atv_f, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                     
@@ -900,13 +900,13 @@ if db:
                             st.error("Failed to generate base ATV forecasts.")
                     
                     cust_f = pd.DataFrame()
-                    with st.spinner("Running base models for Customers and preparing explanations..."):
+                    with st.spinner("Optimizing & training Customer model..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                         
                         xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
                         
                         if xgb_cust_model and not X_cust.empty:
-                            with st.spinner("Calculating SHAP values for XGBoost explainability..."):
+                            with st.spinner("Calculating SHAP values for explainability..."):
                                 explainer = shap.TreeExplainer(xgb_cust_model)
                                 shap_values = explainer(X_cust)
                                 st.session_state.shap_explainer_cust = explainer
