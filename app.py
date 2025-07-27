@@ -26,10 +26,18 @@ import shap
 import matplotlib.pyplot as plt
 import inspect
 
+# --- NEW: Deep Learning Imports for TFT ---
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping as PLEarlyStopping
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.metrics import QuantileLoss
+
 # --- Suppress informational messages ---
-logging.getLogger('prophet').setLevel(logging.ERROR)
-logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+logging.getLogger("prophet").setLevel(logging.ERROR)
+logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 
 # --- Page Configuration ---
@@ -307,7 +315,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         short_term_mape = np.nanmean(np.abs((short_term_df['sales'] - short_term_df['predicted_sales']) / short_term_sales_safe)) * 100
         short_term_accuracy = 100 - short_term_mape
 
-        # Trigger recalibration if recent performance is significantly worse than the baseline
         if short_term_accuracy < (long_term_accuracy * degradation_threshold):
             st.warning(f"🚨 Recent 7-day accuracy ({short_term_accuracy:.2f}%) has dropped significantly below the 30-day baseline ({long_term_accuracy:.2f}%). Triggering model recalibration.")
             st.cache_resource.clear()
@@ -905,7 +912,7 @@ if db:
                         
                         FORECAST_HORIZON = 15
                         
-                        with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost)..."):
+                        with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost, TFT)..."):
                             prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
                             
@@ -920,14 +927,17 @@ if db:
                             cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                             cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
 
+                            tft_atv_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'atv')
+                            tft_cust_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'customers')
+
                         atv_f = pd.DataFrame()
                         with st.spinner("Stacking ATV models for final prediction..."):
-                            base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
+                            base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f, "tft": tft_atv_f}
                             atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
                         
                         cust_f = pd.DataFrame()
                         with st.spinner("Stacking Customer models and preparing explanations..."):
-                            base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
+                            base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f, "tft": tft_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                             
                             if xgb_cust_model and not X_cust.empty:
