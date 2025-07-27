@@ -430,7 +430,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300)
+        study.optimize(objective, n_trials=10, timeout=300)
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for {target_col}. Using default parameters. Error: {e}")
