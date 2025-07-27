@@ -297,7 +297,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 
         today = pd.to_datetime('today').normalize()
         
-        # Calculate long-term baseline accuracy
         long_term_start = today - pd.Timedelta(days=long_term_days)
         long_term_df = true_accuracy_df[true_accuracy_df['date'] >= long_term_start]
         if long_term_df.empty: return False
@@ -306,7 +305,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         long_term_mape = np.nanmean(np.abs((long_term_df['sales'] - long_term_df['predicted_sales']) / long_term_sales_safe)) * 100
         long_term_accuracy = 100 - long_term_mape
 
-        # Calculate short-term accuracy
         short_term_start = today - pd.Timedelta(days=short_term_days)
         short_term_df = true_accuracy_df[true_accuracy_df['date'] >= short_term_start]
         if short_term_df.empty: return False
@@ -362,7 +360,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame(), None
+        return pd.DataFrame()
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -619,13 +617,12 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
 @st.cache_data
 def prepare_data_for_tft(df, target_col, forecast_horizon):
     df_prep = df.copy()
+    for feat in ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']:
+        if feat not in df_prep.columns:
+            df_prep[feat] = getattr(df_prep["date"].dt, feat.replace('dayofyear', 'day_of_year'))
     df_prep["time_idx"] = (df_prep["date"] - df_prep["date"].min()).dt.days
     df_prep["group"] = "store_A"
     df_prep[target_col] = df_prep[target_col].astype(float)
-    required_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']
-    for feat in required_features:
-        if feat not in df_prep.columns:
-            df_prep[feat] = 0
     max_prediction_length = forecast_horizon
     max_encoder_length = 60
     training_cutoff = df_prep["time_idx"].max() - max_prediction_length
@@ -647,9 +644,10 @@ def prepare_data_for_tft(df, target_col, forecast_horizon):
 @st.cache_resource
 def train_and_forecast_tft(_historical_df, periods, target_col):
     try:
-        dataset = prepare_data_for_tft(_historical_df, target_col, periods)
-        train_dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
-        val_dataloader = dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
+        with st.spinner(f"Preparing data for TFT ({target_col})..."):
+            dataset = prepare_data_for_tft(_historical_df, target_col, periods)
+            train_dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
+            val_dataloader = dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
 
         early_stop_callback = PLEarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")
         trainer = pl.Trainer(
@@ -661,25 +659,34 @@ def train_and_forecast_tft(_historical_df, periods, target_col):
             dataset, learning_rate=0.03, hidden_size=32, attention_head_size=1,
             dropout=0.1, hidden_continuous_size=16, loss=QuantileLoss(), optimizer="Ranger"
         )
-        trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
         
+        with st.spinner(f"Training TFT model ({target_col})... This may take a moment."):
+            trainer.fit(
+                tft,
+                train_dataloaders=train_dataloader,
+                val_dataloaders=val_dataloader
+            )
+
         best_model_path = trainer.checkpoint_callback.best_model_path
         best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
         
         encoder_data = _historical_df[_historical_df["time_idx"] > _historical_df["time_idx"].max() - 60]
-        last_data = _historical_df[_historical_df["time_idx"] == _historical_df["time_idx"].max()]
-        decoder_data = pd.concat(
-            [last_data.assign(date=lambda x: x.date + pd.DateOffset(days=i)) for i in range(1, periods + 1)],
-            ignore_index=True,
-        )
+        last_date = _historical_df['date'].max()
+        future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
+        decoder_data = pd.DataFrame({
+            "date": future_dates,
+            "group": "store_A",
+            target_col: 0.0
+        })
+        
         new_prediction_data = pd.concat([encoder_data, decoder_data], ignore_index=True)
-        new_prediction_data["time_idx"] = (new_prediction_data["date"] - _historical_df["date"].min()).dt.days
-
-        raw_predictions = best_tft.predict(new_prediction_data)
+        new_prediction_data["time_idx"] = (pd.to_datetime(new_prediction_data["date"]) - _historical_df["date"].min()).dt.days
+        
+        raw_predictions, x = best_tft.predict(new_prediction_data, return_x=True)
         
         forecast_df = pd.DataFrame({
-            'ds': new_prediction_data['date'].unique()[-periods:],
-            'yhat': raw_predictions[0].numpy()
+            'ds': future_dates,
+            'yhat': raw_predictions[-1].numpy().flatten()
         })
         return forecast_df
     except Exception as e:
@@ -996,7 +1003,7 @@ if db:
                             
                             cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                             cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-                            
+
                             tft_atv_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'atv')
                             tft_cust_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'customers')
 
