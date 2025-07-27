@@ -422,14 +422,12 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
     y = y[X.index]
-    
     X_dates = df_featured.loc[X.index, 'date']
 
     if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
@@ -443,10 +441,7 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
         scores = []
         for train_idx, val_idx in cv.split(X):
             if len(train_idx) < 10 or len(val_idx) < 10: continue 
-
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-        
+            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
             param = {
                 'objective': 'reg:squarederror', 'booster': 'gbtree', 'random_state': 42,
                 'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
@@ -465,7 +460,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
             model.fit(X_train, y_train, **fit_kwargs)
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
-
         return np.mean(scores) if scores else float('inf')
 
     try:
@@ -478,7 +472,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
 
     final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
     final_params.update(best_params)
-
     final_model = xgb.XGBRegressor(**final_params)
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     final_model.fit(X, y, sample_weight=sample_weights)
@@ -609,7 +602,7 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     final_df = None
     for name, fcst_df in base_forecasts_dict.items():
         if fcst_df is None or fcst_df.empty: continue
-        renamed_df = fcst_df.rename(columns={'yhat': f'yhat_{name}'})
+        renamed_df = fcst_df[['ds', 'yhat']].rename(columns={'yhat': f'yhat_{name}'})
         if final_df is None: final_df = renamed_df
         else: final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
     
@@ -637,11 +630,11 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     X_future_meta = final_df[meta_features].dropna()
     stacked_prediction = meta_model.predict(X_future_meta)
     
-    forecast_df = X_future_meta[['ds']].copy()
+    forecast_df = final_df[['ds']].copy()
+    forecast_df = forecast_df.loc[X_future_meta.index]
     forecast_df['yhat'] = stacked_prediction
     
     return forecast_df
-
 
 def plot_full_comparison_chart(hist, fcst, metrics, target):
     fig=go.Figure()
@@ -898,7 +891,7 @@ if db:
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
                         
-                        atv_forecast_for_cust_model = prophet_atv_f # Use Prophet's ATV for other models
+                        atv_forecast_for_cust_model = prophet_atv_f
                         
                         xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                         xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
@@ -957,8 +950,21 @@ if db:
                         st.error("Forecast generation failed. One or more components could not be built.")
 
         st.markdown("---")
-        st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
-        st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
+        st.download_button(
+            "📥 Download Forecast", 
+            convert_df_to_csv(st.session_state.forecast_df), 
+            "forecast_data.csv", 
+            "text/csv", 
+            use_container_width=True, 
+            disabled=st.session_state.forecast_df.empty
+        )
+        st.download_button(
+            "📥 Download Historical", 
+            convert_df_to_csv(st.session_state.historical_df), 
+            "historical_data.csv", 
+            "text/csv", 
+            use_container_width=True
+        )
 
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
     tabs = st.tabs(tab_list)
