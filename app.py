@@ -271,9 +271,8 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
-# --- NEW: Self-Recalibration Logic ---
-def check_performance_and_recalibrate(db, historical_df, threshold=95.0, days=7):
-    """Checks recent performance and clears model caches if accuracy is below a threshold."""
+# --- RE-ENGINEERED: Self-Recalibration Logic ---
+def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0.98, short_term_days=7, long_term_days=30):
     try:
         log_docs = db.collection('forecast_log').stream()
         log_records = [doc.to_dict() for doc in log_docs]
@@ -286,21 +285,35 @@ def check_performance_and_recalibrate(db, historical_df, threshold=95.0, days=7)
         if day_ahead_logs.empty: return False
 
         true_accuracy_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
-        if true_accuracy_df.empty: return False
+        if len(true_accuracy_df) < long_term_days: return False # Not enough data to establish a baseline
 
-        period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-        final_df = true_accuracy_df[true_accuracy_df['date'] >= period_start_date].copy()
-        if final_df.empty: return False
+        today = pd.to_datetime('today').normalize()
+        
+        # Calculate long-term baseline accuracy
+        long_term_start = today - pd.Timedelta(days=long_term_days)
+        long_term_df = true_accuracy_df[true_accuracy_df['date'] >= long_term_start]
+        if long_term_df.empty: return False
+        
+        long_term_sales_safe = long_term_df['sales'].replace(0, np.nan)
+        long_term_mape = np.nanmean(np.abs((long_term_df['sales'] - long_term_df['predicted_sales']) / long_term_sales_safe)) * 100
+        long_term_accuracy = 100 - long_term_mape
 
-        actual_sales_safe = final_df['sales'].replace(0, np.nan)
-        sales_mape = np.nanmean(np.abs((final_df['sales'] - final_df['predicted_sales']) / actual_sales_safe)) * 100
-        sales_accuracy = 100 - sales_mape
+        # Calculate short-term accuracy
+        short_term_start = today - pd.Timedelta(days=short_term_days)
+        short_term_df = true_accuracy_df[true_accuracy_df['date'] >= short_term_start]
+        if short_term_df.empty: return False
 
-        if sales_accuracy < threshold:
-            st.warning(f"🚨 Recent sales forecast accuracy ({sales_accuracy:.2f}%) is below the {threshold}% target. Triggering model recalibration.")
+        short_term_sales_safe = short_term_df['sales'].replace(0, np.nan)
+        short_term_mape = np.nanmean(np.abs((short_term_df['sales'] - short_term_df['predicted_sales']) / short_term_sales_safe)) * 100
+        short_term_accuracy = 100 - short_term_mape
+
+        # Trigger recalibration if recent performance is significantly worse than the baseline
+        if short_term_accuracy < (long_term_accuracy * degradation_threshold):
+            st.warning(f"🚨 Recent 7-day accuracy ({short_term_accuracy:.2f}%) has dropped significantly below the 30-day baseline ({long_term_accuracy:.2f}%). Triggering model recalibration.")
             st.cache_resource.clear()
             time.sleep(2) 
             return True
+
     except Exception as e:
         st.warning(f"Could not perform automatic accuracy check. Error: {e}")
     return False
@@ -873,7 +886,6 @@ if db:
             if len(st.session_state.historical_df) < 50:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
-                # --- NEW: Trigger recalibration check before forecasting ---
                 recalibrated = check_performance_and_recalibrate(db, st.session_state.historical_df)
                 if recalibrated:
                     st.info("Models have been recalibrated. Please click 'Generate Forecast' again to use the new models.")
