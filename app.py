@@ -413,14 +413,20 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
-            # This robust logic handles different xgboost versions to prevent crashes.
+            # This robust logic handles all xgboost versions to prevent crashes.
             fit_params = {
                 "eval_set": [(X_val, y_val)],
                 "sample_weight": sample_weights,
                 "verbose": False
             }
-            if parse_version(xgb.__version__) >= parse_version("1.6.0"):
-                # For new versions, pass early stopping to .fit()
+            
+            xgb_version = parse_version(xgb.__version__)
+            if xgb_version >= parse_version("2.0.0"):
+                # For versions 2.0+, use the new callbacks system
+                early_stopping_callback = xgb.callback.EarlyStopping(rounds=50, save_best=True)
+                fit_params["callbacks"] = [early_stopping_callback]
+            elif xgb_version >= parse_version("1.6.0"):
+                # For versions 1.6.x, use the old early_stopping_rounds parameter
                 fit_params["early_stopping_rounds"] = 50
             
             model.fit(X_train, y_train, **fit_params)
