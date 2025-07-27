@@ -173,7 +173,9 @@ def initialize_state_firestore(db_client):
         'shap_explainer_cust': None,
         'shap_values_cust': None,
         'X_cust': None,
-        'X_cust_dates': None, # ADDED: For robust SHAP lookup
+        'X_cust_dates': None,
+        # IMPROVED: Added state to hold feature sets for future dates for on-demand SHAP explanations
+        'future_X_cust': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -222,13 +224,15 @@ def cap_outliers_iqr(df, column='sales'):
     
     return df_capped, capped_count, upper_bound
 
+@st.cache_data
 def calculate_atv(df):
-    df['base_sales'] = df['sales'] - df.get('add_on_sales', 0)
-    sales = pd.to_numeric(df['base_sales'], errors='coerce').fillna(0)
-    customers = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
+    df_copy = df.copy()
+    df_copy['base_sales'] = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    sales = pd.to_numeric(df_copy['base_sales'], errors='coerce').fillna(0)
+    customers = pd.to_numeric(df_copy['customers'], errors='coerce').fillna(0)
     with np.errstate(divide='ignore', invalid='ignore'): atv = np.divide(sales, customers)
-    df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
-    return df
+    df_copy['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
+    return df_copy
 
 @st.cache_data(ttl=3600)
 def get_weather_forecast(days=16):
@@ -296,7 +300,6 @@ def create_advanced_features(df):
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
         
-    # ADDED: Exponentially Weighted Moving Averages to prioritize recent data
     if 'sales' in df.columns:
         df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
@@ -354,14 +357,14 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# MODIFIED: Fully revamped with Optuna for automated hyperparameter tuning
+# FIXED: Function signature updated to return future feature sets for SHAP.
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
 
     if df_train.empty:
-        return pd.DataFrame(), None, pd.DataFrame(), None
+        return pd.DataFrame(), None, pd.DataFrame(), None, None
 
     df_featured = create_advanced_features(df_train.copy())
 
@@ -370,13 +373,8 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     else:
         df_featured['is_not_normal_day'] = 0
 
-    dropna_col = 'atv_lag_7' if target_col == 'atv' else 'sales_lag_7'
-    if dropna_col in df_featured.columns:
-        df_featured.dropna(subset=[dropna_col], inplace=True)
-
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
 
-    # ADDED EWMA features to the feature lists
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     elif target_col == 'atv':
@@ -386,37 +384,44 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     features = [f for f in features if f in df_featured.columns]
     target = target_col
+    
+    # IMPROVED: Drop all rows with any NaNs in the feature set and align target variable.
+    # This prevents Optuna from failing due to NaNs passed during cross-validation.
+    X = df_featured[features].copy()
+    y = df_featured[target].copy()
+    X.dropna(inplace=True)
+    y = y[X.index]
+    
+    X_dates = df_featured.loc[X.index, 'date']
 
-    X = df_featured[features]
-    y = df_featured[target]
-    X_dates = df_featured['date'] # For robust SHAP lookup later
-
-    if X.empty or len(X) < 50: # Increased minimum data size for robust tuning
+    if X.empty or len(X) < 50:
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
-        return pd.DataFrame(), None, pd.DataFrame(), None
+        return pd.DataFrame(), None, pd.DataFrame(), None, None
 
     # --- Optuna Hyperparameter Tuning ---
     def objective(trial):
+        # FIXED: Added a guard to prevent Optuna from failing on very small data slices.
         cv = TimeSeriesSplit(n_splits=3)
-        
-        param = {
-            'objective': 'reg:squarederror',
-            'booster': 'gbtree',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
-            'random_state': 42
-        }
-
-        model = xgb.XGBRegressor(**param)
         scores = []
         for train_idx, val_idx in cv.split(X):
+            if len(train_idx) < 10 or len(val_idx) < 10:
+                continue # Skip fold if too small
+
             X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
+        
+            param = {
+                'objective': 'reg:squarederror',
+                'booster': 'gbtree',
+                'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
+                'random_state': 42
+            }
+            model = xgb.XGBRegressor(**param)
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
             model.fit(X_train, y_train, 
@@ -428,11 +433,11 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
 
-        return np.mean(scores)
+        return np.mean(scores) if scores else float('inf')
 
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300) # Use a reasonable number of trials/timeout
+        study.optimize(objective, n_trials=25, timeout=300)
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for {target_col}. Using default parameters. Error: {e}")
@@ -445,8 +450,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     sample_weights = np.linspace(0.5, 1.0, len(y))
     final_model.fit(X, y, sample_weight=sample_weights)
 
-    # --- Recursive Forecasting Loop (unchanged) ---
+    # --- Recursive Forecasting Loop ---
     future_predictions = []
+    # IMPROVED: Dictionary to store the feature sets of future predictions for on-demand SHAP.
+    future_feature_sets = {}
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
 
@@ -458,8 +465,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         extended_featured_df = create_advanced_features(extended_history)
         extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
         X_future = extended_featured_df[features].tail(1)
+        
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
+        
+        # Store the feature set for this future date
+        future_feature_sets[next_date.strftime('%Y-%m-%d')] = X_future
+        
         history_with_features = extended_featured_df.copy()
         history_with_features.loc[history_with_features.index.max(), target] = prediction
         if target_col == 'customers' and atv_lookup is not None:
@@ -468,11 +480,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     final_df = pd.DataFrame(future_predictions)
     historical_predictions = df_featured[['date']].copy()
+    historical_predictions = historical_predictions.loc[X.index] # Align with cleaned data
     historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
     historical_predictions['yhat'] = final_model.predict(X)
 
     full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
-    return full_forecast_df, final_model, X, X_dates
+    # FIXED: Return the generated future feature sets.
+    return full_forecast_df, final_model, X, X_dates, future_feature_sets
 
 
 def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, target_col_name):
@@ -488,7 +502,6 @@ def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, tar
         combined['yhat'] = (combined['yhat_prophet'] + combined['yhat_xgb']) / 2
         return combined[['ds', 'yhat']]
 
-    # UPGRADED: Using Ridge regression for a more robust meta-model
     meta_model = Ridge(alpha=0.5)
     meta_model.fit(X_meta, y_meta)
     
@@ -600,47 +613,8 @@ def create_daily_evaluation_data(historical_df, forecast_df):
     
     return eval_df
 
-def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
-    eval_df = create_daily_evaluation_data(historical_df, forecast_df)
-    if eval_df is None or eval_df.empty:
-        return None
-
-    period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
-    eval_df_period = eval_df[eval_df['date'] >= period_start_date].copy()
-
-    if eval_df_period.empty:
-        return None
-
-    actual_s = eval_df_period['actual_sales']
-    forecast_s = eval_df_period['adjusted_forecast_sales']
-    
-    non_zero_mask_s = actual_s != 0
-    if not non_zero_mask_s.any():
-        sales_mape = float('inf')
-    else:
-        sales_mape = np.mean(np.abs((actual_s[non_zero_mask_s] - forecast_s[non_zero_mask_s]) / actual_s[non_zero_mask_s])) * 100
-        
-    sales_mae = mean_absolute_error(actual_s, forecast_s)
-    sales_accuracy = 100 - sales_mape
-
-    actual_c = eval_df_period['actual_customers']
-    forecast_c = eval_df_period['forecast_customers']
-
-    non_zero_mask_c = actual_c != 0
-    if not non_zero_mask_c.any():
-        customer_mape = float('inf')
-    else:
-        customer_mape = np.mean(np.abs((actual_c[non_zero_mask_c] - forecast_c[non_zero_mask_c]) / actual_c[non_zero_mask_c])) * 100
-
-    customer_mae = mean_absolute_error(actual_c, forecast_c)
-    customer_accuracy = 100 - customer_mape
-    
-    return {
-        "sales_accuracy": sales_accuracy,
-        "sales_mae": sales_mae,
-        "customer_accuracy": customer_accuracy,
-        "customer_mae": customer_mae,
-    }
+# FIXED: Removed the unused calculate_accuracy_metrics function to improve clarity.
+# The logic in the 'Forecast Evaluator' tab is superior as it evaluates true day-ahead accuracy.
 
 def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
     if df.empty or actual_col not in df.columns or forecast_col not in df.columns:
@@ -846,7 +820,6 @@ if db:
                     
                     base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                     
-                    # MODIFIED: Using the new cap_outliers_iqr function
                     capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
                     
                     if capped_count > 0:
@@ -859,8 +832,7 @@ if db:
                     
                     with st.spinner("Running base models for Average Sale (ATV)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
-                        # For ATV, we can use the tuned XGBoost model without needing its SHAP values
-                        xgb_atv_f, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                        xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                     
                     atv_f = pd.DataFrame()
                     with st.spinner("Stacking ATV models for final prediction..."):
@@ -873,8 +845,8 @@ if db:
                     with st.spinner("Running base models for Customers and preparing explanations..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                         
-                        # MODIFIED: The XGBoost function now returns X_dates as the 4th item
-                        xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
+                        # FIXED: Unpack the new `future_feature_sets` return value
+                        xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
                         
                         if xgb_cust_model and not X_cust.empty:
                             with st.spinner("Calculating SHAP values for XGBoost explainability..."):
@@ -883,7 +855,9 @@ if db:
                                 st.session_state.shap_explainer_cust = explainer
                                 st.session_state.shap_values_cust = shap_values
                                 st.session_state.X_cust = X_cust
-                                st.session_state.X_cust_dates = X_cust_dates # Store dates for robust lookup
+                                st.session_state.X_cust_dates = X_cust_dates
+                                # FIXED: Store the future feature sets for on-demand SHAP plots
+                                st.session_state.future_X_cust = future_X_cust
 
                     with st.spinner("Stacking Customer models for final prediction..."):
                         if not prophet_cust_f.empty and not xgb_cust_f.empty:
@@ -991,38 +965,63 @@ if db:
                     st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
                     st.info("This waterfall chart shows exactly how each feature contributed to the **XGBoost base model's** customer prediction for the selected day. This reveals the impact of recent sales, weather, and other advanced features.")
                     
-                    if st.session_state.shap_values_cust is None or st.session_state.X_cust_dates is None:
+                    # FIXED: This entire block is re-engineered to handle both historical and future dates correctly.
+                    if st.session_state.shap_explainer_cust is None:
                         st.warning("SHAP values not available. Please regenerate the forecast.")
                     else:
-                        # MODIFIED: New robust logic for finding the SHAP plot index
                         try:
-                            target_date = pd.to_datetime(selected_date)
-                            date_series = st.session_state.X_cust_dates.reset_index(drop=True)
-                            date_idx_loc_list = date_series[date_series.dt.date == target_date.date()].index
+                            plot_generated = False
+                            target_date_dt = pd.to_datetime(selected_date).date()
                             
-                            if not date_idx_loc_list.empty:
-                                date_idx_loc = date_idx_loc_list[0]
-                                st.markdown(f"##### SHAP Explanation for {selected_date_str}")
-                                fig, ax = plt.subplots(figsize=(10, 5))
-                                shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
-                                plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
-                                plt.tight_layout()
-                                st.pyplot(fig)
-                                plt.clf() # Clear the figure to free memory
-
-                                with st.expander("View Overall Feature Importance (Summary Plot)"):
-                                    st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
-                                    fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
-                                    shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
+                            # --- Check for historical data first ---
+                            if st.session_state.X_cust_dates is not None:
+                                historical_dates = pd.to_datetime(st.session_state.X_cust_dates).dt.date
+                                date_match = (historical_dates == target_date_dt)
+                                if date_match.any():
+                                    date_idx_loc = np.where(date_match)[0][0]
+                                    
+                                    st.markdown(f"##### SHAP Explanation for {selected_date_str} (from historical data)")
+                                    fig, ax = plt.subplots(figsize=(10, 5))
+                                    shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
+                                    plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
                                     plt.tight_layout()
-                                    st.pyplot(fig_summary)
+                                    st.pyplot(fig)
                                     plt.clf()
-                            else:
-                                st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot. This can happen for future dates not yet in the historical feature set.")
-                        
+                                    plot_generated = True
+
+                            # --- If not historical, generate SHAP for future date on-demand ---
+                            if not plot_generated and st.session_state.future_X_cust is not None:
+                                future_key = selected_date.strftime('%Y-%m-%d')
+                                future_feature_row = st.session_state.future_X_cust.get(future_key)
+
+                                if future_feature_row is not None:
+                                    st.markdown(f"##### SHAP Explanation for {selected_date_str} (future forecast)")
+                                    with st.spinner("Generating on-demand SHAP explanation..."):
+                                        explainer = st.session_state.shap_explainer_cust
+                                        shap_values_future = explainer(future_feature_row)
+                                        
+                                        fig, ax = plt.subplots(figsize=(10, 5))
+                                        shap.waterfall_plot(shap_values_future[0], show=False)
+                                        plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
+                                        plt.tight_layout()
+                                        st.pyplot(fig)
+                                        plt.clf()
+                                    plot_generated = True
+
+                            if not plot_generated:
+                                st.error(f"Could not find feature data for {selected_date_str} to generate a SHAP plot.")
+                            
+                            # --- Overall Feature Importance (always available) ---
+                            with st.expander("View Overall Feature Importance (Summary Plot)"):
+                                st.info("This plot shows the average impact of each feature across all historical predictions. Features at the top have the highest impact on the model.")
+                                fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
+                                shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
+                                plt.tight_layout()
+                                st.pyplot(fig_summary)
+                                plt.clf()
+
                         except Exception as e:
                             st.error(f"An error occurred while building the SHAP plot: {e}")
-
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
 
