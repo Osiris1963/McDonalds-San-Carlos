@@ -308,7 +308,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -847,7 +847,6 @@ if db:
                         capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
                         if capped_count > 0:
                             st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
-
                         hist_df_with_atv = calculate_atv(capped_df)
                         hist_df_featured = create_advanced_features(hist_df_with_atv)
                         ev_df = st.session_state.events_df.copy()
@@ -857,15 +856,11 @@ if db:
                     with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
-                        
                         atv_forecast_for_cust_model = prophet_atv_f
-                        
                         xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                         xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-
                         lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                         lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-                        
                         cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
                         cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
 
@@ -903,8 +898,28 @@ if db:
                             combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
                         else:
                             combo_f['weather'] = 'Not Available'
-                            
                         st.session_state.forecast_df = combo_f
+                        
+                        try:
+                            with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
+                                combo_f['ds'] = pd.to_datetime(combo_f['ds'])
+                                today_date_naive = pd.to_datetime('today').tz_localize(None).normalize()
+                                future_forecasts_to_log = combo_f[combo_f['ds'] > today_date_naive]
+                                if not future_forecasts_to_log.empty:
+                                    for _, row in future_forecasts_to_log.iterrows():
+                                        log_entry = {
+                                            "generated_on": today_date_naive,
+                                            "forecast_for_date": row['ds'],
+                                            "predicted_sales": row['forecast_sales'],
+                                            "predicted_customers": row['forecast_customers']
+                                        }
+                                        doc_id = f"{today_date_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
+                                        db.collection('forecast_log').document(doc_id).set(log_entry)
+                                    st.info("Forecast log saved successfully.")
+                                else:
+                                    st.warning("No future dates found in the forecast to log.")
+                        except Exception as e:
+                            st.error(f"Failed to save forecast log: {e}")
                         
                         if prophet_model_cust:
                             full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
