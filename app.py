@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
-import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import Ridge
@@ -10,9 +9,7 @@ import numpy as np
 import plotly.graph_objs as go
 import yaml
 from yaml.loader import SafeLoader
-import io
 import time
-import os
 import requests
 from datetime import timedelta, date
 import firebase_admin
@@ -21,11 +18,11 @@ import json
 import logging
 import shap
 import matplotlib.pyplot as plt
+from pkg_resources import parse_version # ROBUSTNESS FIX: For checking library versions
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -173,7 +170,7 @@ def initialize_state_firestore(db_client):
         'shap_explainer_cust': None,
         'shap_values_cust': None,
         'X_cust': None,
-        'X_cust_dates': None, # ADDED: For robust SHAP lookup
+        'X_cust_dates': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -210,7 +207,6 @@ def load_from_firestore(_db_client, collection_name):
     return df
 
 def cap_outliers_iqr(df, column='sales'):
-    """ REPLACES remove_outliers_iqr. Caps extreme values instead of dropping them. """
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
@@ -230,7 +226,7 @@ def calculate_atv(df):
     df['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df
 
-@st.cache_data(ttl=3600)
+@st.cache_resource(ttl=3600)
 def get_weather_forecast(days=16):
     try:
         url="https://api.open-meteo.com/v1/forecast"
@@ -296,7 +292,6 @@ def create_advanced_features(df):
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
         
-    # ADDED: Exponentially Weighted Moving Averages to prioritize recent data
     if 'sales' in df.columns:
         df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
@@ -354,9 +349,8 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# MODIFIED: Fully revamped with Optuna for automated hyperparameter tuning
 @st.cache_resource
-def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
+def train_and_forecast_xgboost(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
 
@@ -376,7 +370,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
 
-    # ADDED EWMA features to the feature lists
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     elif target_col == 'atv':
@@ -389,63 +382,44 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
 
     X = df_featured[features]
     y = df_featured[target]
-    X_dates = df_featured['date'] # For robust SHAP lookup later
+    X_dates = df_featured['date']
 
-    if X.empty or len(X) < 50: # Increased minimum data size for robust tuning
+    if X.empty or len(X) < 50:
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame(), None
 
-    # --- Optuna Hyperparameter Tuning ---
-    def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
-        
-        param = {
-            'objective': 'reg:squarederror',
-            'booster': 'gbtree',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
-            'random_state': 42
-        }
-
-        model = xgb.XGBRegressor(**param)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
-            sample_weights = np.linspace(0.1, 1.0, len(y_train))
-            
-            model.fit(X_train, y_train, 
-                      eval_set=[(X_val, y_val)], 
-                      early_stopping_rounds=50, 
-                      verbose=False,
-                      sample_weight=sample_weights)
-                      
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-
-        return np.mean(scores)
-
-    try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300) # Use a reasonable number of trials/timeout
-        best_params = study.best_params
-    except Exception as e:
-        st.warning(f"Optuna tuning failed for {target_col}. Using default parameters. Error: {e}")
-        best_params = {
-            'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
-            'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
-        }
+    # --- Optuna Removed ---
+    # Using robust default parameters directly instead of tuning.
+    # These are the same parameters the app would fall back to on failure.
+    best_params = {
+        'objective': 'reg:squarederror',
+        'n_estimators': 1000,
+        'learning_rate': 0.05,
+        'max_depth': 5,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'random_state': 42
+    }
 
     final_model = xgb.XGBRegressor(**best_params)
     sample_weights = np.linspace(0.5, 1.0, len(y))
-    final_model.fit(X, y, sample_weight=sample_weights)
+    
+    # Gracefully handle early stopping for different XGBoost versions
+    fit_params = {}
+    if parse_version(xgb.__version__) >= parse_version("1.6.0"):
+        # Create a simple validation set for early stopping
+        split_index = int(len(X) * 0.9)
+        X_train, X_val = X[:split_index], X[split_index:]
+        y_train, y_val = y[:split_index], y[split_index:]
+        train_weights = sample_weights[:split_index]
 
-    # --- Recursive Forecasting Loop (unchanged) ---
+        fit_params["eval_set"] = [(X_val, y_val)]
+        fit_params["early_stopping_rounds"] = 50
+        final_model.fit(X_train, y_train, sample_weight=train_weights, verbose=False, **fit_params)
+    else:
+        # For older versions, train on all data without early stopping to prevent errors
+        final_model.fit(X, y, sample_weight=sample_weights, verbose=False)
+
     future_predictions = []
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
@@ -488,7 +462,6 @@ def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, tar
         combined['yhat'] = (combined['yhat_prophet'] + combined['yhat_xgb']) / 2
         return combined[['ds', 'yhat']]
 
-    # UPGRADED: Using Ridge regression for a more robust meta-model
     meta_model = Ridge(alpha=0.5)
     meta_model.fit(X_meta, y_meta)
     
@@ -507,8 +480,12 @@ def add_to_firestore(db_client, collection_name, data, historical_df):
     
     if 'date' in data and pd.notna(data['date']):
         current_date = pd.to_datetime(data['date'])
-        last_year_date = current_date - timedelta(days=364)
-        
+        # ROBUSTNESS FIX: Correctly find the same date last year, accounting for leap years.
+        try:
+            last_year_date = current_date.replace(year=current_date.year - 1)
+        except ValueError: # Handles leap year case e.g., Feb 29
+            last_year_date = current_date.replace(year=current_date.year - 1, day=28)
+
         hist_copy = historical_df.copy()
         hist_copy['date_only'] = pd.to_datetime(hist_copy['date']).dt.date
         
@@ -621,7 +598,8 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
         sales_mape = np.mean(np.abs((actual_s[non_zero_mask_s] - forecast_s[non_zero_mask_s]) / actual_s[non_zero_mask_s])) * 100
         
     sales_mae = mean_absolute_error(actual_s, forecast_s)
-    sales_accuracy = 100 - sales_mape
+    sales_accuracy = max(0, 100 - sales_mape)
+
 
     actual_c = eval_df_period['actual_customers']
     forecast_c = eval_df_period['forecast_customers']
@@ -633,7 +611,7 @@ def calculate_accuracy_metrics(historical_df, forecast_df, days=30):
         customer_mape = np.mean(np.abs((actual_c[non_zero_mask_c] - forecast_c[non_zero_mask_c]) / actual_c[non_zero_mask_c])) * 100
 
     customer_mae = mean_absolute_error(actual_c, forecast_c)
-    customer_accuracy = 100 - customer_mape
+    customer_accuracy = max(0, 100 - customer_mape)
     
     return {
         "sales_accuracy": sales_accuracy,
@@ -678,17 +656,46 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
 
     return fig
 
-def generate_insight_summary(day_data,selected_date):
-    effects={'Day of the Week':day_data.get('weekly', 0),'Time of Year':day_data.get('yearly', 0),'Holidays/Events':day_data.get('holidays', 0)}
-    significant_effects={k:v for k,v in effects.items()if abs(v)>1}
-    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
-    if not significant_effects:
-        summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."
-        return summary
-    pos_drivers={k:v for k,v in significant_effects.items()if v>0};neg_drivers={k:v for k,v in significant_effects.items()if v<0}
-    if pos_drivers:biggest_pos_driver=max(pos_drivers,key=pos_drivers.get);summary+=f"📈 Main positive driver is **{biggest_pos_driver}**,adding an estimated **{pos_drivers[biggest_pos_driver]:.0f} customers**.\n"
-    if neg_drivers:biggest_neg_driver=min(neg_drivers,key=neg_drivers.get);summary+=f"📉 Main negative driver is **{biggest_neg_driver}**,reducing by **{abs(neg_drivers[biggest_neg_driver]):.0f} customers**.\n"
-    summary+=f"\nAfter all factors,the final forecast is **{day_data.get('yhat', 0):.0f} customers**.";return summary
+def generate_insight_summary(day_data, selected_date, shap_day_values=None, feature_names=None):
+    summary = f"The forecast for **{selected_date.strftime('%A, %B %d')}** starts with a Prophet baseline trend of **{day_data.get('trend', 0):,.0f} customers**.\n"
+
+    prophet_effects = {
+        'Day of the Week': day_data.get('weekly', 0),
+        'Time of Year': day_data.get('yearly', 0),
+        'Holidays/Events': day_data.get('holidays', 0)
+    }
+    significant_prophet_effects = {k: v for k, v in prophet_effects.items() if abs(v) > 0.5}
+
+    if significant_prophet_effects:
+        summary += "\n### 📈 Prophet Model Drivers (Seasonality & Holidays):\n"
+        pos_prophet = {k: v for k, v in significant_prophet_effects.items() if v > 0}
+        neg_prophet = {k: v for k, v in significant_prophet_effects.items() if v < 0}
+        if pos_prophet:
+            for driver, value in pos_prophet.items():
+                summary += f"- **{driver}** effect is positive, adding an estimated **{value:,.0f} customers**.\n"
+        if neg_prophet:
+            for driver, value in neg_prophet.items():
+                summary += f"- **{driver}** effect is negative, reducing the estimate by **{abs(value):,.0f} customers**.\n"
+
+    if shap_day_values is not None and feature_names is not None:
+        shap_values = shap_day_values.values
+        shap_dict = dict(zip(feature_names, shap_values))
+        significant_shap_drivers = {k: v for k, v in shap_dict.items() if abs(v) > 0.1}
+        sorted_shap_drivers = sorted(significant_shap_drivers.items(), key=lambda item: abs(item[1]), reverse=True)
+
+        pos_shap = [(f, v) for f, v in sorted_shap_drivers if v > 0][:2]
+        neg_shap = [(f, v) for f, v in sorted_shap_drivers if v < 0][:2]
+
+        if pos_shap or neg_shap:
+            summary += "\n### 💡 XGBoost Model Drivers (Recent Data & Trends):\n"
+        
+        for feature, value in pos_shap:
+            summary += f"- Recent trends in **`{feature.replace('_', ' ')}`** are a positive factor, adding ~**{value:.1f} customers**.\n"
+        for feature, value in neg_shap:
+            summary += f"- Recent trends in **`{feature.replace('_', ' ')}`** are a negative factor, reducing the estimate by ~**{abs(value):.1f} customers**.\n"
+
+    summary += f"\n---\nAfter combining all factors from the AI ensemble, the final forecast is **{day_data.get('yhat', 0):,.0f} customers**."
+    return summary
 
 def render_activity_card(row, db_client, view_type='compact_list'):
     doc_id = row['doc_id']
@@ -789,9 +796,11 @@ def render_historical_record(row, db_client):
             edit_cols2 = st.columns(2)
             updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
             
-            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
-            current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
+            weather_options = ["Sunny", "Partly Cloudy", "Cloudy", "Foggy", "Rainy", "Rain Showers", "Thunderstorm", "Storm"]
+            current_weather = row.get('weather', 'Cloudy')
+            current_weather_index = weather_options.index(current_weather) if current_weather in weather_options else 0
             updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
+
 
             day_type_options = ["Normal Day", "Not Normal Day"]
             current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
@@ -846,7 +855,6 @@ if db:
                     
                     base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                     
-                    # MODIFIED: Using the new cap_outliers_iqr function
                     capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
                     
                     if capped_count > 0:
@@ -859,8 +867,7 @@ if db:
                     
                     with st.spinner("Running base models for Average Sale (ATV)..."):
                         prophet_atv_f, _ = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
-                        # For ATV, we can use the tuned XGBoost model without needing its SHAP values
-                        xgb_atv_f, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
+                        xgb_atv_f, _, _, _ = train_and_forecast_xgboost(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'atv')
                     
                     atv_f = pd.DataFrame()
                     with st.spinner("Stacking ATV models for final prediction..."):
@@ -873,8 +880,7 @@ if db:
                     with st.spinner("Running base models for Customers and preparing explanations..."):
                         prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers')
                         
-                        # MODIFIED: The XGBoost function now returns X_dates as the 4th item
-                        xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates = train_and_forecast_xgboost_tuned(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
+                        xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates = train_and_forecast_xgboost(hist_df_with_atv, ev_df, FORECAST_HORIZON, 'customers', atv_forecast_df=atv_f)
                         
                         if xgb_cust_model and not X_cust.empty:
                             with st.spinner("Calculating SHAP values for XGBoost explainability..."):
@@ -883,7 +889,7 @@ if db:
                                 st.session_state.shap_explainer_cust = explainer
                                 st.session_state.shap_values_cust = shap_values
                                 st.session_state.X_cust = X_cust
-                                st.session_state.X_cust_dates = X_cust_dates # Store dates for robust lookup
+                                st.session_state.X_cust_dates = X_cust_dates
 
                     with st.spinner("Stacking Customer models for final prediction..."):
                         if not prophet_cust_f.empty and not xgb_cust_f.empty:
@@ -974,54 +980,65 @@ if db:
 
                 future_components['date_str'] = future_components['ds'].dt.strftime('%A, %B %d, %Y')
                 selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
+                
                 selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
+                day_data = future_components[future_components['ds'] == selected_date].iloc[0]
+                
+                shap_day_values = None
+                feature_names = None
+                shap_error_message = ""
 
-                insight_tab1, insight_tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
+                if st.session_state.shap_values_cust is not None and st.session_state.X_cust_dates is not None:
+                    try:
+                        target_date = pd.to_datetime(selected_date)
+                        date_series = st.session_state.X_cust_dates.reset_index(drop=True)
+                        date_idx_loc_list = date_series[date_series.dt.date == target_date.date()].index
+                        
+                        if not date_idx_loc_list.empty:
+                            date_idx_loc = date_idx_loc_list[0]
+                            shap_day_values = st.session_state.shap_values_cust[date_idx_loc]
+                            feature_names = st.session_state.X_cust.columns
+                        else:
+                            shap_error_message = f"Could not find corresponding XGBoost feature data for {selected_date_str} to generate a SHAP analysis. This is expected for future dates."
+                    except Exception as e:
+                        shap_error_message = f"An error occurred while locating SHAP data: {e}"
+
+                insight_tab1, insight_tab2, insight_tab3 = st.tabs(["Combined Insight Summary", "Prophet Model Breakdown", "XGBoost Drivers (SHAP)"])
 
                 with insight_tab1:
-                    st.subheader("Prophet Model Breakdown")
-                    st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
-                    breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
-                    st.plotly_chart(breakdown_fig, use_container_width=True)
-                    st.markdown("---")
-                    st.subheader("Prophet Insight Summary")
-                    st.markdown(generate_insight_summary(day_data, selected_date))
+                    st.subheader("Combined Forecast Summary")
+                    st.info("This summary combines insights from both the Prophet model (for baseline trends and seasonality) and the XGBoost model (for recent data-driven effects).")
+                    summary_text = generate_insight_summary(day_data, selected_date, shap_day_values, feature_names)
+                    st.markdown(summary_text)
 
                 with insight_tab2:
-                    st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
-                    st.info("This waterfall chart shows exactly how each feature contributed to the **XGBoost base model's** customer prediction for the selected day. This reveals the impact of recent sales, weather, and other advanced features.")
-                    
-                    if st.session_state.shap_values_cust is None or st.session_state.X_cust_dates is None:
-                        st.warning("SHAP values not available. Please regenerate the forecast.")
-                    else:
-                        # MODIFIED: New robust logic for finding the SHAP plot index
-                        try:
-                            target_date = pd.to_datetime(selected_date)
-                            date_series = st.session_state.X_cust_dates.reset_index(drop=True)
-                            date_idx_loc_list = date_series[date_series.dt.date == target_date.date()].index
-                            
-                            if not date_idx_loc_list.empty:
-                                date_idx_loc = date_idx_loc_list[0]
-                                st.markdown(f"##### SHAP Explanation for {selected_date_str}")
-                                fig, ax = plt.subplots(figsize=(10, 5))
-                                shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
-                                plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
-                                plt.tight_layout()
-                                st.pyplot(fig)
-                                plt.clf() # Clear the figure to free memory
+                    st.subheader("Prophet Model Breakdown")
+                    st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
+                    breakdown_fig, _ = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                    st.plotly_chart(breakdown_fig, use_container_width=True)
 
-                                with st.expander("View Overall Feature Importance (Summary Plot)"):
-                                    st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
-                                    fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
-                                    shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
-                                    plt.tight_layout()
-                                    st.pyplot(fig_summary)
-                                    plt.clf()
-                            else:
-                                st.error(f"Could not find matching feature data for {selected_date_str} to generate a SHAP plot. This can happen for future dates not yet in the historical feature set.")
-                        
-                        except Exception as e:
-                            st.error(f"An error occurred while building the SHAP plot: {e}")
+                with insight_tab3:
+                    st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
+                    st.info("This section provides a detailed look at the XGBoost model's reasoning. The waterfall chart shows exactly how each feature contributed to the prediction for the selected day.")
+                    
+                    if shap_day_values is not None:
+                        st.markdown(f"##### SHAP Explanation for {selected_date_str}")
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        shap.waterfall_plot(shap_day_values, show=False)
+                        plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
+                        plt.tight_layout()
+                        st.pyplot(fig)
+                        plt.close(fig)
+
+                        with st.expander("View Overall Feature Importance (Summary Plot)"):
+                            st.info("This plot shows the average impact of each feature across all predictions. Features at the top have the highest impact on the model.")
+                            fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
+                            shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
+                            plt.tight_layout()
+                            st.pyplot(fig_summary)
+                            plt.close(fig_summary)
+                    else:
+                        st.warning(shap_error_message or "SHAP values not available. Please regenerate the forecast.")
 
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
@@ -1081,12 +1098,15 @@ if db:
                 actual_cust_safe = final_df['customers'].replace(0, np.nan)
                 cust_mape = np.nanmean(np.abs((final_df['customers'] - final_df['predicted_customers']) / actual_cust_safe)) * 100
 
+                sales_accuracy = max(0, 100 - sales_mape)
+                cust_accuracy = max(0, 100 - cust_mape)
+
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.metric(label="Sales MAPE (Accuracy)", value=f"{100 - sales_mape:.2f}%")
+                    st.metric(label="Sales Accuracy (vs MAPE)", value=f"{sales_accuracy:.2f}%")
                     st.metric(label="Sales MAE (Avg Error)", value=f"₱{sales_mae:,.2f}")
                 with col2:
-                    st.metric(label="Customer MAPE (Accuracy)", value=f"{100 - cust_mape:.2f}%")
+                    st.metric(label="Customer Accuracy (vs MAPE)", value=f"{cust_accuracy:.2f}%")
                     st.metric(label="Customer MAE (Avg Error)", value=f"{cust_mae:,.0f} customers")
 
                 st.markdown("---")
