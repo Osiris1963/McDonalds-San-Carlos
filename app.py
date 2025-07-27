@@ -22,7 +22,7 @@ import json
 import logging
 import shap
 import matplotlib.pyplot as plt
-import inspect # FIXED: Import inspect to dynamically check function arguments
+import inspect
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -346,8 +346,10 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.15, 
-        changepoint_range=0.9,
+        # IMPROVED: Increased changepoint scale for more trend flexibility
+        changepoint_prior_scale=0.5, 
+        # IMPROVED: Extended changepoint range to detect recent trend changes
+        changepoint_range=0.95,
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
@@ -395,8 +397,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame(), None, None
     
-    # FIXED: This block dynamically checks which early stopping parameter the installed
-    # XGBoost version supports. This makes the code robust against environment inconsistencies.
     fit_params = inspect.signature(xgb.XGBRegressor.fit).parameters
     use_callbacks = 'callbacks' in fit_params
     use_early_stopping_rounds = 'early_stopping_rounds' in fit_params
@@ -424,9 +424,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
                 'random_state': 42
             }
             model = xgb.XGBRegressor(**param)
-            sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
-            # Build the fitting parameters dynamically based on the check above
+            # IMPROVED: Aggressive exponential weighting to prioritize recent trends
+            sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
+            
             fit_kwargs = {
                 "eval_set": [(X_val, y_val)],
                 "verbose": False,
@@ -456,7 +457,8 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
 
     final_model = xgb.XGBRegressor(**best_params)
-    sample_weights = np.linspace(0.5, 1.0, len(y))
+    # IMPROVED: Aggressive exponential weighting in final model training
+    sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     final_model.fit(X, y, sample_weight=sample_weights)
 
     # --- Recursive Forecasting Loop ---
@@ -581,7 +583,6 @@ def plot_full_comparison_chart(hist, fcst, metrics, target):
     title_text=f"{target.replace('_',' ').title()} Forecast"
     y_axis_title=title_text+' (₱)' if 'atv' in target or 'sales' in target else title_text
     
-    # FIXED: Replaced shorthand axis titles with the more robust dictionary structure to fix ValueError.
     fig.update_layout(
         title=f'Full Diagnostic: {title_text} vs. Historical',
         xaxis=dict(title='Date'),
@@ -659,7 +660,6 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
         line=dict(color='#d62728', dash='dash', width=2), marker=dict(symbol='x', size=7)
     ))
     
-    # FIXED: Replaced shorthand axis titles with the more robust dictionary structure to fix ValueError.
     fig.update_layout(
         title=dict(text=title, font=dict(color='white', size=20)),
         xaxis=dict(title='Date', font=dict(color='white', size=14)),
