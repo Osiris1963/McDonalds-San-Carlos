@@ -615,17 +615,27 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
     return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, is_catboost=True)
 
 @st.cache_data
-def prepare_data_for_tft(df, target_col, forecast_horizon):
-    df_prep = df.copy()
+def prepare_data_for_tft(_df, target_col, forecast_horizon):
+    df_prep = _df.copy()
     for feat in ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']:
         if feat not in df_prep.columns:
-            df_prep[feat] = getattr(df_prep["date"].dt, feat.replace('dayofyear', 'day_of_year'))
+            if feat == 'dayofyear':
+                df_prep[feat] = df_prep["date"].dt.day_of_year
+            else:
+                 df_prep[feat] = getattr(df_prep["date"].dt, feat)
     df_prep["time_idx"] = (df_prep["date"] - df_prep["date"].min()).dt.days
     df_prep["group"] = "store_A"
     df_prep[target_col] = df_prep[target_col].astype(float)
     max_prediction_length = forecast_horizon
     max_encoder_length = 60
     training_cutoff = df_prep["time_idx"].max() - max_prediction_length
+    
+    for col in df_prep.columns:
+        if df_prep[col].dtype == 'object':
+            df_prep[col] = df_prep[col].astype(str)
+        elif pd.api.types.is_integer_dtype(df_prep[col]):
+            df_prep[col] = df_prep[col].astype(float)
+
     dataset = TimeSeriesDataSet(
         df_prep[lambda x: x.time_idx <= training_cutoff],
         time_idx="time_idx",
@@ -639,13 +649,13 @@ def prepare_data_for_tft(df, target_col, forecast_horizon):
         allow_missing_timesteps=True,
         scalers={}
     )
-    return dataset
+    return dataset, max_encoder_length
 
 @st.cache_resource
 def train_and_forecast_tft(_historical_df, periods, target_col):
     try:
         with st.spinner(f"Preparing data for TFT ({target_col})..."):
-            dataset = prepare_data_for_tft(_historical_df, target_col, periods)
+            dataset, max_encoder_length = prepare_data_for_tft(_historical_df, target_col, periods)
             train_dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
             val_dataloader = dataset.to_dataloader(train=False, batch_size=32, num_workers=0)
 
@@ -670,17 +680,22 @@ def train_and_forecast_tft(_historical_df, periods, target_col):
         best_model_path = trainer.checkpoint_callback.best_model_path
         best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
         
-        encoder_data = _historical_df[_historical_df["time_idx"] > _historical_df["time_idx"].max() - 60]
+        encoder_data = _historical_df[_historical_df["time_idx"] > _historical_df["time_idx"].max() - max_encoder_length]
         last_date = _historical_df['date'].max()
         future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
         decoder_data = pd.DataFrame({
-            "date": future_dates,
-            "group": "store_A",
-            target_col: 0.0
+            "date": future_dates, "group": "store_A", target_col: 0.0
         })
         
         new_prediction_data = pd.concat([encoder_data, decoder_data], ignore_index=True)
         new_prediction_data["time_idx"] = (pd.to_datetime(new_prediction_data["date"]) - _historical_df["date"].min()).dt.days
+
+        for feat in ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear']:
+            if feat not in new_prediction_data.columns:
+                if feat == 'dayofyear':
+                     new_prediction_data[feat] = new_prediction_data["date"].dt.day_of_year
+                else:
+                    new_prediction_data[feat] = getattr(new_prediction_data["date"].dt, feat)
         
         raw_predictions, x = best_tft.predict(new_prediction_data, return_x=True)
         
@@ -734,25 +749,25 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-def plot_full_comparison_chart(hist, fcst, metrics, target):
-    fig=go.Figure()
-    fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')))
-    fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')))
-    title_text=f"{target.replace('_',' ').title()} Forecast"
-    y_axis_title=title_text+' (₱)' if 'atv' in target or 'sales' in target else title_text
+def plot_full_comparison_chart(hist, fcst, metrics, target_col):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=hist['date'], y=hist[target_col], mode='lines+markers', name='Historical Actuals', line=dict(color='#3b82f6')))
+    fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], mode='lines', name='Forecast', line=dict(color='#ffc72c', dash='dash')))
+    title_text = f"{target_col.replace('_',' ').title()} Forecast"
+    y_axis_title = title_text + ' (₱)' if 'atv' in target_col or 'sales' in target_col else title_text
     
     fig.update_layout(
         title=f'Full Diagnostic: {title_text} vs. Historical',
         xaxis=dict(title='Date'),
         yaxis=dict(title=y_axis_title),
-        legend=dict(x=0.01,y=0.99),
+        legend=dict(x=0.01, y=0.99),
         height=500,
-        margin=dict(l=40,r=40,t=60,b=40),
+        margin=dict(l=40, r=40, t=60, b=40),
         paper_bgcolor='#2a2a2a',
         plot_bgcolor='#2a2a2a',
         font_color='white'
     )
-    fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)")
+    fig.add_annotation(x=0.02, y=0.95, xref="paper", yref="paper", text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}", showarrow=False, font=dict(size=12, color="white"), align="left", bgcolor="rgba(0,0,0,0.5)")
     return fig
 
 def plot_forecast_breakdown(components,selected_date,all_events):
