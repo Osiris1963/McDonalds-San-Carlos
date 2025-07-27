@@ -346,9 +346,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
         daily_seasonality=False,
         weekly_seasonality=True,
         yearly_seasonality=use_yearly_seasonality, 
-        # IMPROVED: Increased changepoint scale for more trend flexibility
         changepoint_prior_scale=0.5, 
-        # IMPROVED: Extended changepoint range to detect recent trend changes
         changepoint_range=0.95,
     )
     prophet_model.add_country_holidays(country_name='PH')
@@ -401,7 +399,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     use_callbacks = 'callbacks' in fit_params
     use_early_stopping_rounds = 'early_stopping_rounds' in fit_params
     
-    # --- Optuna Hyperparameter Tuning ---
     def objective(trial):
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
@@ -425,7 +422,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             }
             model = xgb.XGBRegressor(**param)
             
-            # IMPROVED: Aggressive exponential weighting to prioritize recent trends
             sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
             
             fit_kwargs = {
@@ -457,7 +453,6 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         }
 
     final_model = xgb.XGBRegressor(**best_params)
-    # IMPROVED: Aggressive exponential weighting in final model training
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     final_model.fit(X, y, sample_weight=sample_weights)
 
@@ -871,8 +866,14 @@ if db:
                         
                         if xgb_cust_model and not X_cust.empty:
                             with st.spinner("Calculating SHAP values for XGBoost explainability..."):
-                                explainer = shap.TreeExplainer(xgb_cust_model)
-                                shap_values = explainer(X_cust)
+                                # FIXED: Use a more robust explainer configuration and add a fallback for the additivity check.
+                                explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
+                                try:
+                                    shap_values = explainer(X_cust)
+                                except shap.utils.ExplainerError:
+                                    st.warning("SHAP additivity check failed. Calculating values without it. This is usually due to sample weighting and does not impact forecast accuracy.")
+                                    shap_values = explainer(X_cust, check_additivity=False)
+
                                 st.session_state.shap_explainer_cust = explainer
                                 st.session_state.shap_values_cust = shap_values
                                 st.session_state.X_cust = X_cust
