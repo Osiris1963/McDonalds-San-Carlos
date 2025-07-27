@@ -360,7 +360,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
-# MODIFIED: Removed Optuna and using fixed hyperparameters
+# MODIFIED: Removed Optuna and implemented robust fitting logic
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -392,46 +392,55 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     features = [f for f in features if f in df_featured.columns]
     target = target_col
 
-    X = df_featured[features]
-    y = df_featured[target]
-    X_dates = df_featured['date']
+    X = df_featured[features].copy() # Use copy to avoid SettingWithCopyWarning
+    y = df_featured[target].copy()
+    
+    # --- FIX: Explicitly ensure all data is numeric to prevent TypeError ---
+    for col in features:
+        X[col] = pd.to_numeric(X[col], errors='coerce')
+    y = pd.to_numeric(y, errors='coerce')
+
+    # Combine and drop any NaNs that might have been introduced
+    full_data = pd.concat([y, X], axis=1)
+    full_data.dropna(inplace=True)
+    
+    y = full_data[target]
+    X = full_data[features]
+    X_dates = df_featured.loc[X.index, 'date'] # Align dates with cleaned X
 
     if X.empty or len(X) < 50:
-        st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
+        st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering and cleaning.")
         return pd.DataFrame(), None, pd.DataFrame(), None
 
-    # --- Use fixed, robust hyperparameters instead of Optuna tuning ---
+    # Use fixed, robust hyperparameters
     best_params = {
-        'objective': 'reg:squarederror',
-        'n_estimators': 1000,
-        'learning_rate': 0.05,
-        'max_depth': 5,
-        'subsample': 0.8,
-        'colsample_bytree': 0.8,
-        'random_state': 42
+        'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
+        'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
     }
-    st.info(f"Using pre-defined hyperparameters for the {target_col.title()} XGBoost model.")
-
-
-    final_model = xgb.XGBRegressor(**best_params)
-    sample_weights = np.linspace(0.5, 1.0, len(y))
     
-    # Use early stopping during the final fit to prevent overfitting
-    # We need an evaluation set for early stopping. A simple split is fine here.
+    # --- FIX: Implement robust training with early stopping ---
+    # 1. Find optimal boosting rounds on a temporary split
+    temp_model = xgb.XGBRegressor(**best_params)
     split_index = int(len(X) * 0.9)
-    X_train, X_val = X[:split_index], X[split_index:]
-    y_train, y_val = y[:split_index], y[split_index:]
+    X_train, X_val = X.iloc[:split_index], X.iloc[split_index:]
+    y_train, y_val = y.iloc[:split_index], y.iloc[split_index:]
     
-    final_model.fit(X_train, y_train,
-                    eval_set=[(X_val, y_val)],
-                    early_stopping_rounds=50,
-                    verbose=False)
+    temp_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+    
+    # Get the best number of estimators
+    best_n_estimators = temp_model.best_iteration if temp_model.best_iteration else best_params['n_estimators']
+
+    # 2. Train the final model on ALL historical data with the optimal number of estimators
+    final_model_params = best_params.copy()
+    final_model_params['n_estimators'] = best_n_estimators
+    final_model = xgb.XGBRegressor(**final_model_params)
+    final_model.fit(X, y, verbose=False)
 
 
     # --- Recursive Forecasting Loop ---
-    future_predictions = []
-    history_with_features = df_featured.copy()
+    history_with_features = df_featured.loc[X.index].copy() # Start with the cleaned data
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
+    future_predictions = []
 
     for i in range(periods):
         last_date = history_with_features['date'].max()
@@ -443,14 +452,18 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         X_future = extended_featured_df[features].tail(1)
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
-        history_with_features = extended_featured_df.copy()
-        history_with_features.loc[history_with_features.index.max(), target] = prediction
+        
+        # Update history for the next recursive step
+        new_row = extended_featured_df.iloc[-1:].copy()
+        new_row[target] = prediction
         if target_col == 'customers' and atv_lookup is not None:
             forecasted_atv = atv_lookup.get(pd.to_datetime(next_date), history_with_features['atv'].dropna().tail(7).mean())
-            history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
+            new_row['sales'] = prediction * forecasted_atv
+        
+        history_with_features = pd.concat([history_with_features, new_row], ignore_index=True)
 
     final_df = pd.DataFrame(future_predictions)
-    historical_predictions = df_featured[['date']].copy()
+    historical_predictions = df_featured.loc[X.index, ['date']].copy()
     historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
     historical_predictions['yhat'] = final_model.predict(X)
 
@@ -968,8 +981,10 @@ if db:
                             target_date = pd.to_datetime(selected_date).normalize()
                             historical_dates = pd.to_datetime(st.session_state.X_cust_dates).dt.normalize()
                             
-                            if target_date in historical_dates.values:
-                                date_idx_loc = historical_dates[historical_dates == target_date].index[0]
+                            matching_indices = st.session_state.X_cust_dates[historical_dates == target_date].index
+                            
+                            if not matching_indices.empty:
+                                date_idx_loc = matching_indices[0]
                                 
                                 st.markdown(f"##### SHAP Explanation for {selected_date_str}")
                                 fig, ax = plt.subplots(figsize=(10, 5))
