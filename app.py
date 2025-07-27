@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
-import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import Ridge
@@ -25,7 +24,6 @@ import matplotlib.pyplot as plt
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -362,6 +360,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     
     return forecast[['ds', 'yhat']], prophet_model
 
+# MODIFIED: Removed Optuna and using fixed hyperparameters
 @st.cache_resource
 def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_col, atv_forecast_df=None):
     df_train = historical_df.copy()
@@ -401,44 +400,35 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame(), None
 
-    def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
-        param = {
-            'objective': 'reg:squarederror', 'booster': 'gbtree',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
-            'random_state': 42
-        }
-        model = xgb.XGBRegressor(**param)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            sample_weights = np.linspace(0.1, 1.0, len(y_train))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False, sample_weight=sample_weights)
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores)
+    # --- Use fixed, robust hyperparameters instead of Optuna tuning ---
+    best_params = {
+        'objective': 'reg:squarederror',
+        'n_estimators': 1000,
+        'learning_rate': 0.05,
+        'max_depth': 5,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'random_state': 42
+    }
+    st.info(f"Using pre-defined hyperparameters for the {target_col.title()} XGBoost model.")
 
-    try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300)
-        best_params = study.best_params
-    except Exception as e:
-        st.warning(f"Optuna tuning failed for {target_col}. Using default parameters. Error: {e}")
-        best_params = {
-            'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05,
-            'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42
-        }
 
     final_model = xgb.XGBRegressor(**best_params)
     sample_weights = np.linspace(0.5, 1.0, len(y))
-    final_model.fit(X, y, sample_weight=sample_weights)
+    
+    # Use early stopping during the final fit to prevent overfitting
+    # We need an evaluation set for early stopping. A simple split is fine here.
+    split_index = int(len(X) * 0.9)
+    X_train, X_val = X[:split_index], X[split_index:]
+    y_train, y_val = y[:split_index], y[split_index:]
+    
+    final_model.fit(X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    early_stopping_rounds=50,
+                    verbose=False)
 
+
+    # --- Recursive Forecasting Loop ---
     future_predictions = []
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
@@ -467,9 +457,10 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     full_forecast_df = pd.concat([historical_predictions, final_df], ignore_index=True)
     return full_forecast_df, final_model, X, X_dates
 
+
 def train_and_forecast_stacked_ensemble(prophet_f, xgb_f, historical_target, target_col_name):
     """
-    FIXED: Trains meta-model on historical data and predicts on the full horizon.
+    Trains meta-model on historical data and predicts on the full horizon.
     """
     base_forecasts = pd.merge(prophet_f[['ds', 'yhat']], xgb_f[['ds', 'yhat']], on='ds', suffixes=('_prophet', '_xgb'))
     
@@ -562,7 +553,7 @@ def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
 def plot_full_comparison_chart(hist_df, fcst_df, target_col):
     """
-    FIXED: Calculates MAE and RMSE on the fly for the overlapping period.
+    Calculates MAE and RMSE on the fly for the overlapping period.
     """
     fig = go.Figure()
     
@@ -661,7 +652,7 @@ def generate_insight_summary(day_data,selected_date):
 
 def render_activity_card(row, db_client, view_type='compact_list'):
     """
-    FIXED: Uses the passed db_client instead of global db.
+    Uses the passed db_client instead of global db.
     """
     doc_id = row['doc_id']
     
@@ -740,7 +731,7 @@ def render_activity_card(row, db_client, view_type='compact_list'):
 
 def render_historical_record(row, db_client):
     """
-    FIXED: Uses the passed db_client instead of global db.
+    Uses the passed db_client instead of global db.
     """
     date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
@@ -973,7 +964,6 @@ if db:
                     if st.session_state.shap_values_cust is None or st.session_state.X_cust_dates is None:
                         st.warning("SHAP values not available. Please regenerate the forecast.")
                     else:
-                        # FIXED: New robust logic to check if a SHAP plot can be generated.
                         try:
                             target_date = pd.to_datetime(selected_date).normalize()
                             historical_dates = pd.to_datetime(st.session_state.X_cust_dates).dt.normalize()
@@ -1159,7 +1149,7 @@ if db:
         def set_view_all(): st.session_state.show_all_activities = True
         def set_overview(): st.session_state.show_all_activities = False
         
-        # FIXED: Load data once at the top of the tab render
+        # Load data once at the top of the tab render
         activities_df = load_from_firestore(db, 'future_activities')
 
         if st.session_state.get('show_all_activities'):
