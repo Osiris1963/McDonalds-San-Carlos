@@ -13,3 +13,4 @@ shap==0.45.1
 lightgbm==4.4.0
 catboost==1.2.5
 matplotlib==3.9.0
+fredapi==0.5.2
