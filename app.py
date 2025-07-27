@@ -271,6 +271,40 @@ def generate_recurring_local_events(start_date,end_date):
         current_date+=timedelta(days=1)
     return pd.DataFrame(local_events)
 
+# --- NEW: Self-Recalibration Logic ---
+def check_performance_and_recalibrate(db, historical_df, threshold=95.0, days=7):
+    """Checks recent performance and clears model caches if accuracy is below a threshold."""
+    try:
+        log_docs = db.collection('forecast_log').stream()
+        log_records = [doc.to_dict() for doc in log_docs]
+        if not log_records: return False
+
+        forecast_log_df = pd.DataFrame(log_records)
+        forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
+        forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on']).dt.tz_localize(None)
+        day_ahead_logs = forecast_log_df[forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] == timedelta(days=1)].copy()
+        if day_ahead_logs.empty: return False
+
+        true_accuracy_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
+        if true_accuracy_df.empty: return False
+
+        period_start_date = pd.to_datetime('today').normalize() - pd.Timedelta(days=days)
+        final_df = true_accuracy_df[true_accuracy_df['date'] >= period_start_date].copy()
+        if final_df.empty: return False
+
+        actual_sales_safe = final_df['sales'].replace(0, np.nan)
+        sales_mape = np.nanmean(np.abs((final_df['sales'] - final_df['predicted_sales']) / actual_sales_safe)) * 100
+        sales_accuracy = 100 - sales_mape
+
+        if sales_accuracy < threshold:
+            st.warning(f"🚨 Recent sales forecast accuracy ({sales_accuracy:.2f}%) is below the {threshold}% target. Triggering model recalibration.")
+            st.cache_resource.clear()
+            time.sleep(2) 
+            return True
+    except Exception as e:
+        st.warning(f"Could not perform automatic accuracy check. Error: {e}")
+    return False
+
 # --- Core Forecasting Models ---
 
 def create_advanced_features(df):
@@ -308,7 +342,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame(), None
+        return pd.DataFrame()
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -839,97 +873,107 @@ if db:
             if len(st.session_state.historical_df) < 50:
                 st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
-                with st.spinner("🧠 Initializing Advanced Ensemble Forecast..."):
-                    base_df = st.session_state.historical_df.copy()
-                    
-                    with st.spinner("Engineering features and capping outliers..."):
-                        base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
-                        capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
-                        if capped_count > 0:
-                            st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
-                        hist_df_with_atv = calculate_atv(capped_df)
-                        hist_df_featured = create_advanced_features(hist_df_with_atv)
-                        ev_df = st.session_state.events_df.copy()
-                    
-                    FORECAST_HORIZON = 15
-                    
-                    with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost)..."):
-                        prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
-                        prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
-                        atv_forecast_for_cust_model = prophet_atv_f
-                        xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                        xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-                        lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                        lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-                        cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                        cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
-
-                    atv_f = pd.DataFrame()
-                    with st.spinner("Stacking ATV models for final prediction..."):
-                        base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
-                        atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
-                    
-                    cust_f = pd.DataFrame()
-                    with st.spinner("Stacking Customer models and preparing explanations..."):
-                        base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
-                        cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
+                # --- NEW: Trigger recalibration check before forecasting ---
+                recalibrated = check_performance_and_recalibrate(db, st.session_state.historical_df)
+                if recalibrated:
+                    st.info("Models have been recalibrated. Please click 'Generate Forecast' again to use the new models.")
+                else:
+                    with st.spinner("🧠 Initializing Advanced Ensemble Forecast..."):
+                        base_df = st.session_state.historical_df.copy()
                         
-                        if xgb_cust_model and not X_cust.empty:
-                            with st.spinner("Calculating SHAP values for XGBoost component..."):
-                                explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
-                                try:
-                                    shap_values = explainer(X_cust)
-                                except shap.utils.ExplainerError:
-                                    st.warning("SHAP additivity check failed due to sample weighting. Recalculating without it.")
-                                    shap_values = explainer(X_cust, check_additivity=False)
-                                st.session_state.shap_explainer_cust = explainer
-                                st.session_state.shap_values_cust = shap_values
-                                st.session_state.X_cust = X_cust
-                                st.session_state.X_cust_dates = X_cust_dates
-                                st.session_state.future_X_cust = future_X_cust
+                        with st.spinner("Engineering features and capping outliers..."):
+                            base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
+                            capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
+                            if capped_count > 0:
+                                st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
-                    if not cust_f.empty and not atv_f.empty:
-                        combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
-                        combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                            hist_df_with_atv = calculate_atv(capped_df)
+                            hist_df_featured = create_advanced_features(hist_df_with_atv)
+                            ev_df = st.session_state.events_df.copy()
                         
-                        with st.spinner("🛰️ Fetching live weather..."):
-                            weather_df = get_weather_forecast()
-                        if weather_df is not None:
-                            combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                        FORECAST_HORIZON = 15
+                        
+                        with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost)..."):
+                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
+                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
+                            
+                            atv_forecast_for_cust_model = prophet_atv_f
+                            
+                            xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+
+                            lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            
+                            cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+
+                        atv_f = pd.DataFrame()
+                        with st.spinner("Stacking ATV models for final prediction..."):
+                            base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
+                            atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
+                        
+                        cust_f = pd.DataFrame()
+                        with st.spinner("Stacking Customer models and preparing explanations..."):
+                            base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
+                            cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
+                            
+                            if xgb_cust_model and not X_cust.empty:
+                                with st.spinner("Calculating SHAP values for XGBoost component..."):
+                                    explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
+                                    try:
+                                        shap_values = explainer(X_cust)
+                                    except shap.utils.ExplainerError:
+                                        st.warning("SHAP additivity check failed due to sample weighting. Recalculating without it.")
+                                        shap_values = explainer(X_cust, check_additivity=False)
+                                    st.session_state.shap_explainer_cust = explainer
+                                    st.session_state.shap_values_cust = shap_values
+                                    st.session_state.X_cust = X_cust
+                                    st.session_state.X_cust_dates = X_cust_dates
+                                    st.session_state.future_X_cust = future_X_cust
+
+                        if not cust_f.empty and not atv_f.empty:
+                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
+                            combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                            
+                            with st.spinner("🛰️ Fetching live weather..."):
+                                weather_df = get_weather_forecast()
+                            if weather_df is not None:
+                                combo_f = pd.merge(combo_f, weather_df[['date', 'weather']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                            else:
+                                combo_f['weather'] = 'Not Available'
+                            st.session_state.forecast_df = combo_f
+                            
+                            try:
+                                with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
+                                    combo_f['ds'] = pd.to_datetime(combo_f['ds'])
+                                    today_date_naive = pd.to_datetime('today').tz_localize(None).normalize()
+                                    future_forecasts_to_log = combo_f[combo_f['ds'] > today_date_naive]
+                                    if not future_forecasts_to_log.empty:
+                                        for _, row in future_forecasts_to_log.iterrows():
+                                            log_entry = {
+                                                "generated_on": today_date_naive,
+                                                "forecast_for_date": row['ds'],
+                                                "predicted_sales": row['forecast_sales'],
+                                                "predicted_customers": row['forecast_customers']
+                                            }
+                                            doc_id = f"{today_date_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
+                                            db.collection('forecast_log').document(doc_id).set(log_entry)
+                                        st.info("Forecast log saved successfully.")
+                                    else:
+                                        st.warning("No future dates found in the forecast to log.")
+                            except Exception as e:
+                                st.error(f"Failed to save forecast log: {e}")
+                            
+                            if prophet_model_cust:
+                                full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
+                                prophet_forecast_components = prophet_model_cust.predict(full_future)
+                                st.session_state.forecast_components = prophet_forecast_components
+                                st.session_state.all_holidays = prophet_model_cust.holidays
+                            
+                            st.success("Advanced AI forecast generated successfully!")
                         else:
-                            combo_f['weather'] = 'Not Available'
-                        st.session_state.forecast_df = combo_f
-                        
-                        try:
-                            with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
-                                combo_f['ds'] = pd.to_datetime(combo_f['ds'])
-                                today_date_naive = pd.to_datetime('today').tz_localize(None).normalize()
-                                future_forecasts_to_log = combo_f[combo_f['ds'] > today_date_naive]
-                                if not future_forecasts_to_log.empty:
-                                    for _, row in future_forecasts_to_log.iterrows():
-                                        log_entry = {
-                                            "generated_on": today_date_naive,
-                                            "forecast_for_date": row['ds'],
-                                            "predicted_sales": row['forecast_sales'],
-                                            "predicted_customers": row['forecast_customers']
-                                        }
-                                        doc_id = f"{today_date_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
-                                        db.collection('forecast_log').document(doc_id).set(log_entry)
-                                    st.info("Forecast log saved successfully.")
-                                else:
-                                    st.warning("No future dates found in the forecast to log.")
-                        except Exception as e:
-                            st.error(f"Failed to save forecast log: {e}")
-                        
-                        if prophet_model_cust:
-                            full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
-                            prophet_forecast_components = prophet_model_cust.predict(full_future)
-                            st.session_state.forecast_components = prophet_forecast_components
-                            st.session_state.all_holidays = prophet_model_cust.holidays
-                        
-                        st.success("Advanced AI forecast generated successfully!")
-                    else:
-                        st.error("Forecast generation failed. One or more components could not be built.")
+                            st.error("Forecast generation failed. One or more components could not be built.")
 
         st.markdown("---")
         st.download_button(
