@@ -8,10 +8,8 @@ PyYAML==6.0.1
 requests==2.31.0
 firebase-admin==6.5.0
 xgboost==2.1.4
-tensorflow
-scikit-learn
-optuna
-shap
-tensorflow
-lightgbm
-catboost
+optuna==3.6.1
+shap==0.45.1
+lightgbm==4.4.0
+catboost==1.2.5
+matplotlib==3.9.0
