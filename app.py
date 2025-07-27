@@ -22,6 +22,7 @@ import json
 import logging
 import shap
 import matplotlib.pyplot as plt
+import inspect # FIXED: Import inspect to dynamically check function arguments
 
 # --- Suppress Prophet's informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -212,7 +213,6 @@ def load_from_firestore(_db_client, collection_name):
     return df
 
 def cap_outliers_iqr(df, column='sales'):
-    """ REPLACES remove_outliers_iqr. Caps extreme values instead of dropping them. """
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
@@ -394,7 +394,13 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
     if X.empty or len(X) < 50:
         st.warning(f"Not enough data to train XGBoost for {target_col} after feature engineering.")
         return pd.DataFrame(), None, pd.DataFrame(), None, None
-
+    
+    # FIXED: This block dynamically checks which early stopping parameter the installed
+    # XGBoost version supports. This makes the code robust against environment inconsistencies.
+    fit_params = inspect.signature(xgb.XGBRegressor.fit).parameters
+    use_callbacks = 'callbacks' in fit_params
+    use_early_stopping_rounds = 'early_stopping_rounds' in fit_params
+    
     # --- Optuna Hyperparameter Tuning ---
     def objective(trial):
         cv = TimeSeriesSplit(n_splits=3)
@@ -420,13 +426,18 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
             model = xgb.XGBRegressor(**param)
             sample_weights = np.linspace(0.1, 1.0, len(y_train))
             
-            early_stopping_callback = EarlyStopping(rounds=50, save_best=True)
+            # Build the fitting parameters dynamically based on the check above
+            fit_kwargs = {
+                "eval_set": [(X_val, y_val)],
+                "verbose": False,
+                "sample_weight": sample_weights
+            }
+            if use_callbacks:
+                fit_kwargs["callbacks"] = [EarlyStopping(rounds=50, save_best=True)]
+            elif use_early_stopping_rounds:
+                fit_kwargs["early_stopping_rounds"] = 50
             
-            model.fit(X_train, y_train, 
-                      eval_set=[(X_val, y_val)], 
-                      verbose=False,
-                      sample_weight=sample_weights,
-                      callbacks=[early_stopping_callback])
+            model.fit(X_train, y_train, **fit_kwargs)
                       
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
@@ -563,9 +574,27 @@ def delete_from_firestore(db_client, collection_name, doc_id):
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-def plot_full_comparison_chart(hist,fcst,metrics,target):
-    fig=go.Figure();fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')));fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')));title_text=f"{target.replace('_',' ').title()} Forecast";y_axis_title=title_text+' (₱)'if'atv'in target or'sales'in target else title_text
-    fig.update_layout(title=f'Full Diagnostic: {title_text} vs. Historical',xaxis_title='Date',yaxis_title=y_axis_title,legend=dict(x=0.01,y=0.99),height=500,margin=dict(l=40,r=40,t=60,b=40),paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)");return fig
+def plot_full_comparison_chart(hist, fcst, metrics, target):
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')))
+    fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')))
+    title_text=f"{target.replace('_',' ').title()} Forecast"
+    y_axis_title=title_text+' (₱)' if 'atv' in target or 'sales' in target else title_text
+    
+    # FIXED: Replaced shorthand axis titles with the more robust dictionary structure to fix ValueError.
+    fig.update_layout(
+        title=f'Full Diagnostic: {title_text} vs. Historical',
+        xaxis=dict(title='Date'),
+        yaxis=dict(title=y_axis_title),
+        legend=dict(x=0.01,y=0.99),
+        height=500,
+        margin=dict(l=40,r=40,t=60,b=40),
+        paper_bgcolor='#2a2a2a',
+        plot_bgcolor='#2a2a2a',
+        font_color='white'
+    )
+    fig.add_annotation(x=0.02,y=0.95,xref="paper",yref="paper",text=f"<b>Model Perf:</b><br>MAE:{metrics.get('mae',0):.2f}<br>RMSE:{metrics.get('rmse',0):.2f}",showarrow=False,font=dict(size=12,color="white"),align="left",bgcolor="rgba(0,0,0,0.5)")
+    return fig
 
 def plot_forecast_breakdown(components,selected_date,all_events):
     day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
@@ -630,10 +659,11 @@ def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_
         line=dict(color='#d62728', dash='dash', width=2), marker=dict(symbol='x', size=7)
     ))
     
+    # FIXED: Replaced shorthand axis titles with the more robust dictionary structure to fix ValueError.
     fig.update_layout(
         title=dict(text=title, font=dict(color='white', size=20)),
-        xaxis_title=dict(text='Date', font=dict(color='white', size=14)),
-        yaxis_title=dict(text=y_axis_title, font=dict(color='white', size=14)),
+        xaxis=dict(title='Date', font=dict(color='white', size=14)),
+        yaxis=dict(title=y_axis_title, font=dict(color='white', size=14)),
         legend=dict(font=dict(color='white', size=12)),
         height=450, margin=dict(l=50, r=50, t=80, b=50),
         paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white'
@@ -962,7 +992,6 @@ if db:
                             plot_generated = False
                             target_date_dt = pd.to_datetime(selected_date).date()
                             
-                            # --- Check for historical data first ---
                             if st.session_state.X_cust_dates is not None:
                                 historical_dates = pd.to_datetime(st.session_state.X_cust_dates).dt.date
                                 date_match = (historical_dates == target_date_dt)
@@ -978,7 +1007,6 @@ if db:
                                     plt.clf()
                                     plot_generated = True
 
-                            # --- If not historical, generate SHAP for future date on-demand ---
                             if not plot_generated and st.session_state.future_X_cust is not None:
                                 future_key = selected_date.strftime('%Y-%m-%d')
                                 future_feature_row = st.session_state.future_X_cust.get(future_key)
@@ -1000,7 +1028,6 @@ if db:
                             if not plot_generated:
                                 st.error(f"Could not find feature data for {selected_date_str} to generate a SHAP plot.")
                             
-                            # --- Overall Feature Importance (always available) ---
                             with st.expander("View Overall Feature Importance (Summary Plot)"):
                                 st.info("This plot shows the average impact of each feature across all historical predictions. Features at the top have the highest impact on the model.")
                                 fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
