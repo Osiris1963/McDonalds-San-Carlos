@@ -399,9 +399,9 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         param = {
             'objective': 'reg:squarederror',
             'booster': 'gbtree',
-            'n_estimators': trial.suggest_int('n_estimators', 100, 500), # Optimized search space
+            'n_estimators': trial.suggest_int('n_estimators', 100, 500), # Reduced search space
             'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 6), # Optimized search space
+            'max_depth': trial.suggest_int('max_depth', 3, 6), # Reduced search space
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
@@ -442,6 +442,7 @@ def train_and_forecast_xgboost_tuned(historical_df, events_df, periods, target_c
         "early_stopping_rounds": 50
     }
     final_model.fit(X_train, y_train, **final_fit_params)
+
 
     future_predictions = []
     history_with_features = df_featured.copy()
