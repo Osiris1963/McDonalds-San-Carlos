@@ -6,7 +6,6 @@ import lightgbm as lgb
 import catboost as cat
 from xgboost.callback import EarlyStopping as XGBEarlyStopping
 from lightgbm import early_stopping as lgb_early_stopping
-import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 import numpy as np
@@ -29,7 +28,6 @@ import inspect
 # --- Suppress informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -411,11 +409,8 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     features = [f for f in features if f in df_featured.columns]
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    
-    # ROBUSTNESS FIX: Explicitly select only numeric types for the model
     X = X.select_dtypes(include=np.number)
-    features = X.columns.tolist() # Update features list to match numeric columns
-    
+    features = X.columns.tolist()
     common_index = X.dropna().index.intersection(y.dropna().index)
     X = X.loc[common_index]
     y = y.loc[common_index]
@@ -466,38 +461,17 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     features = [f for f in features if f in df_featured.columns]
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    
-    # ROBUSTNESS FIX: Explicitly select only numeric types for the model
     X = X.select_dtypes(include=np.number)
-    features = X.columns.tolist() # Update features list to match numeric columns
-
+    features = X.columns.tolist()
     common_index = X.dropna().index.intersection(y.dropna().index)
     X = X.loc[common_index]
     y = y.loc[common_index]
     X_dates = df_featured.loc[X.index, 'date']
     if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
-    def objective(trial):
-        cv = TimeSeriesSplit(n_splits=5)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            param = {'objective': 'reg:squarederror', 'booster': 'gbtree', 'random_state': 42, 'n_estimators': trial.suggest_int('n_estimators', 500, 2000), 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True), 'max_depth': trial.suggest_int('max_depth', 3, 8), 'subsample': trial.suggest_float('subsample', 0.6, 1.0), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0), 'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True)}
-            model = xgb.XGBRegressor(**param)
-            sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, callbacks=[XGBEarlyStopping(rounds=50, save_best=True)], verbose=False)
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
-    try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300)
-        best_params = study.best_params
-    except Exception as e:
-        st.warning(f"Optuna tuning failed for XGBoost. Using default parameters. Error: {e}")
-        best_params = {}
+    
+    st.info("Using pre-defined parameters for XGBoost.")
     final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
-    final_params.update(best_params)
+    
     final_model = xgb.XGBRegressor(**final_params)
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     final_model.fit(X, y, sample_weight=sample_weights)
@@ -538,37 +512,16 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_fo
     features = [f for f in features if f in df_featured.columns]
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-
-    # ROBUSTNESS FIX: Explicitly select only numeric types for the model
     X = X.select_dtypes(include=np.number)
-    features = X.columns.tolist() # Update features list
-
+    features = X.columns.tolist()
     common_index = X.dropna().index.intersection(y.dropna().index)
     X = X.loc[common_index]
     y = y.loc[common_index]
     if X.empty or len(X) < 50: return pd.DataFrame()
-    def objective(trial):
-        cv = TimeSeriesSplit(n_splits=5)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            param = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'random_state': 42, 'verbosity': -1, 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True), 'num_leaves': trial.suggest_int('num_leaves', 20, 50), 'subsample': trial.suggest_float('subsample', 0.6, 1.0), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0)}
-            model = lgb.LGBMRegressor(**param)
-            sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, callbacks=[lgb_early_stopping(50, verbose=False)])
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
-    try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300)
-        best_params = study.best_params
-    except Exception as e:
-        st.warning(f"Optuna tuning failed for LightGBM. Using default parameters. Error: {e}")
-        best_params = {}
-    final_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'verbosity': -1}
-    final_params.update(best_params)
+    
+    st.info("Using pre-defined parameters for LightGBM.")
+    final_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1500, 'learning_rate': 0.05, 'num_leaves': 31, 'verbosity': -1}
+    
     return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, holidays_df)
 
 @st.cache_resource
@@ -584,37 +537,16 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
     features = [f for f in features if f in df_featured.columns]
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    
-    # ROBUSTNESS FIX: Explicitly select only numeric types for the model
     X = X.select_dtypes(include=np.number)
-    features = X.columns.tolist() # Update features list
-
+    features = X.columns.tolist()
     common_index = X.dropna().index.intersection(y.dropna().index)
     X = X.loc[common_index]
     y = y.loc[common_index]
     if X.empty or len(X) < 50: return pd.DataFrame()
-    def objective(trial):
-        cv = TimeSeriesSplit(n_splits=5)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            param = {'objective': 'RMSE', 'iterations': 2000, 'random_seed': 42, 'verbose': 0, 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True), 'depth': trial.suggest_int('depth', 4, 10), 'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-8, 10.0, log=True)}
-            model = cat.CatBoostRegressor(**param)
-            sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, early_stopping_rounds=50)
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
-    try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=25, timeout=300)
-        best_params = study.best_params
-    except Exception as e:
-        st.warning(f"Optuna tuning failed for CatBoost. Using default parameters. Error: {e}")
-        best_params = {}
-    final_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 2000, 'verbose': 0}
-    final_params.update(best_params)
+    
+    st.info("Using pre-defined parameters for CatBoost.")
+    final_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 1500, 'learning_rate': 0.05, 'depth': 6, 'verbose': 0}
+    
     return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, holidays_df, is_catboost=True)
 
 @st.cache_resource
@@ -658,6 +590,7 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     forecast_df['yhat'] = stacked_prediction
     return forecast_df
 
+# ... The rest of the UI and helper functions remain unchanged and are omitted for brevity ...
 # --- All other helper and UI functions remain the same ---
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
