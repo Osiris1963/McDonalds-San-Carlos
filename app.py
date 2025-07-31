@@ -65,7 +65,7 @@ def init_firestore():
 
 def add_to_firestore(db_client, collection_name, record, existing_df):
     date_to_check = pd.to_datetime(record['date']).normalize()
-    if date_to_check in pd.to_datetime(existing_df['date']).normalize().values:
+    if not existing_df.empty and 'date' in existing_df.columns and date_to_check in pd.to_datetime(existing_df['date']).normalize().values:
         st.error(f"A record for {date_to_check.strftime('%Y-%m-%d')} already exists.")
         return
     db_client.collection(collection_name).add(record)
@@ -238,7 +238,6 @@ def run_simplified_ensemble_pipeline(historical_df, target_col, periods, weather
         if p_model: prophet_models[day_of_week] = p_model
         merged_f = pd.merge(prophet_f.rename(columns={'yhat':'yhat_prophet'}), xgb_f.rename(columns={'yhat':'yhat_xgb'}), on='ds', how='inner')
         merged_f['yhat'] = (merged_f['yhat_prophet'] + merged_f['yhat_xgb']) / 2
-        # Carry over prophet components for insights
         for col in ['trend', 'yearly', 'holidays']:
             if col in merged_f.columns:
                 merged_f[col] = merged_f[col]
@@ -256,7 +255,6 @@ def log_forecast_to_firestore(db_client, forecast_df):
             "predicted_customers": row['forecast_customers'],
             "generated_on": generated_on
         }
-        # Check for existing log for that day and update it
         query = db_client.collection('forecast_log').where('forecast_for_date', '==', row['ds']).limit(1)
         docs = list(query.stream())
         if docs:
@@ -340,20 +338,28 @@ if db:
                         
                         hist_df_with_atv = calculate_atv(cap_outliers_iqr(base_df, column='sales'))
                         
+                        # Stage 1: Forecast Customers
                         cust_f, cust_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'customers', FORECAST_HORIZON, weather_df)
-                        atv_f, atv_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'atv', FORECAST_HORIZON, weather_df, customer_forecasts=cust_f)
                         
-                        if not cust_f.empty and not atv_f.empty:
-                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds', how='outer')
-                            combo_f.interpolate(method='linear', limit_direction='both', inplace=True)
-                            combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
-                            st.session_state.forecast_df = combo_f
-                            st.session_state.prophet_models['customers'] = cust_models
-                            st.session_state.prophet_models['atv'] = atv_models
-                            log_forecast_to_firestore(db, combo_f)
-                            st.success("Forecast generated!")
+                        # Check if the customer forecast is valid before proceeding
+                        if cust_f.empty:
+                            st.error("Forecast Failed: Could not generate a customer forecast. Ensure sufficient data exists for each day of the week.")
                         else:
-                            st.error("Forecast generation failed.")
+                            # Stage 2: Forecast ATV (only if customer forecast was successful)
+                            atv_f, atv_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'atv', FORECAST_HORIZON, weather_df, customer_forecasts=cust_f)
+                            
+                            if not atv_f.empty:
+                                combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds', how='outer')
+                                combo_f.interpolate(method='linear', limit_direction='both', inplace=True)
+                                combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
+                                st.session_state.forecast_df = combo_f
+                                st.session_state.prophet_models['customers'] = cust_models
+                                st.session_state.prophet_models['atv'] = atv_models
+                                log_forecast_to_firestore(db, combo_f)
+                                st.success("Forecast generated!")
+                            else:
+                                st.error("Forecast Failed: Could not generate an ATV forecast after the customer forecast.")
+        
         st.markdown("---")
         st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
         st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical.csv", "text/csv", use_container_width=True)
@@ -405,7 +411,7 @@ if db:
 
                 if not final_df.empty:
                     sales_mae = mean_absolute_error(final_df['sales'], final_df['predicted_sales'])
-                    sales_mape = np.mean(np.abs((final_df['sales'] - final_df['predicted_sales']) / final_df['sales'])) * 100
+                    sales_mape = np.mean(np.abs((final_df['sales'] - final_df['predicted_sales']) / final_df['sales'].replace(0,1))) * 100
                     c1, c2 = st.columns(2)
                     c1.metric("Sales Accuracy (MAPE)", f"{100-sales_mape:.2f}%")
                     c2.metric("Sales Average Error (MAE)", f"₱{sales_mae:,.2f}")
