@@ -305,7 +305,7 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         # Trigger recalibration if recent performance is significantly worse than the baseline
         if short_term_accuracy < (long_term_accuracy * degradation_threshold):
             st.warning(f"🚨 Recent 7-day accuracy ({short_term_accuracy:.2f}%) has dropped significantly below the 30-day baseline ({long_term_accuracy:.2f}%). Triggering model recalibration.")
-            st.cache_resource.clear()
+            st.cache_data.clear() # Use clear() for @st.cache_data
             time.sleep(2) 
             return True
 
@@ -326,7 +326,6 @@ def create_advanced_features(df, weather_df=None):
         if col not in df.columns:
             df[col] = 0 # Default to a neutral value
 
-    # --- CORRECTED: Robustly fill missing weather data with 0 after trying to forward-fill ---
     df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill').fillna(0)
 
     df['dayofweek'] = df['date'].dt.dayofweek
@@ -364,7 +363,7 @@ def create_advanced_features(df, weather_df=None):
     return df
 
 
-@st.cache_resource
+@st.cache_data # BUG FIX: Changed from cache_resource to cache_data for correct invalidation
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
@@ -377,15 +376,9 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
     all_manual_events = pd.concat([manual_events_renamed, recurring_events])
     all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
-    if 'day_type' in historical_df.columns:
-        not_normal_days_df = historical_df[historical_df['day_type'] == 'Not Normal Day'].copy()
-        if not not_normal_days_df.empty:
-            not_normal_events = pd.DataFrame({
-                'holiday': 'Unusual_Day',
-                'ds': pd.to_datetime(not_normal_days_df['date']),
-                'lower_window': 0, 'upper_window': 0,
-            })
-            all_manual_events = pd.concat([all_manual_events, not_normal_events])
+    
+    # REMOVED: Logic for "Not Normal Day" / "Unusual_Day" to streamline features
+    
     use_yearly_seasonality = len(df_train) >= 365
     prophet_model = Prophet(
         growth='linear', holidays=all_manual_events, daily_seasonality=False,
@@ -401,7 +394,8 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, weather_forecast_df, is_catboost=False):
     df_featured = historical_df.copy()
     
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
+    # REMOVED: 'is_not_normal_day' from base features
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed']
 
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
@@ -452,10 +446,7 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
         extended_featured_df = create_advanced_features(extended_history)
         
-        if 'day_type' in extended_featured_df.columns:
-             extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
-        else:
-            extended_featured_df['is_not_normal_day'] = 0
+        # REMOVED: Logic for creating 'is_not_normal_day' column
             
         X_future = extended_featured_df[features].tail(1)
         prediction = final_model.predict(X_future)[0]
@@ -475,11 +466,12 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     
     return pd.concat([historical_predictions, final_df], ignore_index=True)
 
-@st.cache_resource
+@st.cache_data # BUG FIX: Changed from cache_resource to cache_data
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, atv_forecast_df=None):
     df_featured = historical_df.copy()
     
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
+    # REMOVED: 'is_not_normal_day' from base features
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else: # atv
@@ -536,11 +528,12 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather
     return _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df)
 
 
-@st.cache_resource
+@st.cache_data # BUG FIX: Changed from cache_resource to cache_data
 def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weather_forecast_df, atv_forecast_df=None):
     df_featured = historical_df.copy()
     
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
+    # REMOVED: 'is_not_normal_day' from base features
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else: #atv
@@ -588,11 +581,12 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weathe
 
     return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df)
 
-@st.cache_resource
+@st.cache_data # BUG FIX: Changed from cache_resource to cache_data
 def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weather_forecast_df, atv_forecast_df=None):
     df_featured = historical_df.copy()
     
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
+    # REMOVED: 'is_not_normal_day' from base features
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else: # atv
@@ -639,7 +633,7 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weathe
     
     return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df, is_catboost=True)
 
-@st.cache_resource
+@st.cache_data # BUG FIX: Changed from cache_resource to cache_data
 def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
     final_df = None
     for name, fcst_df in base_forecasts_dict.items():
@@ -848,11 +842,9 @@ def render_historical_record(row, db_client):
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         st.write(f"**Weather:** {row.get('weather', 'N/A')}")
-        day_type = row.get('day_type', 'Normal Day')
-        st.write(f"**Day Type:** {day_type}")
-        if day_type == 'Not Normal Day':
-            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
 
+        # REMOVED: Display for Day Type and Notes
+        
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             st.write("---")
             st.markdown("**Edit Record**")
@@ -868,10 +860,7 @@ def render_historical_record(row, db_client):
             current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
             updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
 
-            day_type_options = ["Normal Day", "Not Normal Day"]
-            current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
-            updated_day_type = st.selectbox("Day Type", options=day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
-            updated_day_type_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"notes_{row['doc_id']}")
+            # REMOVED: Input fields for Day Type and Notes
             
             btn_cols = st.columns(2)
             if btn_cols[0].form_submit_button("💾 Update Record", use_container_width=True):
@@ -880,8 +869,7 @@ def render_historical_record(row, db_client):
                     'customers': updated_customers,
                     'add_on_sales': updated_addons,
                     'weather': updated_weather,
-                    'day_type': updated_day_type,
-                    'day_type_notes': updated_day_type_notes if updated_day_type == 'Not Normal Day' else ''
+                    # REMOVED: Day Type fields from the update dictionary
                 }
                 update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
                 st.success(f"Record for {date_str} updated!")
@@ -927,10 +915,8 @@ if db:
                         with st.spinner("🛰️ Fetching live weather and engineering features..."):
                             weather_df = get_weather_forecast(days=FORECAST_HORIZON + len(base_df))
                             
-                            # --- CORRECTED: Handle weather API failure gracefully ---
                             if weather_df is None:
                                 st.warning("Could not fetch live weather data. Proceeding without it. Forecast accuracy may be reduced.")
-                                # Create an empty dataframe to prevent crashes downstream
                                 weather_df = pd.DataFrame(columns=['date', 'temp_max', 'precipitation', 'wind_speed', 'weather_condition'])
                             
                             base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
@@ -1178,11 +1164,8 @@ if db:
                 new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
                 new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
                 
-                new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
-                new_day_type_notes = ""
-                if new_day_type == "Not Normal Day":
-                    new_day_type_notes = st.text_area("Notes for Not Normal Day (Optional)", placeholder="e.g., Power outage, unexpected local event...")
-
+                # REMOVED: Input fields for Day Type and Notes
+                
                 if st.form_submit_button("✅ Save Record"):
                     new_rec={
                         "date":new_date,
@@ -1190,8 +1173,7 @@ if db:
                         "customers":new_customers,
                         "weather":new_weather,
                         "add_on_sales":new_addons,
-                        "day_type": new_day_type,
-                        "day_type_notes": new_day_type_notes
+                        # REMOVED: Day Type fields from the new record dictionary
                     }
                     add_to_firestore(db,'historical_data',new_rec, st.session_state.historical_df)
                     st.cache_data.clear()
@@ -1208,7 +1190,8 @@ if db:
                 with st.container(border=True):
                     recent_df = st.session_state.historical_df.copy().sort_values(by="date", ascending=False).head(10)
                     if not recent_df.empty:
-                        display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather', 'day_type']
+                        # REMOVED: 'day_type' from the display columns
+                        display_cols = ['date', 'sales', 'customers', 'add_on_sales', 'weather']
                         cols_to_show = [col for col in display_cols if col in recent_df.columns]
                         
                         st.dataframe(
@@ -1221,7 +1204,6 @@ if db:
                                 "customers": st.column_config.NumberColumn("Customers", format="%d"),
                                 "add_on_sales": st.column_config.NumberColumn("Add-on Sales (₱)", format="₱%.2f"),
                                 "weather": "Weather",
-                                "day_type": "Day Type"
                             }
                         )
                     else:
@@ -1235,7 +1217,8 @@ if db:
             st.markdown("#### All Upcoming Activities")
             st.button("⬅️ Back to Overview", on_click=set_overview)
             
-            activities_df = load_from_firestore(db, 'future_activities')
+            # BUG FIX: Use session_state df instead of reloading from Firestore
+            activities_df = st.session_state.events_df.copy()
             all_upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy()
             
             if all_upcoming_df.empty:
@@ -1305,7 +1288,8 @@ if db:
                 btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
                 
                 st.markdown("---",)
-                activities_df = load_from_firestore(db, 'future_activities')
+                # BUG FIX: Use session_state df instead of reloading from Firestore
+                activities_df = st.session_state.events_df.copy()
                 upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
                 
                 if upcoming_df.empty:
