@@ -23,8 +23,6 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import logging
-import shap
-import matplotlib.pyplot as plt
 import inspect
 
 # --- Suppress informational messages ---
@@ -173,12 +171,6 @@ def initialize_state_firestore(db_client):
         'migration_done': False,
         'show_recent_entries': False,
         'show_all_activities': False,
-        'shap_explainer_cust': None,
-        'shap_values_cust': None,
-        'future_shap_values': {},
-        'X_cust': None,
-        'X_cust_dates': None,
-        'future_X_cust': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -403,7 +395,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, weather_forecast_df, is_catboost=False):
     df_featured = historical_df.copy()
     
-    # --- FIXED: Added weather features to the feature set ---
+    # --- Weather features are now part of the standard feature set ---
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
 
     if target_col == 'customers':
@@ -429,7 +421,6 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
     
-    # --- FIXED: Use weather forecast for future predictions ---
     weather_lookup = weather_forecast_df.set_index('date') if weather_forecast_df is not None else None
 
     for i in range(periods):
@@ -452,7 +443,7 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
                 future_step_df['wind_speed'] = last_weather['wind_speed']
 
         extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        extended_featured_df = create_advanced_features(extended_history) # No weather_df passed, as it's already in the df
+        extended_featured_df = create_advanced_features(extended_history)
         
         if 'day_type' in extended_featured_df.columns:
              extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
@@ -463,11 +454,9 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Update history with the new prediction for the next iteration
         history_with_features = extended_featured_df.copy()
         history_with_features.loc[history_with_features.index.max(), target_col] = prediction
         
-        # If we are predicting customers, we also need to update sales for the next lag/rolling features
         if target_col == 'customers' and atv_lookup is not None:
             forecasted_atv = atv_lookup.get(pd.to_datetime(next_date), history_with_features['atv'].dropna().tail(7).mean())
             history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
@@ -483,23 +472,19 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, atv_forecast_df=None):
     df_featured = historical_df.copy()
     
-    # --- FIXED: Added weather features to the feature set ---
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
-    
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else: # atv
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-        
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
     y = y[X.index]
-    X_dates = df_featured.loc[X.index, 'date']
 
-    if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
+    if X.empty or len(X) < 50: return pd.DataFrame()
     
     fit_params = inspect.signature(xgb.XGBRegressor.fit).parameters
     use_callbacks = 'callbacks' in fit_params
@@ -541,49 +526,8 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather
     final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
     final_params.update(best_params)
     
-    final_model = xgb.XGBRegressor(**final_params)
-    sample_weights = np.exp(np.linspace(-1, 0, len(y)))
-    final_model.fit(X, y, sample_weight=sample_weights)
-
-    full_forecast_df = _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df)
-    
-    future_feature_sets = {}
-    history_with_features = df_featured.copy()
-    atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
-    weather_lookup = weather_forecast_df.set_index('date') if weather_forecast_df is not None else None
-
-    for i in range(periods):
-        last_date = history_with_features['date'].max()
-        next_date = last_date + timedelta(days=1)
-        future_step_df = pd.DataFrame([{'date': next_date}])
-
-        if weather_lookup is not None:
-            try:
-                weather_for_day = weather_lookup.loc[next_date]
-                future_step_df['temp_max'] = weather_for_day['temp_max']
-                future_step_df['precipitation'] = weather_for_day['precipitation']
-                future_step_df['wind_speed'] = weather_for_day['wind_speed']
-            except KeyError:
-                last_weather = history_with_features[['temp_max', 'precipitation', 'wind_speed']].iloc[-1]
-                future_step_df['temp_max'] = last_weather['temp_max']
-                future_step_df['precipitation'] = last_weather['precipitation']
-                future_step_df['wind_speed'] = last_weather['wind_speed']
-
-        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        extended_featured_df = create_advanced_features(extended_history)
-        
-        if 'day_type' in extended_featured_df.columns:
-            extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
-        else:
-            extended_featured_df['is_not_normal_day'] = 0
-            
-        X_future = extended_featured_df[features].tail(1)
-        future_feature_sets[next_date.strftime('%Y-%m-%d')] = X_future
-        
-        # Update history for the next step
-        history_with_features = extended_featured_df.copy()
-        
-    return full_forecast_df, final_model, X, X_dates, future_feature_sets
+    # SHAP logic removed, so we only need the forecast dataframe.
+    return _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df)
 
 
 @st.cache_resource
@@ -716,7 +660,6 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
         final_df['yhat'] = X_meta.mean(axis=1)
         return final_df[['ds', 'yhat']]
 
-    # --- FIXED: Replaced LGBM with a more robust RidgeCV linear model for the ensemble ---
     meta_model = RidgeCV(alphas=np.logspace(-3, 3, 10), fit_intercept=False)
     meta_model.fit(X_meta, y_meta)
     
@@ -976,10 +919,13 @@ if db:
                         FORECAST_HORIZON = 15
                         
                         with st.spinner("🛰️ Fetching live weather and engineering features..."):
-                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + len(base_df)) # Fetch historical too
+                            # Logic to fetch enough weather data for historical records and the forecast period
+                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + len(base_df))
+                            
+                            # --- CORRECTED: Ensure weather data is available before proceeding ---
                             if weather_df is None:
-                                st.error("Weather data fetch failed. Cannot proceed with forecast.")
-                                st.stop()
+                                st.error("Weather data fetch failed. Cannot proceed with forecast. Please try again later.")
+                                st.stop() # Stop execution if weather data is not available
 
                             base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                             capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
@@ -987,7 +933,6 @@ if db:
                                 st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
 
                             hist_df_with_atv = calculate_atv(capped_df)
-                            # --- FIXED: Pass weather_df to feature engineering ---
                             hist_df_featured = create_advanced_features(hist_df_with_atv, weather_df)
                             ev_df = st.session_state.events_df.copy()
                         
@@ -997,8 +942,8 @@ if db:
                             
                             atv_forecast_for_cust_model = prophet_atv_f
                             
-                            xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, atv_forecast_for_cust_model)
-                            xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df, atv_forecast_for_cust_model)
+                            xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, atv_forecast_for_cust_model)
+                            xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df, atv_forecast_for_cust_model)
 
                             lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, atv_forecast_for_cust_model)
                             lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df, atv_forecast_for_cust_model)
@@ -1012,40 +957,16 @@ if db:
                             atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
                         
                         cust_f = pd.DataFrame()
-                        with st.spinner("Stacking Customer models and preparing explanations..."):
+                        with st.spinner("Stacking Customer models..."):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                             
-                            if xgb_cust_model and not X_cust.empty:
-                                with st.spinner("Calculating SHAP values for XGBoost component..."):
-                                    explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
-                                    try:
-                                        shap_values = explainer(X_cust)
-                                    except shap.utils.ExplainerError:
-                                        st.warning("SHAP additivity check failed. Recalculating without it.")
-                                        shap_values = explainer(X_cust, check_additivity=False)
-                                    st.session_state.shap_explainer_cust = explainer
-                                    st.session_state.shap_values_cust = shap_values
-                                    st.session_state.X_cust = X_cust
-                                    st.session_state.X_cust_dates = X_cust_dates
-                                    st.session_state.future_X_cust = future_X_cust
-
-                                    # --- FIXED: Pre-compute SHAP values for all future dates ---
-                                    if explainer and future_X_cust:
-                                        st.session_state.future_shap_values = {}
-                                        for date_key, feature_row in future_X_cust.items():
-                                            try:
-                                                shap_values_future = explainer(feature_row, check_additivity=False)
-                                                st.session_state.future_shap_values[date_key] = shap_values_future
-                                            except Exception as e:
-                                                print(f"Could not compute SHAP for {date_key}: {e}")
-
-
+                        # --- REMOVED: All SHAP calculation logic has been taken out. ---
+                        
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
-                            # Merge weather conditions for display
                             combo_f = pd.merge(combo_f, weather_df[['date', 'weather_condition']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
                             combo_f.rename(columns={'weather_condition': 'weather'}, inplace=True)
                             
@@ -1138,53 +1059,15 @@ if db:
                 selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
                 selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
 
-                insight_tab1, insight_tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
+                # --- REMOVED: SHAP tab and logic are gone. Only showing Prophet breakdown now. ---
+                st.subheader("Prophet Model Breakdown")
+                st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
+                breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                st.plotly_chart(breakdown_fig, use_container_width=True)
+                st.markdown("---")
+                st.subheader("Prophet Insight Summary")
+                st.markdown(generate_insight_summary(day_data, selected_date))
 
-                with insight_tab1:
-                    st.subheader("Prophet Model Breakdown")
-                    st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
-                    breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
-                    st.plotly_chart(breakdown_fig, use_container_width=True)
-                    st.markdown("---")
-                    st.subheader("Prophet Insight Summary")
-                    st.markdown(generate_insight_summary(day_data, selected_date))
-
-                with insight_tab2:
-                    st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
-                    st.info("This waterfall chart shows how each feature contributed to the **XGBoost base model's** prediction for the selected day.")
-                    
-                    if not st.session_state.future_shap_values:
-                        st.warning("SHAP values not available. Please regenerate the forecast.")
-                    else:
-                        try:
-                            # --- FIXED: Retrieve pre-computed SHAP values ---
-                            future_key = selected_date.strftime('%Y-%m-%d')
-                            shap_values_for_day = st.session_state.future_shap_values.get(future_key)
-
-                            if shap_values_for_day:
-                                st.markdown(f"##### SHAP Explanation for {selected_date_str} (future forecast)")
-                                fig, ax = plt.subplots(figsize=(10, 5))
-                                shap.waterfall_plot(shap_values_for_day[0], show=False)
-                                plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
-                                plt.tight_layout()
-                                st.pyplot(fig)
-                                plt.clf()
-                            else:
-                                st.error(f"Could not find pre-computed SHAP data for {selected_date_str}.")
-
-                        except Exception as e:
-                            st.error(f"An error occurred while building the SHAP plot: {e}")
-
-                        with st.expander("View Overall Feature Importance (Summary Plot)"):
-                            if st.session_state.shap_values_cust:
-                                st.info("This plot shows the average impact of each feature across all historical predictions. Features at the top have the highest impact on the model.")
-                                fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
-                                shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
-                                plt.tight_layout()
-                                st.pyplot(fig_summary)
-                                plt.clf()
-                            else:
-                                st.warning("Historical SHAP values not available.")
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
     
