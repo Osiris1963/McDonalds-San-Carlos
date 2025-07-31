@@ -2,19 +2,34 @@ import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
+import lightgbm as lgb
+import catboost as cat
+from xgboost.callback import EarlyStopping as XGBEarlyStopping
+from lightgbm import early_stopping as lgb_early_stopping
+import optuna
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
 import numpy as np
 import plotly.graph_objs as go
+import yaml
+from yaml.loader import SafeLoader
+import io
 import time
+import os
 import requests
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
+import json
 import logging
-from sklearn.metrics import mean_absolute_error
+import shap
+import matplotlib.pyplot as plt
+import inspect
 
 # --- Suppress informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -31,28 +46,106 @@ def apply_custom_styling():
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
         /* --- Main Font & Colors --- */
-        html, body, [class*="st-"] { font-family: 'Poppins', sans-serif; }
-        .main > div { background-color: #1a1a1a; }
-        [data-testid="stSidebar"] { background-color: #252525; }
-        .stButton > button { border-radius: 8px; font-weight: 600; transition: all 0.2s ease-in-out; border: none; padding: 10px 16px; }
-        .stButton:has(button:contains("Generate")), .stButton:has(button:contains("Save")) > button { background: linear-gradient(45deg, #c8102e, #e01a37); color: #FFFFFF; }
-        .stButton:has(button:contains("Refresh")), .stButton:has(button:contains("View All")), .stButton:has(button:contains("Back to Overview")) > button { border: 2px solid #c8102e; background: transparent; color: #c8102e; }
-        .stTabs [data-baseweb="tab"] { border-radius: 8px; font-weight: 600; }
-        .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: #ffffff; }
-        .st-expander { border: 1px solid #444 !important; border-radius: 10px; background-color: #252525; margin-bottom: 0.5rem; }
+        html, body, [class*="st-"] {
+            font-family: 'Poppins', sans-serif;
+        }
+        .main > div {
+            background-color: #1a1a1a;
+        }
+        
+        /* --- Clean Layout Adjustments --- */
+        .block-container {
+            padding-top: 2.5rem !important;
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+        }
+        
+        /* --- Sidebar --- */
+        [data-testid="stSidebar"] {
+            background-color: #252525;
+            border-right: 1px solid #444;
+            width: 320px !important;
+        }
+        [data-testid="stSidebar-resize-handler"] {
+            display: none;
+        }
+        
+        /* --- Primary & Secondary Buttons --- */
+        .stButton > button {
+            border-radius: 8px;
+            font-weight: 600;
+            transition: all 0.2s ease-in-out;
+            border: none;
+            padding: 10px 16px;
+        }
+        .stButton:has(button:contains("Generate")),
+        .stButton:has(button:contains("Save")) > button {
+            background: linear-gradient(45deg, #c8102e, #e01a37);
+            color: #FFFFFF;
+        }
+        .stButton:has(button:contains("Generate")):hover > button,
+        .stButton:has(button:contains("Save")):hover > button {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px 0 rgba(200, 16, 46, 0.4);
+        }
+        .stButton:has(button:contains("Refresh")),
+        .stButton:has(button:contains("View All")),
+        .stButton:has(button:contains("Back to Overview")) > button {
+            border: 2px solid #c8102e;
+            background: transparent;
+            color: #c8102e;
+        }
+        .stButton:has(button:contains("Refresh")):hover > button,
+        .stButton:has(button:contains("View All")):hover > button,
+        .stButton:has(button:contains("Back to Overview")):hover > button {
+            background: #c8102e;
+            color: #ffffff;
+        }
+
+        /* --- Tabs --- */
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 8px;
+            background-color: transparent;
+            color: #d3d3d3;
+            padding: 8px 14px;
+            font-weight: 600;
+            font-size: 0.9rem;
+        }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            background-color: #c8102e;
+            color: #ffffff;
+        }
+
+        /* --- Expanders for Editing --- */
+        .st-expander {
+            border: 1px solid #444 !important;
+            box-shadow: none;
+            border-radius: 10px;
+            background-color: #252525;
+            margin-bottom: 0.5rem;
+        }
+        .st-expander header {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #d3d3d3;
+        }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Firestore Initialization & C.R.U.D Functions ---
+# --- Firestore Initialization & Data Operations ---
 @st.cache_resource
 def init_firestore():
     try:
         if not firebase_admin._apps:
             creds_dict = {
-              "type": st.secrets.firebase_credentials.type, "project_id": st.secrets.firebase_credentials.project_id,
-              "private_key_id": st.secrets.firebase_credentials.private_key_id, "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
-              "client_email": st.secrets.firebase_credentials.client_email, "client_id": st.secrets.firebase_credentials.client_id,
-              "auth_uri": st.secrets.firebase_credentials.auth_uri, "token_uri": st.secrets.firebase_credentials.token_uri,
+              "type": st.secrets.firebase_credentials.type,
+              "project_id": st.secrets.firebase_credentials.project_id,
+              "private_key_id": st.secrets.firebase_credentials.private_key_id,
+              "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
+              "client_email": st.secrets.firebase_credentials.client_email,
+              "client_id": st.secrets.firebase_credentials.client_id,
+              "auth_uri": st.secrets.firebase_credentials.auth_uri,
+              "token_uri": st.secrets.firebase_credentials.token_uri,
               "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
               "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url
             }
@@ -60,41 +153,48 @@ def init_firestore():
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
-        st.error(f"Firestore Connection Error: {e}")
+        st.error(f"Firestore Connection Error: Failed to initialize Firebase. Please check your Streamlit Secrets configuration. Error details: {e}")
         return None
 
 def add_to_firestore(db_client, collection_name, record, existing_df):
-    date_to_check = pd.to_datetime(record['date']).normalize()
-    if not existing_df.empty and 'date' in existing_df.columns and date_to_check in pd.to_datetime(existing_df['date']).normalize().values:
-        st.error(f"A record for {date_to_check.strftime('%Y-%m-%d')} already exists.")
+    record['date'] = pd.to_datetime(record['date']).to_pydatetime()
+    if not existing_df.empty and record['date'].date() in pd.to_datetime(existing_df['date']).dt.date.values:
+        st.error(f"A record for {record['date'].strftime('%Y-%m-%d')} already exists. Please edit the existing record.")
         return
-    db_client.collection(collection_name).add(record)
-    st.success("Record added!")
-    st.cache_data.clear()
-    time.sleep(1)
-    st.rerun()
+    try:
+        db_client.collection(collection_name).add(record)
+    except Exception as e:
+        st.error(f"Error adding record to Firestore: {e}")
 
+def update_activity_in_firestore(db_client, doc_id, update_data):
+    try:
+        db_client.collection('future_activities').document(doc_id).update(update_data)
+    except Exception as e:
+        st.error(f"Error updating activity: {e}")
 
-def update_firestore_record(db_client, collection_name, doc_id, update_data):
-    db_client.collection(collection_name).document(doc_id).update(update_data)
-    st.success("Record updated!")
-    st.cache_data.clear()
-    time.sleep(1)
-    st.rerun()
+def update_historical_record_in_firestore(db_client, doc_id, update_data):
+    try:
+        db_client.collection('historical_data').document(doc_id).update(update_data)
+    except Exception as e:
+        st.error(f"Error updating historical record: {e}")
 
 def delete_from_firestore(db_client, collection_name, doc_id):
-    db_client.collection(collection_name).document(doc_id).delete()
-    st.warning("Record deleted.")
-    st.cache_data.clear()
-    time.sleep(1)
-    st.rerun()
+    try:
+        db_client.collection(collection_name).document(doc_id).delete()
+    except Exception as e:
+        st.error(f"Error deleting record: {e}")
 
 # --- App State Management ---
-def initialize_state(db_client):
+def initialize_state_firestore(db_client):
     if 'db_client' not in st.session_state: st.session_state.db_client = db_client
     if 'historical_df' not in st.session_state: st.session_state.historical_df = load_from_firestore(db_client, 'historical_data')
     if 'events_df' not in st.session_state: st.session_state.events_df = load_from_firestore(db_client, 'future_activities')
-    defaults = {'forecast_df': pd.DataFrame(), 'prophet_models': {}, 'username': "Admin", 'show_all_activities': False}
+    defaults = {
+        'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688",
+        'authentication_status': True, 'access_level': 1, 'username': "Admin",
+        'forecast_components': pd.DataFrame(), 'migration_done': False, 'show_recent_entries': False,
+        'show_all_activities': False, 'shap_values_cust': {}, 'X_cust': {}, 'day_models': {}
+    }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
@@ -102,376 +202,618 @@ def initialize_state(db_client):
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
     if _db_client is None: return pd.DataFrame()
+    
     docs = _db_client.collection(collection_name).stream()
-    records = []
-    for doc in docs:
-        record = doc.to_dict()
-        record['doc_id'] = doc.id
-        records.append(record)
+    records = [doc.to_dict() | {'doc_id': doc.id} for doc in docs]
+        
     if not records: return pd.DataFrame()
+    
     df = pd.DataFrame(records)
+    
     if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
-    for col in ['sales', 'customers', 'add_on_sales', 'potential_sales']:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.tz_localize(None)
+        df.dropna(subset=['date'], inplace=True)
+        if not df.empty:
+            df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+
+    numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
+    for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').interpolate().fillna(0)
-    return df.sort_values(by='date').reset_index(drop=True)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
+    return df
 
 def cap_outliers_iqr(df, column='sales'):
-    Q1, Q3 = df[column].quantile(0.25), df[column].quantile(0.75)
-    upper_bound = Q3 + 1.5 * (Q3 - Q1)
+    Q1 = df[column].quantile(0.25); Q3 = df[column].quantile(0.75)
+    IQR = Q3 - Q1; upper_bound = Q3 + 1.5 * IQR
+    capped_count = (df[column] > upper_bound).sum()
     df_capped = df.copy()
     df_capped.loc[df_capped[column] > upper_bound, column] = upper_bound
-    return df_capped
+    return df_capped, capped_count, upper_bound
 
 @st.cache_data
 def calculate_atv(df):
     df_copy = df.copy()
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    df_copy['base_sales'] = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     with np.errstate(divide='ignore', invalid='ignore'):
-        atv = np.divide(base_sales, df_copy['customers'].replace(0, np.nan)) # Avoid division by zero
-    df_copy['atv'] = np.nan_to_num(atv)
+        atv = np.divide(df_copy['base_sales'], df_copy['customers'])
+    df_copy['atv'] = np.nan_to_num(atv, nan=0.0, posinf=0.0, neginf=0.0)
     return df_copy
 
 @st.cache_data(ttl=3600)
 def get_weather_forecast(days=16):
     try:
-        params={"latitude":10.48, "longitude":123.42, "daily":"weather_code,temperature_2m_max", "timezone":"Asia/Manila", "forecast_days":days}
-        response = requests.get("https://api.open-meteo.com/v1/forecast", params=params)
-        response.raise_for_status()
-        df = pd.DataFrame(response.json()['daily'])
-        df.rename(columns={'time':'date', 'temperature_2m_max':'temp_max'}, inplace=True)
-        df['date'] = pd.to_datetime(df['date'])
-        return df[['date', 'temp_max']]
-    except requests.exceptions.RequestException:
-        return pd.DataFrame()
+        params={
+            "latitude":10.48, "longitude":123.42, "daily":"weather_code,temperature_2m_max,precipitation_sum,wind_speed_10m_max",
+            "timezone":"Asia/Manila", "forecast_days":days }
+        response=requests.get("https://api.open-meteo.com/v1/forecast",params=params)
+        response.raise_for_status(); data=response.json(); df=pd.DataFrame(data['daily'])
+        df.rename(columns={'time':'date','temperature_2m_max':'temp_max','precipitation_sum':'precipitation','wind_speed_10m_max':'wind_speed'},inplace=True)
+        df['date']=pd.to_datetime(df['date']);df['weather']=df['weather_code'].apply(map_weather_code)
+        return df[['date', 'weather']]
+    except requests.exceptions.RequestException as e:
+        st.error(f"Could not fetch weather data. Error: {e}")
+        return None
 
-@st.cache_data
-def create_advanced_features(df, weather_df=None):
-    df['date'] = pd.to_datetime(df['date'])
-    if weather_df is not None and not weather_df.empty:
-        df = pd.merge(df, weather_df, on='date', how='left')
-        df['temp_max'].ffill(inplace=True)
-        df['temp_max'].bfill(inplace=True)
-    
-    df['dayofweek'] = df['date'].dt.dayofweek
-    df['month'] = df['date'].dt.month
-    df['year'] = df['date'].dt.year
-    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
-    df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
-    df['is_payday_window'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int)
+def map_weather_code(code):
+    if code in [0, 1]: return "Sunny"
+    if code == 2: return "Partly Cloudy"
+    if code == 3: return "Cloudy"
+    if code in [45, 48]: return "Foggy"
+    if code in [51, 53, 55, 61, 63, 65, 80, 81, 82]: return "Rainy"
+    if code in [95, 96, 99]: return "Thunderstorm"
+    return "Cloudy"
 
-    df = df.sort_values('date').reset_index(drop=True)
-    for lag in [7, 14, 28]: # Weekly lags
-        if 'sales' in df.columns: df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
-        if 'customers' in df.columns: df[f'customers_lag_{lag}'] = df['customers'].shift(lag)
+def generate_recurring_local_events(start_date, end_date):
+    events = []
+    current_date = start_date
+    while current_date <= end_date:
+        if current_date.day in [15, 30]:
+            events.append({'holiday': 'Payday', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
+            for i in range(1, 3):
+                events.append({'holiday': 'Near_Payday', 'ds': current_date - timedelta(days=i), 'lower_window': 0, 'upper_window': 0})
+        if current_date.month == 7 and current_date.day == 1:
+            events.append({'holiday': 'San Carlos Charter Day', 'ds': current_date, 'lower_window': 0, 'upper_window': 0})
+        current_date += timedelta(days=1)
+    return pd.DataFrame(events)
 
-    return df.fillna(0)
-
+# --- Self-Recalibration Logic ---
 def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0.98, short_term_days=7, long_term_days=30):
     try:
         log_docs = db.collection('forecast_log').stream()
         log_records = [doc.to_dict() for doc in log_docs]
         if not log_records: return False
 
-        forecast_log_df = pd.DataFrame(log_records)
-        forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
-        forecast_log_df['generated_on'] = pd.to_datetime(forecast_log_df['generated_on']).dt.tz_localize(None)
-        day_ahead_logs = forecast_log_df[forecast_log_df['forecast_for_date'] - forecast_log_df['generated_on'] <= timedelta(days=1)].copy()
+        log_df = pd.DataFrame(log_records)
+        log_df['forecast_for_date'] = pd.to_datetime(log_df['forecast_for_date']).dt.tz_localize(None)
+        log_df['generated_on'] = pd.to_datetime(log_df['generated_on']).dt.tz_localize(None)
+        day_ahead_logs = log_df[log_df['forecast_for_date'] - log_df['generated_on'] == timedelta(days=1)].copy()
+        
         if day_ahead_logs.empty: return False
 
-        true_accuracy_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
-        if len(true_accuracy_df) < long_term_days: return False 
-        
+        merged_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
+        if len(merged_df) < long_term_days: return False
+
         today = pd.to_datetime('today').normalize()
-        long_term_df = true_accuracy_df[true_accuracy_df['date'] >= today - pd.Timedelta(days=long_term_days)]
-        short_term_df = true_accuracy_df[true_accuracy_df['date'] >= today - pd.Timedelta(days=short_term_days)]
+        long_term_df = merged_df[merged_df['date'] >= today - pd.Timedelta(days=long_term_days)]
+        short_term_df = merged_df[merged_df['date'] >= today - pd.Timedelta(days=short_term_days)]
 
         if long_term_df.empty or short_term_df.empty: return False
-
+        
         long_term_accuracy = 100 - (np.nanmean(np.abs((long_term_df['sales'] - long_term_df['predicted_sales']) / long_term_df['sales'].replace(0, np.nan))) * 100)
         short_term_accuracy = 100 - (np.nanmean(np.abs((short_term_df['sales'] - short_term_df['predicted_sales']) / short_term_df['sales'].replace(0, np.nan))) * 100)
 
         if short_term_accuracy < (long_term_accuracy * degradation_threshold):
-            st.warning(f"🚨 Model accuracy degradation detected! Recalibrating...")
+            st.warning(f"🚨 Recent 7-day accuracy ({short_term_accuracy:.2f}%) dropped below 30-day baseline ({long_term_accuracy:.2f}%). Triggering model recalibration.")
+            st.cache_resource.clear()
             st.cache_data.clear()
             time.sleep(2) 
             return True
     except Exception as e:
-        st.warning(f"Could not perform accuracy check. Error: {e}")
+        st.warning(f"Could not perform automatic accuracy check. Error: {e}")
     return False
 
-# --- Core Forecasting Models (Simplified) ---
+# --- Core Forecasting Models ---
 @st.cache_data
-def train_and_forecast_prophet_day_specific(historical_df, periods, target_col, day_of_week):
-    df_train = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
-    if len(df_train) < 10: return pd.DataFrame(), None
-    df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
-    prophet_model = Prophet(weekly_seasonality=False, daily_seasonality=False, yearly_seasonality=True)
+def create_day_specific_features(df, target_col):
+    df = df.sort_values('date')
+    lags = [1, 2, 3, 4] # Lag by weeks
+    for lag in lags:
+        df[f'{target_col}_lag_{lag}'] = df[target_col].shift(lag)
+    
+    windows = [2, 4] # Rolling means over 2 and 4 weeks
+    for window in windows:
+        df[f'{target_col}_rolling_mean_{window}'] = df[target_col].shift(1).rolling(window=window, min_periods=1).mean()
+        df[f'{target_col}_rolling_std_{window}'] = df[target_col].shift(1).rolling(window=window, min_periods=1).std()
+    
+    df['month'] = df['date'].dt.month
+    df['quarter'] = df['date'].dt.quarter
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    df['dayofyear'] = df['date'].dt.dayofyear
+    df['is_not_normal_day'] = df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
+    
+    return df
+
+@st.cache_resource
+def train_and_forecast_prophet(_historical_df, _events_df, periods, target_col):
+    df_train = _historical_df.rename(columns={'date': 'ds', target_col: 'y'})
+    if df_train.empty or len(df_train) < 15: return pd.DataFrame(), None
+
+    start_date = df_train['ds'].min(); end_date = df_train['ds'].max() + timedelta(days=periods)
+    recurring_events = generate_recurring_local_events(start_date, end_date)
+    manual_events = _events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
+    all_events = pd.concat([manual_events, recurring_events]).dropna(subset=['ds', 'holiday'])
+
+    prophet_model = Prophet(
+        growth='linear', holidays=all_events, daily_seasonality=False,
+        weekly_seasonality=True, yearly_seasonality=(len(df_train) >= 365), 
+        changepoint_prior_scale=0.5, changepoint_range=0.95,
+    )
     prophet_model.add_country_holidays(country_name='PH')
-    prophet_model.fit(df_prophet)
-    last_date = historical_df['date'].max()
-    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
-    future_day_specific = future_dates[future_dates.dayofweek == day_of_week][:periods]
-    future_df = pd.DataFrame({'ds': future_day_specific})
-    forecast = prophet_model.predict(future_df)
-    return forecast[['ds', 'yhat', 'trend', 'yearly', 'holidays']], prophet_model
+    prophet_model.fit(df_train)
+    future = prophet_model.make_future_dataframe(periods=periods)
+    forecast = prophet_model.predict(future)
+    return forecast[['ds', 'yhat']], prophet_model
 
-@st.cache_data
-def train_and_forecast_xgb_day_specific(historical_df, periods, target_col, day_of_week, customer_forecast_df=None, weather_df=None):
-    df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
-    if len(df_day) < 20: return pd.DataFrame()
+@st.cache_resource(show_spinner=False)
+def train_day_specific_tree_model(model_name, _df_day, target_col, periods):
+    df_featured = create_day_specific_features(_df_day.copy(), target_col)
     
-    last_date = historical_df['date'].max()
-    future_dates_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
-    future_day_specific_dates = future_dates_range[future_dates_range.dayofweek == day_of_week][:periods]
-    future_df_placeholders = pd.DataFrame({'date': future_day_specific_dates})
+    features = [col for col in df_featured.columns if col not in ['date', 'doc_id', 'sales', 'customers', 'atv', 'base_sales', 'add_on_sales', 'day_type', 'day_type_notes', 'weather']]
     
-    combined_df = pd.concat([df_day, future_df_placeholders], ignore_index=True)
-    combined_featured_df = create_advanced_features(combined_df, weather_df)
+    X = df_featured[features].copy()
+    y = df_featured[target_col].copy()
     
-    if target_col == 'atv' and customer_forecast_df is not None:
-        combined_featured_df = pd.merge(
-            combined_featured_df, 
-            customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), 
-            on='date', 
-            how='left'
-        )
-        # Fill NaN values created by the merge for historical data rows
-        combined_featured_df['forecast_customers'].fillna(0, inplace=True)
+    X.dropna(inplace=True); y = y[X.index]
+    if X.empty or len(X) < 10: return pd.DataFrame(), None, pd.DataFrame() # Not enough data for this day of the week
 
-    features = [f for f in combined_featured_df.columns if combined_featured_df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date', target_col]]
-    train_df = combined_featured_df.dropna(subset=[target_col])
-    predict_df = combined_featured_df[combined_featured_df[target_col].isna()]
+    # Using pre-defined robust parameters instead of running Optuna for 14 different models to speed up generation
+    params = {
+        'xgb': {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42},
+        'lgbm': {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000, 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 31},
+        'cat': {'random_seed': 42, 'objective': 'RMSE', 'iterations': 1000, 'verbose': 0, 'learning_rate': 0.05, 'depth': 6}
+    }
     
-    X_train, y_train = train_df[features], train_df[target_col]
-    X_future = predict_df[features]
+    model_map = {'xgb': xgb.XGBRegressor, 'lgbm': lgb.LGBMRegressor, 'cat': cat.CatBoostRegressor}
+    model = model_map[model_name](**params[model_name])
 
-    if X_train.empty or X_future.empty: return pd.DataFrame()
+    sample_weights = np.exp(np.linspace(-1, 0, len(y))) # Weight recent samples more
+    model.fit(X, y, sample_weight=sample_weights)
     
-    model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42).fit(X_train, y_train)
-    predictions = model.predict(X_future)
+    # Create future dataframe
+    future_predictions = []
+    history_copy = df_featured.copy()
+    for i in range(periods):
+        last_date = history_copy['date'].max()
+        next_date = last_date + timedelta(days=7) # Predict for the same day next week
+        
+        future_step_df = pd.DataFrame([{'date': next_date}])
+        extended_history = pd.concat([history_copy, future_step_df], ignore_index=True)
+        extended_featured_df = create_day_specific_features(extended_history, target_col)
+        
+        X_future = extended_featured_df[features].tail(1)
+        prediction = model.predict(X_future)[0]
+        
+        future_predictions.append({'ds': next_date, 'yhat': prediction})
+        history_copy.loc[history_copy.index.max() + 1, 'date'] = next_date
+        history_copy.loc[history_copy.index.max(), target_col] = prediction
+
+    historical_preds = pd.DataFrame({'ds': df_featured.loc[X.index, 'date'], 'yhat': model.predict(X)})
+    future_preds = pd.DataFrame(future_predictions)
+
+    return pd.concat([historical_preds, future_preds], ignore_index=True), model, X
+
+@st.cache_resource
+def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
+    final_df = None
+    for name, fcst_df in base_forecasts_dict.items():
+        if fcst_df is None or fcst_df.empty: continue
+        renamed_df = fcst_df[['ds', 'yhat']].rename(columns={'yhat': f'yhat_{name}'})
+        if final_df is None: final_df = renamed_df
+        else: final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
     
-    return pd.DataFrame({'ds': predict_df['date'], 'yhat': predictions})
+    if final_df is None or final_df.empty: return pd.DataFrame()
 
-# --- Simplified Orchestration Function ---
-def run_simplified_ensemble_pipeline(historical_df, target_col, periods, weather_df, customer_forecasts=None):
-    all_forecasts = []
-    prophet_models = {}
-    for day_of_week in range(7):
-        prophet_f, p_model = train_and_forecast_prophet_day_specific(historical_df, periods, target_col, day_of_week)
-        xgb_f = train_and_forecast_xgb_day_specific(historical_df, periods, target_col, day_of_week, customer_forecasts, weather_df)
-        if prophet_f.empty or xgb_f.empty: continue
-        if p_model: prophet_models[day_of_week] = p_model
-        merged_f = pd.merge(prophet_f.rename(columns={'yhat':'yhat_prophet'}), xgb_f.rename(columns={'yhat':'yhat_xgb'}), on='ds', how='inner')
-        merged_f['yhat'] = (merged_f['yhat_prophet'] + merged_f['yhat_xgb']) / 2
-        for col in ['trend', 'yearly', 'holidays']:
-            if col in merged_f.columns:
-                merged_f[col] = merged_f[col]
-        all_forecasts.append(merged_f)
-    if not all_forecasts: return pd.DataFrame(), {}
-    final_forecast = pd.concat(all_forecasts).sort_values('ds').reset_index(drop=True)
-    return final_forecast, prophet_models
+    final_df = final_df.sort_values('ds').interpolate(method='linear', limit_direction='both', axis=0)
+    final_df.bfill(inplace=True); final_df.ffill(inplace=True)
 
-def log_forecast_to_firestore(db_client, forecast_df):
-    generated_on = pd.to_datetime('today')
-    for _, row in forecast_df.iterrows():
-        log_entry = {
-            "forecast_for_date": row['ds'],
-            "predicted_sales": row['forecast_sales'],
-            "predicted_customers": row['forecast_customers'],
-            "generated_on": generated_on
-        }
-        query = db_client.collection('forecast_log').where('forecast_for_date', '==', row['ds']).limit(1)
-        docs = list(query.stream())
-        if docs:
-            db_client.collection('forecast_log').document(docs[0].id).set(log_entry)
-        else:
-            db_client.collection('forecast_log').add(log_entry)
+    training_data = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
+    
+    meta_features = [col for col in training_data.columns if 'yhat_' in col]
+    X_meta = training_data[meta_features]
+    y_meta = training_data[target_col_name]
+    
+    if len(X_meta) < 20:
+        st.warning(f"Not enough historical data for advanced stacking. Falling back to simple averaging.")
+        final_df['yhat'] = final_df[meta_features].mean(axis=1)
+        return final_df[['ds', 'yhat']]
 
-# --- Plotting and UI Rendering ---
+    meta_model = lgb.LGBMRegressor(random_state=42, n_estimators=200, objective='regression_l1', verbosity=-1)
+    meta_model.fit(X_meta, y_meta)
+    
+    X_future_meta = final_df[meta_features].dropna()
+    final_df['yhat'] = meta_model.predict(X_future_meta)
+    
+    return final_df[['ds', 'yhat']]
+
+# --- Plotting and UI ---
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-def plot_forecast_breakdown(prophet_model, selected_date):
-    if not prophet_model:
-        st.warning("Prophet model not available for this day.")
-        return go.Figure()
+def plot_full_comparison_chart(hist, fcst, metrics, target):
+    fig=go.Figure()
+    fig.add_trace(go.Scatter(x=hist['date'],y=hist[target],mode='lines+markers',name='Historical Actuals',line=dict(color='#3b82f6')))
+    fig.add_trace(go.Scatter(x=fcst['ds'],y=fcst['yhat'],mode='lines',name='Forecast',line=dict(color='#ffc72c',dash='dash')))
+    title_text=f"{target.replace('_',' ').title()} Forecast"
+    y_axis_title=title_text+' (₱)' if 'atv' in target or 'sales' in target else title_text
     
-    components_df = prophet_model.predict(pd.DataFrame({'ds': [selected_date]}))
-    return prophet_model.plot_components(components_df)
-
-def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
-    if df.empty: return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df[date_col], y=df[actual_col], mode='lines+markers', name='Actual', line=dict(color='#3b82f6')))
-    fig.add_trace(go.Scatter(x=df[date_col], y=df[forecast_col], mode='lines+markers', name='Forecast', line=dict(color='#d62728', dash='dash')))
-    fig.update_layout(title=title, yaxis_title=y_axis_title, paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white')
+    fig.update_layout(
+        title=f'Full Diagnostic: {title_text} vs. Historical', xaxis=dict(title='Date'), yaxis=dict(title=y_axis_title),
+        legend=dict(x=0.01,y=0.99), height=500, margin=dict(l=40,r=40,t=60,b=40),
+        paper_bgcolor='#2a2a2a', plot_bgcolor='#2a2a2a', font_color='white'
+    )
     return fig
 
-def render_activity_card(row, db_client):
-    with st.expander(f"**{pd.to_datetime(row['date']).strftime('%b %d')}**: {row['activity_name']}"):
-        status, sales, doc_id = row['remarks'], row['potential_sales'], row['doc_id']
-        st.markdown(f"**Status:** {status} | **Potential Sales:** ₱{sales:,.2f}")
-        with st.form(key=f"update_form_{doc_id}", border=False):
-            updated_sales = st.number_input("Sales (₱)", value=float(sales), key=f"sales_{doc_id}")
-            updated_remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"], index=["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"].index(status), key=f"remarks_{doc_id}")
-            c1, c2 = st.columns(2)
-            if c1.form_submit_button("💾 Update", use_container_width=True):
-                update_firestore_record(db_client, 'future_activities', doc_id, {"potential_sales": updated_sales, "remarks": updated_remarks})
-            if c2.form_submit_button("🗑️ Delete", use_container_width=True):
-                delete_from_firestore(db_client, 'future_activities', doc_id)
+def plot_forecast_breakdown(components,selected_date,all_events):
+    day_data=components[components['ds']==selected_date].iloc[0];event_on_day=all_events[all_events['ds']==selected_date]
+    x_data = ['Baseline Trend'];y_data = [day_data.get('trend', 0)];measure_data = ["absolute"]
+    if 'weekly' in day_data and pd.notna(day_data['weekly']):
+        x_data.append('Day of Week Effect');y_data.append(day_data['weekly']);measure_data.append('relative')
+    if 'yearly' in day_data and pd.notna(day_data['yearly']):
+        x_data.append('Time of Year Effect');y_data.append(day_data['yearly']);measure_data.append('relative')
+    if 'holidays' in day_data and pd.notna(day_data['holidays']):
+        holiday_text='Holidays/Events'if event_on_day.empty else f"Event: {event_on_day['holiday'].iloc[0]}"
+        x_data.append(holiday_text);y_data.append(day_data['holidays']);measure_data.append('relative')
+
+    x_data.append('Final Forecast');y_data.append(day_data['yhat']);measure_data.append('total')
+    fig=go.Figure(go.Waterfall(name="Breakdown",orientation="v",measure=measure_data,x=x_data,textposition="outside",text=[f"{v:,.0f}"for v in y_data],y=y_data,connector={"line":{"color":"rgb(63,63,63)"}},increasing={"marker":{"color":"#2ca02c"}},decreasing={"marker":{"color":"#d62728"}},totals={"marker":{"color":"#1f77b4"}}));fig.update_layout(title=f"Forecast Breakdown for {selected_date.strftime('%A,%B %d')}",showlegend=False,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white');return fig,day_data
+
+def plot_evaluation_graph(df, date_col, actual_col, forecast_col, title, y_axis_title):
+    if df.empty: return go.Figure().update_layout(title=title, paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white', annotations=[{"text": "No data available.", "xref": "paper", "yref": "paper", "showarrow": False}])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df[date_col], y=df[actual_col], mode='lines+markers', name='Actual',line=dict(color='#3b82f6')))
+    fig.add_trace(go.Scatter(x=df[date_col], y=df[forecast_col], mode='lines+markers', name='Forecast',line=dict(color='#d62728', dash='dash')))
+    fig.update_layout(
+        title=dict(text=title), xaxis=dict(title='Date'), yaxis=dict(title=y_axis_title),
+        legend=dict(font=dict(color='white')), height=450, margin=dict(l=50,r=50,t=80,b=50),
+        paper_bgcolor='#1a1a1a', plot_bgcolor='#252525', font_color='white',
+        xaxis_gridcolor='#444', yaxis_gridcolor='#444'
+    )
+    return fig
+
+def generate_insight_summary(day_data,selected_date):
+    effects={'Day of the Week':day_data.get('weekly',0),'Time of Year':day_data.get('yearly',0),'Holidays/Events':day_data.get('holidays',0)}
+    significant_effects={k:v for k,v in effects.items()if abs(v)>1}
+    summary=f"The forecast for **{selected_date.strftime('%A,%B %d')}** starts with a baseline trend of **{day_data.get('trend', 0):.0f} customers**.\n\n"
+    if not significant_effects:
+        summary += f"The final forecast of **{day_data.get('yhat', 0):.0f} customers** is driven primarily by this trend."
+    else:
+        pos_drivers={k:v for k,v in significant_effects.items()if v>0}
+        neg_drivers={k:v for k,v in significant_effects.items()if v<0}
+        if pos_drivers: summary+=f"📈 Main positive driver is **{max(pos_drivers,key=pos_drivers.get)}**, adding an estimated **{max(pos_drivers.values()):.0f} customers**.\n"
+        if neg_drivers: summary+=f"📉 Main negative driver is **{min(neg_drivers,key=neg_drivers.get)}**, reducing by **{abs(min(neg_drivers.values())):.0f} customers**.\n"
+    summary+=f"\nAfter all factors, the final forecast is **{day_data.get('yhat', 0):.0f} customers**."
+    return summary
+
+def render_activity_card(row, db_client, view_type='compact_list'):
+    doc_id = row['doc_id']
+    status_colors = {'Confirmed': '#22C55E', 'Needs Follow-up': '#F59E0B', 'Tentative': '#38BDF8', 'Cancelled': '#EF4444'}
+    status = row.get('remarks', 'Tentative')
+    color = status_colors.get(status, '#A9A9A9')
+    
+    if view_type == 'compact_list':
+        with st.expander(f"**{pd.to_datetime(row['date']).strftime('%b %d')}** | {row['activity_name']}"):
+            st.markdown(f"**Status:** <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
+            st.markdown(f"**Potential Sales:** ₱{row['potential_sales']:,.2f}")
+            with st.form(key=f"compact_update_form_{doc_id}", border=False):
+                status_options = list(status_colors.keys())
+                updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"compact_sales_{doc_id}")
+                updated_remarks = st.selectbox("Status", options=status_options, index=status_options.index(status), key=f"compact_remarks_{doc_id}")
+                uc, dc = st.columns(2)
+                if uc.form_submit_button("💾 Update", use_container_width=True):
+                    update_activity_in_firestore(db_client, doc_id, {"potential_sales": updated_sales, "remarks": updated_remarks})
+                    st.success("Activity updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
+                if dc.form_submit_button("🗑️ Delete", use_container_width=True):
+                    delete_from_firestore(db_client, 'future_activities', doc_id)
+                    st.warning("Activity deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
+    else: # 'grid' view
+        with st.container(border=True):
+            st.markdown(f"**{row['activity_name']}**")
+            st.markdown(f"<small>📅 {pd.to_datetime(row['date']).strftime('%A, %B %d, %Y')}</small>", unsafe_allow_html=True)
+            st.markdown(f"💰 ₱{row['potential_sales']:,.2f}")
+            st.markdown(f"Status: <span style='color:{color}; font-weight:600;'>{status}</span>", unsafe_allow_html=True)
+            with st.expander("Edit / Manage"):
+                with st.form(key=f"full_update_form_{doc_id}", border=False):
+                    status_options = list(status_colors.keys())
+                    updated_sales = st.number_input("Sales (₱)", value=float(row['potential_sales']), format="%.2f", key=f"full_sales_{doc_id}")
+                    updated_remarks = st.selectbox("Status", options=status_options, index=status_options.index(status), key=f"full_remarks_{doc_id}")
+                    uc, dc = st.columns(2)
+                    if uc.form_submit_button("💾 Update", use_container_width=True):
+                        update_activity_in_firestore(db_client, doc_id, {"potential_sales": updated_sales, "remarks": updated_remarks})
+                        st.success("Activity updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
+                    if dc.form_submit_button("🗑️ Delete", use_container_width=True):
+                        delete_from_firestore(db_client, 'future_activities', doc_id)
+                        st.warning("Activity deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
 
 def render_historical_record(row, db_client):
-    with st.expander(f"{row['date'].strftime('%B %d, %Y')} - Sales: ₱{row.get('sales', 0):,.2f}"):
+    date_str = row['date'].strftime('%B %d, %Y')
+    with st.expander(f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"):
+        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f} | **Weather:** {row.get('weather', 'N/A')} | **Day Type:** {row.get('day_type', 'Normal Day')}")
+        if row.get('day_type') == 'Not Normal Day': st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
+
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+            st.markdown("**Edit Record**")
             c1, c2 = st.columns(2)
-            updated_sales = c1.number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"h_sales_{row['doc_id']}")
-            updated_customers = c2.number_input("Customers", value=int(row.get('customers', 0)), key=f"h_cust_{row['doc_id']}")
-            if c1.form_submit_button("💾 Update Record", use_container_width=True):
-                update_firestore_record(db_client, 'historical_data', row['doc_id'], {'sales': updated_sales, 'customers': updated_customers})
-            if c2.form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
+            updated_sales = c1.number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"s_{row['doc_id']}")
+            updated_customers = c2.number_input("Customers", value=int(row.get('customers', 0)), key=f"c_{row['doc_id']}")
+            updated_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], index=["Normal Day", "Not Normal Day"].index(row.get('day_type', 'Normal Day')), key=f"dt_{row['doc_id']}")
+            updated_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"n_{row['doc_id']}")
+            
+            b1, b2 = st.columns(2)
+            if b1.form_submit_button("💾 Update Record", use_container_width=True):
+                update_data = { 'sales': updated_sales, 'customers': updated_customers, 'day_type': updated_day_type, 'day_type_notes': updated_notes if updated_day_type == 'Not Normal Day' else '' }
+                update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
+                st.success(f"Record for {date_str} updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
+
+            if b2.form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
                 delete_from_firestore(db_client, 'historical_data', row['doc_id'])
+                st.warning(f"Record for {date_str} deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
 
 # --- Main Application UI ---
 apply_custom_styling()
 db = init_firestore()
 if db:
-    initialize_state(db)
+    initialize_state_firestore(db)
     
     with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png", width=80)
-        st.title(f"Welcome, {st.session_state['username']}")
-        st.markdown("---")
-        st.info("Forecasting with a Day-Specific Prophet + XGBoost Ensemble.")
+        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
+        st.info("Forecasting with an Advanced AI Ensemble")
 
         if st.button("🔄 Refresh Data from Firestore"):
-            st.cache_data.clear(); st.rerun()
+            st.cache_data.clear(); st.cache_resource.clear()
+            st.success("Cache cleared. Rerunning to get latest data."); time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", use_container_width=True):
             if len(st.session_state.historical_df) < 50:
-                st.error("Please provide at least 50 days of data.")
+                st.error("Please provide at least 50 days of data for reliable forecasting.")
             else:
                 if check_performance_and_recalibrate(db, st.session_state.historical_df):
-                    st.info("Model recalibrated. Please click 'Generate Forecast' again.")
+                    st.info("Models recalibrated. Please click 'Generate Forecast' again.")
                 else:
-                    with st.spinner("🧠 Training Day-Specific Models (Prophet + XGBoost)..."):
-                        base_df = st.session_state.historical_df.copy()
+                    with st.spinner("🚀 Launching AI Ensemble Forecast..."):
+                        hist_df = st.session_state.historical_df.copy()
+                        ev_df = st.session_state.events_df.copy()
                         FORECAST_HORIZON = 15
-                        weather_df = get_weather_forecast(days=FORECAST_HORIZON + 30)
                         
-                        hist_df_with_atv = calculate_atv(cap_outliers_iqr(base_df, column='sales'))
+                        # --- Pre-processing ---
+                        with st.spinner("Engineering features and handling outliers..."):
+                            hist_df, _, _ = cap_outliers_iqr(hist_df, column='sales')
+                            hist_df_atv = calculate_atv(hist_df)
                         
-                        cust_f, cust_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'customers', FORECAST_HORIZON, weather_df)
+                        # --- Prophet Model ---
+                        with st.spinner("Training Foundational Prophet Model..."):
+                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_atv, ev_df, FORECAST_HORIZON, 'customers')
+                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_atv, ev_df, FORECAST_HORIZON, 'atv')
+
+                        # --- Day-Specific Tree Models ---
+                        all_atv_forecasts = {'prophet': prophet_atv_f}
+                        all_cust_forecasts = {'prophet': prophet_cust_f}
+                        day_models_cust = {}; x_cust_data = {}; shap_values_cust_data = {}
+
+                        df_by_day = [hist_df_atv[hist_df_atv['date'].dt.dayofweek == i] for i in range(7)]
                         
-                        if cust_f.empty:
-                            st.error("Forecast Failed: Could not generate a customer forecast. Ensure sufficient data exists for each day of the week.")
-                        else:
-                            atv_f, atv_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'atv', FORECAST_HORIZON, weather_df, customer_forecasts=cust_f)
+                        for model_name in ['xgb', 'lgbm', 'cat']:
+                            with st.spinner(f"Training {model_name.upper()} day-specific models..."):
+                                atv_day_forecasts = []; cust_day_forecasts = []
+                                for i in range(7): # 0=Monday, 6=Sunday
+                                    if len(df_by_day[i]) > 10:
+                                        fcst_atv, _, _ = train_day_specific_tree_model(model_name, df_by_day[i], 'atv', FORECAST_HORIZON)
+                                        fcst_cust, model_cust, X_cust = train_day_specific_tree_model(model_name, df_by_day[i], 'customers', FORECAST_HORIZON)
+                                        atv_day_forecasts.append(fcst_atv)
+                                        cust_day_forecasts.append(fcst_cust)
+                                        
+                                        if model_name == 'xgb' and model_cust is not None and not X_cust.empty:
+                                            day_models_cust[(i, 'xgb')] = model_cust
+                                            x_cust_data[(i, 'xgb')] = X_cust
+                                            try:
+                                                explainer = shap.TreeExplainer(model_cust)
+                                                shap_values_cust_data[(i, 'xgb')] = explainer(X_cust)
+                                            except Exception:
+                                                pass # Fail silently if SHAP fails for a specific model
+
+                                all_atv_forecasts[model_name] = pd.concat(atv_day_forecasts, ignore_index=True) if atv_day_forecasts else pd.DataFrame()
+                                all_cust_forecasts[model_name] = pd.concat(cust_day_forecasts, ignore_index=True) if cust_day_forecasts else pd.DataFrame()
+
+                        st.session_state.day_models = day_models_cust
+                        st.session_state.X_cust = x_cust_data
+                        st.session_state.shap_values_cust = shap_values_cust_data
+                        
+                        # --- Stacking ---
+                        with st.spinner("Stacking all models for final predictions..."):
+                            atv_f = train_and_forecast_stacked_ensemble(all_atv_forecasts, hist_df_atv, 'atv')
+                            cust_f = train_and_forecast_stacked_ensemble(all_cust_forecasts, hist_df_atv, 'customers')
+
+                        # --- Final Combination ---
+                        if not cust_f.empty and not atv_f.empty:
+                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
+                            combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
-                            if not atv_f.empty:
-                                combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds', how='outer')
-                                combo_f.interpolate(method='linear', limit_direction='both', inplace=True)
-                                combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
-                                st.session_state.forecast_df = combo_f
-                                st.session_state.prophet_models['customers'] = cust_models
-                                st.session_state.prophet_models['atv'] = atv_models
-                                log_forecast_to_firestore(db, combo_f)
-                                st.success("Forecast generated!")
-                            else:
-                                st.error("Forecast Failed: Could not generate an ATV forecast after the customer forecast.")
-        
+                            weather_df = get_weather_forecast()
+                            if weather_df is not None:
+                                combo_f = pd.merge(combo_f, weather_df, left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                            
+                            st.session_state.forecast_df = combo_f
+                            
+                            # Log to Firestore
+                            try:
+                                with st.spinner("📝 Saving forecast log..."):
+                                    today_naive = datetime.now().normalize()
+                                    to_log = combo_f[combo_f['ds'] > today_naive]
+                                    for _, row in to_log.iterrows():
+                                        log_id = f"{today_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
+                                        log_entry = {"generated_on": today_naive, "forecast_for_date": row['ds'], "predicted_sales": row['forecast_sales'], "predicted_customers": row['forecast_customers']}
+                                        db.collection('forecast_log').document(log_id).set(log_entry, merge=True)
+                            except Exception as e:
+                                st.error(f"Failed to save forecast log: {e}")
+                            
+                            if prophet_model_cust:
+                                p_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
+                                st.session_state.forecast_components = prophet_model_cust.predict(p_future)
+                                st.session_state.all_holidays = prophet_model_cust.holidays
+                            
+                            st.success("✅ Advanced AI forecast generated successfully!")
+                        else:
+                            st.error("Forecast generation failed. Check model outputs.")
+
         st.markdown("---")
-        st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
-        st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical.csv", "text/csv", use_container_width=True)
+        st.download_button("📥 Download Forecast", convert_df_to_csv(st.session_state.forecast_df), "forecast_data.csv", "text/csv", use_container_width=True, disabled=st.session_state.forecast_df.empty)
+        st.download_button("📥 Download Historical", convert_df_to_csv(st.session_state.historical_df), "historical_data.csv", "text/csv", use_container_width=True)
 
-    tabs = st.tabs(["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Evaluator", "✍️ Add Data", "📅 Activities", "📜 History"])
+    tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "📈 Forecast Evaluator", "✍️ Add/Edit Data", "📅 Future Activities", "📜 Historical Data"]
+    tabs = st.tabs(tab_list)
     
-    with tabs[0]: # Dashboard
+    with tabs[0]:
         if not st.session_state.forecast_df.empty:
-            df = st.session_state.forecast_df
-            st.dataframe(df.rename(columns={'ds':'Date', 'forecast_customers':'Customers', 'forecast_atv':'Avg. Sale (₱)', 'forecast_sales':'Sales (₱)'}).set_index('Date'), use_container_width=True)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df['ds'], y=df['forecast_sales'], name='Sales', line=dict(color='#ffc72c')))
-            fig.add_trace(go.Scatter(x=df['ds'], y=df['forecast_customers'], name='Customers', yaxis='y2', line=dict(color='#c8102e')))
-            fig.update_layout(title='15-Day Sales & Customer Forecast', yaxis_title='Sales (₱)', yaxis2=dict(title='Customers', overlaying='y', side='right'), paper_bgcolor='#2a2a2a', plot_bgcolor='#2a2a2a', font_color='white')
-            st.plotly_chart(fig, use_container_width=True)
-        else: st.info("Click 'Generate Forecast' to begin.")
-
-    with tabs[1]: # Insights
-        st.header("💡 Forecast Insights")
-        if not st.session_state.forecast_df.empty:
-            selected_date = st.selectbox("Select a date to analyze:", options=st.session_state.forecast_df['ds'].dt.date)
-            selected_date = pd.to_datetime(selected_date)
-            day_of_week = selected_date.dayofweek
-            target_to_view = st.radio("View insights for:", ["Customers", "Average Transaction Value (ATV)"], horizontal=True)
-            
-            model_dict = st.session_state.prophet_models.get(target_to_view.lower().split(' ')[0], {})
-            if day_of_week in model_dict:
-                model = model_dict[day_of_week]
-                fig = plot_forecast_breakdown(model, selected_date)
-                st.pyplot(fig)
-            else: st.warning("No insight components available for the selected day or target.")
-        else: st.info("Generate a forecast to view insights.")
-
-    with tabs[2]: # Evaluator
-        st.header("📈 Forecast Evaluator")
-        try:
-            log_docs = db.collection('forecast_log').stream()
-            log_records = [doc.to_dict() for doc in log_docs]
-            if log_records:
-                forecast_log_df = pd.DataFrame(log_records)
-                forecast_log_df['forecast_for_date'] = pd.to_datetime(forecast_log_df['forecast_for_date']).dt.tz_localize(None)
-                true_accuracy_df = pd.merge(st.session_state.historical_df, forecast_log_df, left_on='date', right_on='forecast_for_date', how='inner')
+            future_df = st.session_state.forecast_df[st.session_state.forecast_df['ds'] >= datetime.now().normalize()].copy()
+            if not future_df.empty:
+                disp_cols = {'ds':'Date','forecast_customers':'Predicted Customers','forecast_atv':'Predicted Avg Sale (₱)','forecast_sales':'Predicted Sales (₱)','weather':'Predicted Weather'}
+                display_df = future_df.rename(columns=disp_cols)[list(disp_cols.values())]
+                st.markdown("#### Forecasted Values"); st.dataframe(display_df.set_index('Date').style.format({'Predicted Customers':'{:,.0f}','Predicted Avg Sale (₱)':'₱{:,.2f}','Predicted Sales (₱)':'₱{:,.2f}'}),use_container_width=True,height=560)
                 
-                days_to_eval = st.slider("Select evaluation period (days):", 7, 90, 30)
-                final_df = true_accuracy_df[true_accuracy_df['date'] >= pd.to_datetime('today').normalize() - pd.Timedelta(days=days_to_eval)].copy()
+                fig=go.Figure(); fig.add_trace(go.Scatter(x=future_df['ds'],y=future_df['forecast_sales'],mode='lines+markers',name='Sales Forecast',line=dict(color='#ffc72c'))); fig.add_trace(go.Scatter(x=future_df['ds'],y=future_df['forecast_customers'],mode='lines+markers',name='Customer Forecast',yaxis='y2',line=dict(color='#c8102e'))); fig.update_layout(title='15-Day Sales & Customer Forecast',xaxis_title='Date',yaxis=dict(title='Predicted Sales (₱)',color='#ffc72c'),yaxis2=dict(title='Predicted Customers',overlaying='y',side='right',color='#c8102e'),legend=dict(orientation='h'),height=500,paper_bgcolor='#2a2a2a',plot_bgcolor='#2a2a2a',font_color='white'); st.plotly_chart(fig,use_container_width=True)
+        else: st.info("Click the 'Generate Forecast' button to begin.")
+    
+    with tabs[1]:
+        st.header("💡 Forecast Insights")
+        if st.session_state.forecast_components.empty:
+            st.info("Click 'Generate Forecast' to see prediction drivers.")
+        else:
+            future_components = st.session_state.forecast_components[st.session_state.forecast_components['ds'] >= datetime.now().normalize()].copy()
+            if not future_components.empty:
+                cust_final = st.session_state.forecast_df[['ds', 'forecast_customers']].rename(columns={'forecast_customers': 'final_yhat'})
+                future_components = pd.merge(future_components, cust_final, on='ds', how='left')
+                future_components['yhat'] = future_components['final_yhat'].fillna(future_components['yhat'])
 
-                if not final_df.empty:
-                    sales_mae = mean_absolute_error(final_df['sales'], final_df['predicted_sales'])
-                    sales_mape = np.mean(np.abs((final_df['sales'] - final_df['predicted_sales']) / final_df['sales'].replace(0,1))) * 100
-                    c1, c2 = st.columns(2)
-                    c1.metric("Sales Accuracy (MAPE)", f"{100-sales_mape:.2f}%")
-                    c2.metric("Sales Average Error (MAE)", f"₱{sales_mae:,.2f}")
-                    st.plotly_chart(plot_evaluation_graph(final_df, 'date', 'sales', 'predicted_sales', 'Actual vs. Forecasted Sales', 'Sales (₱)'), use_container_width=True)
-                else: st.warning(f"No forecast data in the last {days_to_eval} days to evaluate.")
-            else: st.warning("No forecast logs found.")
-        except Exception as e: st.error(f"Could not build report: {e}")
-        
-    with tabs[3]: # Add Data
-        st.subheader("✍️ Add New Daily Record")
+                selected_date = st.selectbox("Select a day to analyze:", options=future_components['ds'], format_func=lambda d: d.strftime('%A, %B %d, %Y'))
+                
+                tab1, tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
+                with tab1:
+                    st.info("Shows foundational drivers from the Prophet model, like trend and seasonality.")
+                    fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown("---"); st.subheader("Prophet Insight Summary")
+                    st.markdown(generate_insight_summary(day_data, selected_date))
+                with tab2:
+                    st.info("Shows how each feature contributed to the day-specific XGBoost model.")
+                    day_of_week = selected_date.dayofweek
+                    key = (day_of_week, 'xgb')
+                    if key not in st.session_state.shap_values_cust:
+                        st.warning("SHAP values not available for this day's XGBoost model. It may not have had enough data to train.")
+                    else:
+                        shap_values = st.session_state.shap_values_cust[key]
+                        X_data = st.session_state.X_cust[key]
+                        X_dates = st.session_state.historical_df[st.session_state.historical_df['date'].dt.dayofweek == day_of_week].loc[X_data.index, 'date']
+                        
+                        date_match_idx = X_dates[X_dates.dt.date == selected_date.date()].index.tolist()
+                        if date_match_idx:
+                            loc = X_data.index.get_loc(date_match_idx[0])
+                            st.markdown(f"##### SHAP Explanation for {selected_date.strftime('%A, %B %d')}")
+                            fig, ax = plt.subplots(); shap.waterfall_plot(shap_values[loc], show=False); st.pyplot(fig); plt.clf()
+                        else:
+                            st.error(f"Could not find historical feature data for {selected_date.strftime('%A, %B %d')} to generate a SHAP plot.")
+                        
+                        with st.expander("View Overall Feature Importance for this Day of the Week"):
+                            fig_summary, ax_summary = plt.subplots(); shap.summary_plot(shap_values.values, X_data, plot_type="bar", show=False); plt.tight_layout(); st.pyplot(fig_summary); plt.clf()
+            
+    with tabs[2]:
+        st.header("📈 Forecast Evaluator")
+        st.info("Compares actual results against the forecast generated the day before.")
+        def render_true_accuracy_content(days):
+            try:
+                log_docs = db.collection('forecast_log').stream()
+                log_records = [doc.to_dict() for doc in log_docs]
+                if not log_records: raise ValueError("No forecast logs found.")
+
+                log_df = pd.DataFrame(log_records)
+                log_df['forecast_for_date'] = pd.to_datetime(log_df['forecast_for_date']).dt.tz_localize(None)
+                log_df['generated_on'] = pd.to_datetime(log_df['generated_on']).dt.tz_localize(None)
+                day_ahead_logs = log_df[log_df['forecast_for_date'] - log_df['generated_on'] == timedelta(days=1)].copy()
+                if day_ahead_logs.empty: raise ValueError("Not enough consecutive logs.")
+
+                merged_df = pd.merge(st.session_state.historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
+                if merged_df.empty: raise ValueError("No matching historical data for logs.")
+                
+                final_df = merged_df[merged_df['date'] >= datetime.now().normalize() - pd.Timedelta(days=days)].copy()
+                if final_df.empty: raise ValueError(f"No forecast data in the last {days} days.")
+
+                st.subheader(f"Accuracy Metrics for the Last {days} Days")
+                sales_mape = np.nanmean(np.abs((final_df['sales'] - final_df['predicted_sales']) / final_df['sales'].replace(0, np.nan))) * 100
+                cust_mape = np.nanmean(np.abs((final_df['customers'] - final_df['predicted_customers']) / final_df['customers'].replace(0, np.nan))) * 100
+                col1, col2 = st.columns(2)
+                col1.metric("Sales Accuracy (MAPE)", f"{100 - sales_mape:.2f}%")
+                col2.metric("Customer Accuracy (MAPE)", f"{100 - cust_mape:.2f}%")
+
+                st.plotly_chart(plot_evaluation_graph(final_df, 'date', 'sales', 'predicted_sales', 'Actual vs. Forecasted Sales', 'Sales (₱)'), use_container_width=True)
+                st.plotly_chart(plot_evaluation_graph(final_df, 'date', 'customers', 'predicted_customers', 'Actual vs. Forecasted Customers', 'Customers'), use_container_width=True)
+            except ValueError as e:
+                st.warning(str(e))
+            except Exception as e:
+                st.error(f"An error occurred building the report: {e}")
+
+        eval_tab_7, eval_tab_30 = st.tabs(["Last 7 Days", "Last 30 Days"])
+        with eval_tab_7: render_true_accuracy_content(7)
+        with eval_tab_30: render_true_accuracy_content(30)
+
+    with tabs[3]:
         with st.form("new_record_form", clear_on_submit=True):
-            new_date, new_sales, new_customers = st.date_input("Date", date.today()), st.number_input("Total Sales (₱)", 0.0, format="%.2f"), st.number_input("Customer Count", 0, step=1)
-            if st.form_submit_button("✅ Save Record", use_container_width=True):
-                add_to_firestore(db, 'historical_data', {"date":pd.to_datetime(new_date), "sales":new_sales, "customers":new_customers}, st.session_state.historical_df)
+            st.subheader("✍️ Add New Daily Record")
+            new_date=st.date_input("Date", date.today())
+            c1, c2 = st.columns(2)
+            new_sales=c1.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
+            new_customers=c2.number_input("Customer Count",min_value=0)
+            new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Use 'Not Normal Day' for unexpected events.")
+            new_notes = st.text_area("Notes (if Not Normal Day)", "") if new_day_type == "Not Normal Day" else ""
+            if st.form_submit_button("✅ Save Record"):
+                add_to_firestore(db, 'historical_data', { "date":new_date, "sales":new_sales, "customers":new_customers, "day_type": new_day_type, "day_type_notes": new_notes, "add_on_sales": 0, "weather": "Cloudy" }, st.session_state.historical_df)
+                st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
 
-    with tabs[4]: # Activities
-        st.subheader("📅 Future Activities")
-        c1, c2 = st.columns([1,2])
-        with c1.form("new_activity_form", clear_on_submit=True):
-            activity_name = st.text_input("Activity/Event Name")
-            activity_date = st.date_input("Date of Activity", min_value=date.today())
-            potential_sales = st.number_input("Potential Sales (₱)", 0.0, format="%.2f")
+    with tabs[4]:
+        c1, c2 = st.columns([1,2], gap="large")
+        with c1, st.form("new_activity_form", clear_on_submit=True, border=True):
+            st.markdown("##### Add New Activity")
+            name = st.text_input("Activity/Event Name")
+            act_date = st.date_input("Date of Activity", min_value=date.today())
+            sales = st.number_input("Potential Sales (₱)", min_value=0.0, format="%.2f")
             remarks = st.selectbox("Status", ["Confirmed", "Needs Follow-up", "Tentative", "Cancelled"])
             if st.form_submit_button("✅ Save Activity", use_container_width=True):
-                if activity_name and activity_date:
-                    add_to_firestore(db, 'future_activities', {"activity_name": activity_name, "date": pd.to_datetime(activity_date), "potential_sales": potential_sales, "remarks": remarks}, pd.DataFrame())
-        
+                if name and act_date:
+                    db.collection('future_activities').add({"activity_name": name, "date": pd.to_datetime(act_date), "potential_sales": float(sales), "remarks": remarks})
+                    st.success(f"Activity '{name}' saved!"); st.cache_data.clear(); time.sleep(1); st.rerun()
+                else: st.warning("Name and date are required.")
+
         with c2:
-            upcoming_df = st.session_state.events_df[pd.to_datetime(st.session_state.events_df['date']).dt.date >= date.today()].copy()
+            st.markdown("##### Upcoming Activities")
+            activities_df = load_from_firestore(db, 'future_activities')
+            upcoming_df = activities_df[pd.to_datetime(activities_df['date']).dt.date >= date.today()].copy().head(10)
             if upcoming_df.empty:
                 st.info("No upcoming activities scheduled.")
             else:
                 for _, row in upcoming_df.iterrows():
-                    render_activity_card(row, db)
+                    render_activity_card(row, db, view_type='compact_list')
 
-    with tabs[5]: # History
-        st.subheader("📜 View & Edit Historical Data")
+    with tabs[5]:
+        st.subheader("View & Edit Historical Data")
         df = st.session_state.historical_df.copy()
         if not df.empty:
-            year = st.selectbox("Select Year:", sorted(df['date'].dt.year.unique(), reverse=True))
-            month_str = st.selectbox("Select Month:", sorted(df[df['date'].dt.year == year]['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True))
-            if month_str:
-                month = pd.to_datetime(month_str, format='%B').month
-                filtered_df = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
-                for _, row in filtered_df.iterrows():
-                    render_historical_record(row, db)
+            df['date'] = pd.to_datetime(df['date'])
+            all_years = sorted(df['date'].dt.year.unique(), reverse=True)
+            c1, c2 = st.columns(2)
+            sel_year = c1.selectbox("Select Year:", options=all_years)
+            
+            df_year = df[df['date'].dt.year == sel_year]
+            all_months = sorted(df_year['date'].dt.strftime('%B').unique(), key=lambda m: datetime.strptime(m, '%B').month, reverse=True)
+            sel_month_str = c2.selectbox("Select Month:", options=all_months)
+            sel_month_num = datetime.strptime(sel_month_str, '%B').month
+            
+            filtered_df = df[(df['date'].dt.year == sel_year) & (df['date'].dt.month == sel_month_num)].sort_values('date')
+            for _, row in filtered_df.iterrows():
+                render_historical_record(row, db)
