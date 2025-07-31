@@ -20,6 +20,7 @@ from firebase_admin import credentials, firestore
 import json
 import logging
 import matplotlib.pyplot as plt
+import inspect
 
 # --- Deep Learning Imports ---
 import torch
@@ -426,22 +427,8 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
 
 @st.cache_resource
 def train_and_forecast_xgboost(historical_df, periods, target_col, atv_forecast_df=None):
-    df_featured = historical_df.copy()
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
-    if target_col == 'customers':
-        features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
-    else:
-        features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-    features = [f for f in features if f in df_featured.columns]
-    X = df_featured[features].copy()
-    y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
-
-    if X.empty or len(X) < 50: return pd.DataFrame()
-
     params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
-    return _run_tree_model_forecast(xgb.XGBRegressor, params, df_featured, periods, target_col, atv_forecast_df)
+    return _run_tree_model_forecast(xgb.XGBRegressor, params, historical_df, periods, target_col, atv_forecast_df)
 
 @st.cache_resource
 def train_and_forecast_lightgbm(historical_df, periods, target_col, atv_forecast_df=None):
@@ -592,6 +579,8 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     return forecast_df
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
+
+# --- All other helper and UI functions are included below ---
 
 def plot_full_comparison_chart(hist, fcst, metrics, target_col):
     fig = go.Figure()
@@ -872,7 +861,7 @@ if db:
                             atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
                         
                         cust_f = pd.DataFrame()
-                        with st.spinner("Stacking Customer models and preparing explanations..."):
+                        with st.spinner("Stacking Customer models..."):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f, "tft": tft_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                             
