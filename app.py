@@ -381,63 +381,73 @@ def generate_day_by_day_forecast(historical_df, events_df, forecast_horizon=15):
 
     all_forecasts_cust = []
     all_forecasts_atv = []
+    
+    # --- FIX: Use a reliable list for day names ---
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
     # --- Step 2: Loop through each day of the week (0=Mon, 1=Tue, ..., 6=Sun) ---
     for dow in range(7):
-        day_name = pd.to_datetime(dow, format='%w').strftime('%A')
+        day_name = day_names[dow]
         
         with st.spinner(f"Analyzing and forecasting for all future {day_name}s..."):
-            # Filter data for the specific day of the week
-            df_dow = hist_df_with_atv[hist_df_with_atv['date'].dt.dayofweek == dow].copy()
-            
-            if len(df_dow) < 15:
-                st.warning(f"Skipping {day_name}s due to insufficient data (found {len(df_dow)}, need at least 15).")
-                continue
-
-            # Determine how many future occurrences of this day we need to forecast
-            today = pd.to_datetime('today').normalize()
-            days_until_next_dow = (dow - today.dayofweek + 7) % 7
-            first_forecast_date = today + timedelta(days=days_until_next_dow)
-            remaining_horizon = forecast_horizon - (first_forecast_date - today).days
-            periods_to_forecast = (remaining_horizon // 7) + 1
-
-            # --- Step 3: Forecast Customers for this DOW ---
-            xgb_params = {'objective': 'reg:squarederror', 'n_estimators': 500, 'learning_rate': 0.05, 'max_depth': 4, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
-            lgbm_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 500, 'verbosity': -1}
-            cat_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 500, 'verbose': 0}
-
-            cust_xgb_f, xgb_model_cust, X_cust = train_and_forecast_tree_model_dow(xgb.XGBRegressor, xgb_params, df_dow, periods_to_forecast, 'customers')
-            cust_lgbm_f, _, _ = train_and_forecast_tree_model_dow(lgb.LGBMRegressor, lgbm_params, df_dow, periods_to_forecast, 'customers')
-            cust_cat_f, _, _ = train_and_forecast_tree_model_dow(cat.CatBoostRegressor, cat_params, df_dow, periods_to_forecast, 'customers', is_catboost=True)
-            
-            # Ensemble the customer forecasts for this DOW
-            if not cust_xgb_f.empty:
-                cust_ensemble_f = cust_xgb_f.copy()
-                cust_ensemble_f['yhat'] = (cust_xgb_f['yhat'] + cust_lgbm_f['yhat'] + cust_cat_f['yhat']) / 3
-                all_forecasts_cust.append(cust_ensemble_f)
+            try:
+                # Filter data for the specific day of the week
+                df_dow = hist_df_with_atv[hist_df_with_atv['date'].dt.dayofweek == dow].copy()
                 
-                # Store model and features for SHAP analysis
-                if xgb_model_cust and not X_cust.empty:
-                    st.session_state.model_store[dow] = xgb_model_cust
-                    st.session_state.feature_store[dow] = X_cust
-                    try:
-                        explainer = shap.TreeExplainer(xgb_model_cust)
-                        shap_values = explainer(X_cust)
-                        st.session_state.shap_values_store[dow] = shap_values
-                    except Exception as e:
-                        st.warning(f"Could not generate SHAP values for {day_name}s: {e}")
+                if len(df_dow) < 15:
+                    st.warning(f"Skipping {day_name}s due to insufficient data (found {len(df_dow)}, need at least 15).")
+                    continue
 
+                # Determine how many future occurrences of this day we need to forecast
+                today = pd.to_datetime('today').normalize()
+                days_until_next_dow = (dow - today.dayofweek + 7) % 7
+                first_forecast_date = today + timedelta(days=days_until_next_dow)
+                if days_until_next_dow == 0 and today.hour > 1: # If it's today, forecast for next week
+                     first_forecast_date += timedelta(days=7)
+                
+                remaining_horizon = forecast_horizon - (first_forecast_date - today).days
+                periods_to_forecast = (remaining_horizon // 7) + 1
 
-            # --- Step 4: Forecast ATV for this DOW ---
-            atv_xgb_f, _, _ = train_and_forecast_tree_model_dow(xgb.XGBRegressor, xgb_params, df_dow, periods_to_forecast, 'atv')
-            atv_lgbm_f, _, _ = train_and_forecast_tree_model_dow(lgb.LGBMRegressor, lgbm_params, df_dow, periods_to_forecast, 'atv')
-            atv_cat_f, _, _ = train_and_forecast_tree_model_dow(cat.CatBoostRegressor, cat_params, df_dow, periods_to_forecast, 'atv', is_catboost=True)
+                # --- Step 3: Forecast Customers for this DOW ---
+                xgb_params = {'objective': 'reg:squarederror', 'n_estimators': 500, 'learning_rate': 0.05, 'max_depth': 4, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
+                lgbm_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 500, 'verbosity': -1}
+                cat_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 500, 'verbose': 0}
 
-            # Ensemble the ATV forecasts for this DOW
-            if not atv_xgb_f.empty:
-                atv_ensemble_f = atv_xgb_f.copy()
-                atv_ensemble_f['yhat'] = (atv_xgb_f['yhat'] + atv_lgbm_f['yhat'] + atv_cat_f['yhat']) / 3
-                all_forecasts_atv.append(atv_ensemble_f)
+                cust_xgb_f, xgb_model_cust, X_cust = train_and_forecast_tree_model_dow(xgb.XGBRegressor, xgb_params, df_dow, periods_to_forecast, 'customers')
+                cust_lgbm_f, _, _ = train_and_forecast_tree_model_dow(lgb.LGBMRegressor, lgbm_params, df_dow, periods_to_forecast, 'customers')
+                cust_cat_f, _, _ = train_and_forecast_tree_model_dow(cat.CatBoostRegressor, cat_params, df_dow, periods_to_forecast, 'customers', is_catboost=True)
+                
+                # Ensemble the customer forecasts for this DOW
+                if not cust_xgb_f.empty and not cust_lgbm_f.empty and not cust_cat_f.empty:
+                    cust_ensemble_f = cust_xgb_f.copy()
+                    cust_ensemble_f['yhat'] = (cust_xgb_f['yhat'] + cust_lgbm_f['yhat'] + cust_cat_f['yhat']) / 3
+                    all_forecasts_cust.append(cust_ensemble_f)
+                    
+                    # Store model and features for SHAP analysis
+                    if xgb_model_cust and not X_cust.empty:
+                        st.session_state.model_store[dow] = xgb_model_cust
+                        st.session_state.feature_store[dow] = X_cust
+                        try:
+                            explainer = shap.TreeExplainer(xgb_model_cust)
+                            shap_values = explainer(X_cust)
+                            st.session_state.shap_values_store[dow] = shap_values
+                        except Exception as e:
+                            st.warning(f"Could not generate SHAP values for {day_name}s: {e}")
+
+                # --- Step 4: Forecast ATV for this DOW ---
+                atv_xgb_f, _, _ = train_and_forecast_tree_model_dow(xgb.XGBRegressor, xgb_params, df_dow, periods_to_forecast, 'atv')
+                atv_lgbm_f, _, _ = train_and_forecast_tree_model_dow(lgb.LGBMRegressor, lgbm_params, df_dow, periods_to_forecast, 'atv')
+                atv_cat_f, _, _ = train_and_forecast_tree_model_dow(cat.CatBoostRegressor, cat_params, df_dow, periods_to_forecast, 'atv', is_catboost=True)
+
+                # Ensemble the ATV forecasts for this DOW
+                if not atv_xgb_f.empty and not atv_lgbm_f.empty and not atv_cat_f.empty:
+                    atv_ensemble_f = atv_xgb_f.copy()
+                    atv_ensemble_f['yhat'] = (atv_xgb_f['yhat'] + atv_lgbm_f['yhat'] + atv_cat_f['yhat']) / 3
+                    all_forecasts_atv.append(atv_ensemble_f)
+            
+            except Exception as e:
+                st.error(f"Failed to generate forecast for {day_name}s. Error: {e}")
+                continue
 
     # --- Step 5: Combine all DOW forecasts into a single timeline ---
     if not all_forecasts_cust or not all_forecasts_atv:
