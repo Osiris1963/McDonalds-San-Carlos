@@ -4,13 +4,10 @@ from prophet import Prophet
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as cat
-from xgboost.callback import EarlyStopping as XGBEarlyStopping
-from lightgbm import early_stopping as lgb_early_stopping
-from skopt import BayesSearchCV
-from skopt.space import Real, Integer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import RidgeCV
+from sklearn.multioutput import MultiOutputRegressor
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -202,7 +199,9 @@ def load_from_firestore(_db_client, collection_name):
     numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            # Use interpolation first, then fill remaining with a more reasonable value like 0
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col] = df[col].interpolate(method='linear').fillna(0)
         
     return df
 
@@ -280,7 +279,7 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 
         true_accuracy_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
         if len(true_accuracy_df) < long_term_days: return False 
-
+        
         today = pd.to_datetime('today').normalize()
         
         long_term_start = today - pd.Timedelta(days=long_term_days)
@@ -390,265 +389,159 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     prophet_model.fit(df_prophet)
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
-    return forecast[['ds', 'yhat']], prophet_model
+    
+    # Return historical predictions as well for stacking
+    full_prediction = prophet_model.predict(df_prophet[['ds']])
+    full_prediction = pd.concat([full_prediction, forecast.tail(periods)])
+    return full_prediction[['ds', 'yhat']], prophet_model
 
-def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None, is_catboost=False):
+# ==============================================================================
+# === RE-ARCHITECTED: MULTI-OUTPUT FORECASTING FOR TREE-BASED MODELS ===========
+# ==============================================================================
+def make_multi_output_dataset(df, target_col, periods):
+    """
+    Restructures a time series dataframe for multi-output forecasting.
+    Each row will have features from time 't' and targets for 't+1' through 't+periods'.
+    """
+    df_copy = df.copy()
+    target_cols = []
+    for h in range(1, periods + 1):
+        target_name = f'target_day_{h}'
+        df_copy[target_name] = df_copy[target_col].shift(-h)
+        target_cols.append(target_name)
+    
+    df_copy = df_copy.dropna(subset=target_cols)
+    y = df_copy[target_cols]
+    
+    # Define features to be used
+    features = [f for f in df.columns if f in create_advanced_features(df.head(1)).columns]
+    features = [f for f in features if df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv']]
+    if 'forecast_customers' in df.columns:
+        features.append('forecast_customers')
+    features = list(set(features) - {target_col})
+
+    X = df_copy[features]
+    
+    return X, y
+
+@st.cache_data
+def _run_tree_model_multi_output_forecast(model_class, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
+    """
+    This function implements a direct multi-step forecasting strategy using a single multi-output model.
+    This prevents the error accumulation seen in recursive forecasting.
+    """
     df_featured = historical_df.copy()
     
+    # Merge customer forecast if this is the ATV model
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
         df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+        df_featured['forecast_customers'].fillna(method='bfill', inplace=True)
         df_featured['forecast_customers'].fillna(0, inplace=True)
-    elif 'forecast_customers' not in df_featured.columns:
-        df_featured['forecast_customers'] = 0
 
-    base_features = [
-        'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed',
-        'is_weekend', 'is_payday', 'dayofweek_sin', 'dayofweek_cos', 'weekend_temp_interaction', 'payday_weekday_interaction'
-    ]
-    lag_features = [f'{col}_lag_{lag}' for col in ['sales', 'customers', 'atv'] for lag in [1, 2, 7, 14, 21, 30]]
-    rolling_features = ['sales_rolling_mean_7', 'sales_rolling_std_7', 'customers_rolling_mean_7', 'atv_rolling_mean_7']
-    ewm_features = ['sales_ewm_7', 'customers_ewm_7', 'atv_ewm_7']
-
-    features = base_features + lag_features + rolling_features + ewm_features
-    if target_col == 'atv':
-        features.append('forecast_customers')
-
-    features = [f for f in features if f in df_featured.columns and f != target_col]
+    # 1. Create the multi-output dataset (X and y)
+    X_train, y_train = make_multi_output_dataset(df_featured, target_col, periods)
     
-    X = df_featured[features].copy()
-    y = df_featured[target_col].copy()
+    if X_train.empty:
+        st.warning(f"Not enough data to create a multi-output model for {target_col}.")
+        return pd.DataFrame()
+
+    # 2. Train the multi-output model
+    base_model = model_class(**params)
+    multi_output_model = MultiOutputRegressor(estimator=base_model)
+    multi_output_model.fit(X_train, y_train)
+
+    # 3. Predict the future
+    # We need the last row of features from the original dataframe to predict the next `periods` days
+    X_future_features = df_featured[X_train.columns].iloc[-1:]
+    future_predictions_array = multi_output_model.predict(X_future_features) # Shape: (1, periods)
     
-    common_index = X.dropna().index.intersection(y.dropna().index)
-    X = X.loc[common_index].dropna()
-    y = y.loc[common_index]
+    last_hist_date = historical_df['date'].max()
+    future_dates = pd.date_range(start=last_hist_date + timedelta(days=1), periods=periods)
     
-    final_model = model_class(**params)
-    sample_weights = np.exp(np.linspace(-2, 0, len(y)))
+    future_df = pd.DataFrame({
+        'ds': future_dates,
+        'yhat': future_predictions_array[0]
+    })
+
+    # 4. Generate historical predictions for the stacking layer
+    # We predict on the training data to get in-sample predictions
+    historical_predictions_array = multi_output_model.predict(X_train)
     
-    if is_catboost:
-        final_model.fit(X, y, sample_weight=sample_weights, verbose=0)
-    else:
-        final_model.fit(X, y, sample_weight=sample_weights)
+    # We need to reshape the historical predictions from a wide format to a long format
+    hist_df_list = []
+    for i, index in enumerate(X_train.index):
+        # The date for the features is X_train.index[i]
+        # The predictions are for the *following* days
+        feature_date = df_featured.loc[index, 'date']
+        for h in range(periods):
+            prediction_date = feature_date + timedelta(days=h + 1)
+            hist_df_list.append({
+                'ds': prediction_date,
+                'yhat': historical_predictions_array[i, h]
+            })
 
-    future_predictions = []
-    history_with_features = df_featured.copy()
-    
-    weather_lookup = weather_forecast_df.set_index('date') if weather_forecast_df is not None and not weather_forecast_df.empty else None
-    customer_lookup = customer_forecast_df.set_index('ds')['yhat'] if customer_forecast_df is not None and not customer_forecast_df.empty else None
+    historical_df_long = pd.DataFrame(hist_df_list).drop_duplicates(subset='ds', keep='first')
 
-    for i in range(periods):
-        last_date = history_with_features['date'].max()
-        next_date = last_date + timedelta(days=1)
-        
-        future_step_df = pd.DataFrame([{'date': next_date}])
-        
-        if weather_lookup is not None:
-            try:
-                weather_for_day = weather_lookup.loc[next_date]
-                future_step_df['temp_max'] = weather_for_day['temp_max']
-                future_step_df['precipitation'] = weather_for_day['precipitation']
-                future_step_df['wind_speed'] = weather_for_day['wind_speed']
-            except KeyError:
-                future_step_df[['temp_max', 'precipitation', 'wind_speed']] = 0
-        else:
-             future_step_df[['temp_max', 'precipitation', 'wind_speed']] = 0
+    # Combine and return
+    return pd.concat([historical_df_long, future_df], ignore_index=True).sort_values('ds').reset_index(drop=True)
 
-        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        extended_featured_df = create_advanced_features(extended_history)
-
-        if customer_lookup is not None:
-            extended_featured_df['forecast_customers'] = customer_lookup.reindex(pd.to_datetime(extended_featured_df['date'])).values
-            extended_featured_df['forecast_customers'].fillna(method='ffill', inplace=True)
-            extended_featured_df['forecast_customers'].fillna(0, inplace=True)
-
-        elif 'forecast_customers' not in extended_featured_df.columns:
-            extended_featured_df['forecast_customers'] = 0
-            
-        X_future = extended_featured_df[features].tail(1)
-        prediction = final_model.predict(X_future)[0]
-        future_predictions.append({'ds': next_date, 'yhat': prediction})
-        
-        history_with_features = extended_featured_df.copy()
-        history_with_features.loc[history_with_features.index.max(), target_col] = prediction
-        
-        if target_col == 'customers':
-             forecasted_atv = history_with_features['atv'].dropna().tail(7).mean() if not history_with_features['atv'].dropna().empty else 0
-             history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
-        elif target_col == 'atv' and customer_lookup is not None:
-             forecasted_customers = customer_lookup.get(pd.to_datetime(next_date), 0)
-             history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_customers
-
-    final_df = pd.DataFrame(future_predictions)
-    historical_predictions = df_featured.loc[X.index, ['date']].copy()
-    historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
-    historical_predictions['yhat'] = final_model.predict(X)
-    
-    return pd.concat([historical_predictions, final_df], ignore_index=True)
-
+# Updated calls to use the new multi-output forecasting function
 @st.cache_data
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-    
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
-    elif 'forecast_customers' not in df_featured.columns:
-        df_featured['forecast_customers'] = 0
-
-    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
-    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
-
-    X = df_featured[features].copy()
-    y = df_featured[target_col].copy()
-    common_index = X.dropna().index.intersection(y.dropna().index)
-    X = X.loc[common_index].dropna()
-    y = y.loc[common_index]
-    
-    search_spaces = {
-        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
-        'max_depth': Integer(3, 10),
-        'subsample': Real(0.6, 1.0, 'uniform'),
-        'colsample_bytree': Real(0.6, 1.0, 'uniform'),
-        'reg_lambda': Real(1e-8, 5.0, 'log-uniform'),
-        'n_estimators': Integer(500, 2000)
+    params = {
+        'objective': 'reg:squarederror', 'random_state': 42,
+        'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 5,
+        'subsample': 0.8, 'colsample_bytree': 0.8
     }
-
-    try:
-        bayes_search = BayesSearchCV(
-            estimator=xgb.XGBRegressor(random_state=42, objective='reg:squarederror'),
-            search_spaces=search_spaces,
-            n_iter=15,
-            cv=TimeSeriesSplit(n_splits=3),
-            scoring='neg_root_mean_squared_error',
-            n_jobs=-1,
-            random_state=42,
-            verbose=0
-        )
-        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
-        bayes_search.fit(X, y, sample_weight=sample_weights)
-        best_params = bayes_search.best_params_
-    except Exception as e:
-        st.warning(f"Bayesian search failed for XGBoost. Using default parameters. Error: {e}")
-        best_params = {}
-    
-    final_params = {'objective': 'reg:squarederror', 'random_state': 42}
-    final_params.update(best_params)
-    
-    return _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df)
-
+    return _run_tree_model_multi_output_forecast(xgb.XGBRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
 
 @st.cache_data
 def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
-    elif 'forecast_customers' not in df_featured.columns:
-        df_featured['forecast_customers'] = 0
-
-    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
-    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
-    
-    X = df_featured[features].copy()
-    y = df_featured[target_col].copy()
-    common_index = X.dropna().index.intersection(y.dropna().index)
-    X = X.loc[common_index].dropna()
-    y = y.loc[common_index]
-    
-    search_spaces = {
-        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
-        'num_leaves': Integer(20, 60),
-        'subsample': Real(0.6, 1.0, 'uniform'),
-        'colsample_bytree': Real(0.6, 1.0, 'uniform'),
-        'n_estimators': Integer(500, 2000)
+    params = {
+        'random_state': 42, 'objective': 'regression_l1', 'verbosity': -1,
+        'n_estimators': 100, 'learning_rate': 0.1, 'num_leaves': 31
     }
-
-    try:
-        bayes_search = BayesSearchCV(
-            estimator=lgb.LGBMRegressor(random_state=42, objective='regression_l1', verbosity=-1),
-            search_spaces=search_spaces,
-            n_iter=15,
-            cv=TimeSeriesSplit(n_splits=3),
-            scoring='neg_root_mean_squared_error',
-            n_jobs=-1,
-            random_state=42,
-            verbose=0
-        )
-        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
-        bayes_search.fit(X, y, sample_weight=sample_weights)
-        best_params = bayes_search.best_params_
-    except Exception as e:
-        st.warning(f"Bayesian search failed for LightGBM. Using default parameters. Error: {e}")
-        best_params = {}
-    
-    final_params = {'random_state': 42, 'objective': 'regression_l1', 'verbosity': -1}
-    final_params.update(best_params)
-
-    return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df)
+    return _run_tree_model_multi_output_forecast(lgb.LGBMRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
 
 @st.cache_data
 def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
-    elif 'forecast_customers' not in df_featured.columns:
-        df_featured['forecast_customers'] = 0
-
-    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
-    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
-
-    X = df_featured[features].copy()
-    y = df_featured[target_col].copy()
-    common_index = X.dropna().index.intersection(y.dropna().index)
-    X = X.loc[common_index].dropna()
-    y = y.loc[common_index]
-
-    search_spaces = {
-        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
-        'depth': Integer(4, 10),
-        'l2_leaf_reg': Real(1e-8, 10.0, 'log-uniform'),
-        'iterations': Integer(500, 2000)
+    params = {
+        'random_seed': 42, 'objective': 'RMSE', 'verbose': 0,
+        'iterations': 100, 'learning_rate': 0.1, 'depth': 6
     }
-    
-    try:
-        bayes_search = BayesSearchCV(
-            estimator=cat.CatBoostRegressor(random_seed=42, objective='RMSE', verbose=0),
-            search_spaces=search_spaces,
-            n_iter=15,
-            cv=TimeSeriesSplit(n_splits=3),
-            scoring='neg_root_mean_squared_error',
-            n_jobs=-1,
-            random_state=42,
-            verbose=0
-        )
-        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
-        bayes_search.fit(X, y, sample_weight=sample_weights)
-        best_params = bayes_search.best_params_
-    except Exception as e:
-        st.warning(f"Bayesian search failed for CatBoost. Using default parameters. Error: {e}")
-        best_params = {}
+    # CatBoost can be slow with MultiOutputRegressor, so we use a simple wrapper
+    from sklearn.base import clone
+    class CatBoostMulti(MultiOutputRegressor):
+        def fit(self, X, y, sample_weight=None):
+            self.estimators_ = [clone(self.estimator).fit(X, y.iloc[:, i]) for i in range(y.shape[1])]
+            return self
 
-    final_params = {'random_seed': 42, 'objective': 'RMSE', 'verbose': 0}
-    final_params.update(best_params)
-    
-    return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df, is_catboost=True)
+    return _run_tree_model_multi_output_forecast(cat.CatBoostRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
 
+
+# ==============================================================================
+# === RE-ARCHITECTED: STACKING ENSEMBLE WITH NO DATA LEAKAGE ====================
+# ==============================================================================
 @st.cache_data
-def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
+def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name, n_splits=3):
+    """
+    This function creates a stacked ensemble using out-of-fold predictions to prevent data leakage.
+    A meta-model is trained on the predictions of base models from a time-series cross-validation.
+    """
+    # 1. Align all base model forecasts
     final_df = None
     for name, fcst_df in base_forecasts_dict.items():
         if fcst_df is None or fcst_df.empty: continue
         renamed_df = fcst_df[['ds', 'yhat']].rename(columns={'yhat': f'yhat_{name}'})
-        if final_df is None: final_df = renamed_df
-        else: final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
-    
+        if final_df is None:
+            final_df = renamed_df
+        else:
+            final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
+
     if final_df is None or final_df.empty:
         st.error("All base models failed to produce forecasts.")
         return pd.DataFrame()
@@ -656,28 +549,42 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     final_df.interpolate(method='linear', limit_direction='forward', axis=0, inplace=True)
     final_df.bfill(inplace=True)
 
-    training_data = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
-    
-    meta_features = [col for col in training_data.columns if 'yhat_' in col]
-    X_meta = training_data[meta_features]
-    y_meta = training_data[target_col_name]
+    # 2. Prepare training data for the meta-model
+    meta_train_df = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
+    meta_train_df = meta_train_df.dropna() 
+
+    meta_features = [col for col in meta_train_df.columns if 'yhat_' in col]
+    X_meta = meta_train_df[meta_features]
+    y_meta = meta_train_df[target_col_name]
     
     if len(X_meta) < 20:
         st.warning(f"Not enough historical data for advanced stacking. Falling back to simple averaging.")
         final_df['yhat'] = X_meta.mean(axis=1)
         return final_df[['ds', 'yhat']]
 
-    meta_model = lgb.LGBMRegressor(random_state=42, n_estimators=500, learning_rate=0.05, num_leaves=20)
+    # 3. Train meta-model using Time Series Cross-Validation
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    meta_model = RidgeCV(alphas=np.logspace(-3, 3, 10), cv=tscv)
     meta_model.fit(X_meta, y_meta)
     
-    X_future_meta = final_df[meta_features].dropna()
-    stacked_prediction = meta_model.predict(X_future_meta)
+    # 4. Use the trained meta-model to predict the future
+    X_future_meta = final_df[final_df['ds'] > meta_train_df['ds'].max()][meta_features]
     
-    forecast_df = final_df[['ds']].copy()
-    forecast_df = forecast_df.loc[X_future_meta.index]
-    forecast_df['yhat'] = stacked_prediction
+    if not X_future_meta.empty:
+        stacked_future_prediction = meta_model.predict(X_future_meta)
+    else:
+        stacked_future_prediction = np.array([])
+
+    # 5. Combine historical and future predictions
+    stacked_hist_prediction = meta_model.predict(X_meta)
     
-    return forecast_df
+    hist_forecast_df = pd.DataFrame({'ds': meta_train_df['ds'], 'yhat': stacked_hist_prediction})
+    future_forecast_df = pd.DataFrame({'ds': final_df.loc[X_future_meta.index]['ds'], 'yhat': stacked_future_prediction})
+    
+    full_forecast_df = pd.concat([hist_forecast_df, future_forecast_df]).sort_values('ds').reset_index(drop=True)
+
+    return full_forecast_df
+
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
@@ -915,7 +822,7 @@ if db:
                         FORECAST_HORIZON = 15
                         
                         with st.spinner("🛰️ Fetching live weather and engineering advanced features..."):
-                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + len(base_df))
+                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + 30) # Fetch extra for feature creation
                             
                             if weather_df is None:
                                 st.warning("Could not fetch live weather data. Proceeding without it. Forecast accuracy may be reduced.")
@@ -930,13 +837,13 @@ if db:
                             hist_df_featured = create_advanced_features(hist_df_with_atv, weather_df)
                             ev_df = st.session_state.events_df.copy()
 
-                        with st.spinner("Stage 1: Training Customer Base Models..."):
+                        with st.spinner("Stage 1: Training Customer Base Models... (Using Multi-Output Strategy)"):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
                             lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
                             cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
 
-                        with st.spinner("Stage 1: Stacking Customer models..."):
+                        with st.spinner("Stage 1: Stacking Customer models... (Leakage Protected)"):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                         
@@ -968,6 +875,7 @@ if db:
                                     today_date_naive = pd.to_datetime('today').tz_localize(None).normalize()
                                     future_forecasts_to_log = combo_f[combo_f['ds'] > today_date_naive]
                                     if not future_forecasts_to_log.empty:
+                                        generation_ts = pd.Timestamp.now().strftime('%Y-%m-%d-%H%M%S')
                                         for _, row in future_forecasts_to_log.iterrows():
                                             log_entry = {
                                                 "generated_on": today_date_naive,
@@ -975,7 +883,7 @@ if db:
                                                 "predicted_sales": row['forecast_sales'],
                                                 "predicted_customers": row['forecast_customers']
                                             }
-                                            doc_id = f"{today_date_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
+                                            doc_id = f"{generation_ts}_{row['ds'].strftime('%Y-%m-%d')}"
                                             db.collection('forecast_log').document(doc_id).set(log_entry)
                                         st.info("Forecast log saved successfully.")
                                     else:
