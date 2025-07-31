@@ -353,13 +353,16 @@ def create_dynamic_event_features(df, holidays_df):
     # Bridge Holidays (a weekday between a weekend and a holiday)
     df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
     df['is_holiday_today'] = df['date'].isin(holiday_dates).astype(int)
-    df['is_holiday_tomorrow'] = df['date'].apply(lambda x: (x + timedelta(days=1)) in holiday_dates).astype(int)
-    df['is_holiday_yesterday'] = df['date'].apply(lambda x: (x - timedelta(days=1)) in holiday_dates).astype(int)
+    
+    # Shift requires a sorted index to work correctly
+    df = df.sort_values('date').reset_index(drop=True)
+    is_holiday_tomorrow = df['date'].apply(lambda x: (x + timedelta(days=1)) in holiday_dates)
+    is_holiday_yesterday = df['date'].apply(lambda x: (x - timedelta(days=1)) in holiday_dates)
 
-    # Flag Friday before a Monday holiday, or Tuesday after a Thursday holiday
+    # Flag Friday before a Monday holiday, or Monday after a Friday holiday
     df['is_bridge_holiday'] = (
-        ((df['dayofweek'] == 4) & (df['is_holiday_tomorrow'].shift(-1).fillna(0).astype(bool))) | # Friday before Sat/Sun, Mon holiday
-        ((df['dayofweek'] == 0) & (df['is_holiday_yesterday'].shift(1).fillna(0).astype(bool)))   # Monday after Fri holiday, Sat/Sun
+        ((df['dayofweek'] == 4) & (is_holiday_tomorrow.shift(-2).fillna(False))) | # Friday before a Monday holiday
+        ((df['dayofweek'] == 0) & (is_holiday_yesterday.shift(2).fillna(False)))   # Monday after a Friday holiday
     ).astype(int)
     
     return df
@@ -393,7 +396,6 @@ def create_advanced_features(df, holidays_df):
 
     # ENHANCED: Weather features
     if 'weather' in df.columns:
-        # One-hot encode weather for interactions and lags
         weather_dummies = pd.get_dummies(df['weather'], prefix='weather').astype(int)
         df = pd.concat([df, weather_dummies], axis=1)
         if 'weather_Rainy' in df.columns:
@@ -444,7 +446,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, holidays_df, is_catboost=False):
     df_featured = historical_df.copy()
     
-    # ENHANCED: Add new features to the feature list
     base_features = [
         'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier',
         'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday',
@@ -455,15 +456,18 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
     
-    # Add weather dummies to features if they exist
-    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    # BUG FIX: Select only the one-hot-encoded weather columns, not the original text column
+    weather_cols = [col for col in df_featured.columns if col.startswith('weather_')]
     features.extend(weather_cols)
     
-    features = [f for f in features if f in df_featured.columns] # Keep only existing features
+    features = [f for f in features if f in df_featured.columns and f in df_featured] 
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
+    
+    # Align X and y after potential row drops from feature creation
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index]
+    y = y.loc[common_index]
     
     final_model = model_class(**params)
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
@@ -510,20 +514,24 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_forecast_df, holidays_df):
     df_featured = historical_df.copy()
     
-    # ENHANCED: Define feature set
+    # Define feature set
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier', 'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday', 'weather_rainy_lag_1', 'rainy_weekend_interaction']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    
+    # BUG FIX: Select only the one-hot-encoded weather columns
+    weather_cols = [col for col in df_featured.columns if col.startswith('weather_')]
     features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
+    
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index]
+    y = y.loc[common_index]
     X_dates = df_featured.loc[X.index, 'date']
 
     if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
@@ -599,14 +607,18 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_fo
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    
+    # BUG FIX: Select only the one-hot-encoded weather columns
+    weather_cols = [col for col in df_featured.columns if col.startswith('weather_')]
     features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
+    
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index]
+    y = y.loc[common_index]
 
     if X.empty or len(X) < 50: return pd.DataFrame()
 
@@ -651,14 +663,18 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    
+    # BUG FIX: Select only the one-hot-encoded weather columns
+    weather_cols = [col for col in df_featured.columns if col.startswith('weather_')]
     features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
+
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index]
+    y = y.loc[common_index]
 
     if X.empty or len(X) < 50: return pd.DataFrame()
 
