@@ -11,6 +11,3 @@ xgboost==2.1.4
 lightgbm==4.4.0
 catboost==1.2.5
 matplotlib==3.9.0
-torch==2.1.2
-pytorch-lightning==1.9.5
-pytorch-forecasting==1.0.0
