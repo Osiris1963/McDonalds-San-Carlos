@@ -4,7 +4,6 @@ from prophet import Prophet
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as cat
-from xgboost.callback import EarlyStopping as XGBEarlyStopping
 from lightgbm import early_stopping as lgb_early_stopping
 import optuna
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -22,9 +21,6 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import json
 import logging
-import shap
-import matplotlib.pyplot as plt
-import inspect
 
 # --- Suppress informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -193,7 +189,7 @@ def initialize_state_firestore(db_client):
         'forecast_df': pd.DataFrame(), 'metrics': {}, 'name': "Store 688",
         'authentication_status': True, 'access_level': 1, 'username': "Admin",
         'forecast_components': pd.DataFrame(), 'migration_done': False, 'show_recent_entries': False,
-        'show_all_activities': False, 'shap_values_cust': {}, 'X_cust': {}, 'day_models': {}
+        'show_all_activities': False,
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -330,7 +326,6 @@ def create_day_specific_features(df, target_col):
     df['quarter'] = df['date'].dt.quarter
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     df['dayofyear'] = df['date'].dt.dayofyear
-    df['is_not_normal_day'] = df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
     
     return df
 
@@ -359,15 +354,14 @@ def train_and_forecast_prophet(_historical_df, _events_df, periods, target_col):
 def train_day_specific_tree_model(model_name, _df_day, target_col, periods):
     df_featured = create_day_specific_features(_df_day.copy(), target_col)
     
-    features = [col for col in df_featured.columns if col not in ['date', 'doc_id', 'sales', 'customers', 'atv', 'base_sales', 'add_on_sales', 'day_type', 'day_type_notes', 'weather']]
+    features = [col for col in df_featured.columns if col not in ['date', 'doc_id', 'sales', 'customers', 'atv', 'base_sales', 'add_on_sales', 'weather']]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     
     X.dropna(inplace=True); y = y[X.index]
-    if X.empty or len(X) < 10: return pd.DataFrame(), None, pd.DataFrame() # Not enough data for this day of the week
+    if X.empty or len(X) < 10: return pd.DataFrame()
 
-    # Using pre-defined robust parameters instead of running Optuna for 14 different models to speed up generation
     params = {
         'xgb': {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42},
         'lgbm': {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000, 'verbosity': -1, 'learning_rate': 0.05, 'num_leaves': 31},
@@ -377,15 +371,14 @@ def train_day_specific_tree_model(model_name, _df_day, target_col, periods):
     model_map = {'xgb': xgb.XGBRegressor, 'lgbm': lgb.LGBMRegressor, 'cat': cat.CatBoostRegressor}
     model = model_map[model_name](**params[model_name])
 
-    sample_weights = np.exp(np.linspace(-1, 0, len(y))) # Weight recent samples more
+    sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     model.fit(X, y, sample_weight=sample_weights)
     
-    # Create future dataframe
     future_predictions = []
     history_copy = df_featured.copy()
     for i in range(periods):
         last_date = history_copy['date'].max()
-        next_date = last_date + timedelta(days=7) # Predict for the same day next week
+        next_date = last_date + timedelta(days=7)
         
         future_step_df = pd.DataFrame([{'date': next_date}])
         extended_history = pd.concat([history_copy, future_step_df], ignore_index=True)
@@ -401,7 +394,7 @@ def train_day_specific_tree_model(model_name, _df_day, target_col, periods):
     historical_preds = pd.DataFrame({'ds': df_featured.loc[X.index, 'date'], 'yhat': model.predict(X)})
     future_preds = pd.DataFrame(future_predictions)
 
-    return pd.concat([historical_preds, future_preds], ignore_index=True), model, X
+    return pd.concat([historical_preds, future_preds], ignore_index=True)
 
 @st.cache_resource
 def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
@@ -537,20 +530,17 @@ def render_activity_card(row, db_client, view_type='compact_list'):
 def render_historical_record(row, db_client):
     date_str = row['date'].strftime('%B %d, %Y')
     with st.expander(f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"):
-        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f} | **Weather:** {row.get('weather', 'N/A')} | **Day Type:** {row.get('day_type', 'Normal Day')}")
-        if row.get('day_type') == 'Not Normal Day': st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
+        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f} | **Weather:** {row.get('weather', 'N/A')}")
 
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             st.markdown("**Edit Record**")
             c1, c2 = st.columns(2)
             updated_sales = c1.number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"s_{row['doc_id']}")
             updated_customers = c2.number_input("Customers", value=int(row.get('customers', 0)), key=f"c_{row['doc_id']}")
-            updated_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], index=["Normal Day", "Not Normal Day"].index(row.get('day_type', 'Normal Day')), key=f"dt_{row['doc_id']}")
-            updated_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"n_{row['doc_id']}")
             
             b1, b2 = st.columns(2)
             if b1.form_submit_button("💾 Update Record", use_container_width=True):
-                update_data = { 'sales': updated_sales, 'customers': updated_customers, 'day_type': updated_day_type, 'day_type_notes': updated_notes if updated_day_type == 'Not Normal Day' else '' }
+                update_data = { 'sales': updated_sales, 'customers': updated_customers }
                 update_historical_record_in_firestore(db_client, row['doc_id'], update_data)
                 st.success(f"Record for {date_str} updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
 
@@ -597,36 +587,23 @@ if db:
                         # --- Day-Specific Tree Models ---
                         all_atv_forecasts = {'prophet': prophet_atv_f}
                         all_cust_forecasts = {'prophet': prophet_cust_f}
-                        day_models_cust = {}; x_cust_data = {}; shap_values_cust_data = {}
-
+                        
                         df_by_day = [hist_df_atv[hist_df_atv['date'].dt.dayofweek == i] for i in range(7)]
                         
                         for model_name in ['xgb', 'lgbm', 'cat']:
                             with st.spinner(f"Training {model_name.upper()} day-specific models..."):
-                                atv_day_forecasts = []; cust_day_forecasts = []
+                                atv_day_forecasts = []
+                                cust_day_forecasts = []
                                 for i in range(7): # 0=Monday, 6=Sunday
                                     if len(df_by_day[i]) > 10:
-                                        fcst_atv, _, _ = train_day_specific_tree_model(model_name, df_by_day[i], 'atv', FORECAST_HORIZON)
-                                        fcst_cust, model_cust, X_cust = train_day_specific_tree_model(model_name, df_by_day[i], 'customers', FORECAST_HORIZON)
+                                        fcst_atv = train_day_specific_tree_model(model_name, df_by_day[i], 'atv', FORECAST_HORIZON)
+                                        fcst_cust = train_day_specific_tree_model(model_name, df_by_day[i], 'customers', FORECAST_HORIZON)
                                         atv_day_forecasts.append(fcst_atv)
                                         cust_day_forecasts.append(fcst_cust)
-                                        
-                                        if model_name == 'xgb' and model_cust is not None and not X_cust.empty:
-                                            day_models_cust[(i, 'xgb')] = model_cust
-                                            x_cust_data[(i, 'xgb')] = X_cust
-                                            try:
-                                                explainer = shap.TreeExplainer(model_cust)
-                                                shap_values_cust_data[(i, 'xgb')] = explainer(X_cust)
-                                            except Exception:
-                                                pass # Fail silently if SHAP fails for a specific model
 
                                 all_atv_forecasts[model_name] = pd.concat(atv_day_forecasts, ignore_index=True) if atv_day_forecasts else pd.DataFrame()
                                 all_cust_forecasts[model_name] = pd.concat(cust_day_forecasts, ignore_index=True) if cust_day_forecasts else pd.DataFrame()
 
-                        st.session_state.day_models = day_models_cust
-                        st.session_state.X_cust = x_cust_data
-                        st.session_state.shap_values_cust = shap_values_cust_data
-                        
                         # --- Stacking ---
                         with st.spinner("Stacking all models for final predictions..."):
                             atv_f = train_and_forecast_stacked_ensemble(all_atv_forecasts, hist_df_atv, 'atv')
@@ -684,6 +661,8 @@ if db:
     
     with tabs[1]:
         st.header("💡 Forecast Insights")
+        st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
+        
         if st.session_state.forecast_components.empty:
             st.info("Click 'Generate Forecast' to see prediction drivers.")
         else:
@@ -695,35 +674,12 @@ if db:
 
                 selected_date = st.selectbox("Select a day to analyze:", options=future_components['ds'], format_func=lambda d: d.strftime('%A, %B %d, %Y'))
                 
-                tab1, tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
-                with tab1:
-                    st.info("Shows foundational drivers from the Prophet model, like trend and seasonality.")
-                    fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.markdown("---"); st.subheader("Prophet Insight Summary")
-                    st.markdown(generate_insight_summary(day_data, selected_date))
-                with tab2:
-                    st.info("Shows how each feature contributed to the day-specific XGBoost model.")
-                    day_of_week = selected_date.dayofweek
-                    key = (day_of_week, 'xgb')
-                    if key not in st.session_state.shap_values_cust:
-                        st.warning("SHAP values not available for this day's XGBoost model. It may not have had enough data to train.")
-                    else:
-                        shap_values = st.session_state.shap_values_cust[key]
-                        X_data = st.session_state.X_cust[key]
-                        X_dates = st.session_state.historical_df[st.session_state.historical_df['date'].dt.dayofweek == day_of_week].loc[X_data.index, 'date']
-                        
-                        date_match_idx = X_dates[X_dates.dt.date == selected_date.date()].index.tolist()
-                        if date_match_idx:
-                            loc = X_data.index.get_loc(date_match_idx[0])
-                            st.markdown(f"##### SHAP Explanation for {selected_date.strftime('%A, %B %d')}")
-                            fig, ax = plt.subplots(); shap.waterfall_plot(shap_values[loc], show=False); st.pyplot(fig); plt.clf()
-                        else:
-                            st.error(f"Could not find historical feature data for {selected_date.strftime('%A, %B %d')} to generate a SHAP plot.")
-                        
-                        with st.expander("View Overall Feature Importance for this Day of the Week"):
-                            fig_summary, ax_summary = plt.subplots(); shap.summary_plot(shap_values.values, X_data, plot_type="bar", show=False); plt.tight_layout(); st.pyplot(fig_summary); plt.clf()
-            
+                fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
+                st.subheader("Prophet Insight Summary")
+                st.markdown(generate_insight_summary(day_data, selected_date))
+
     with tabs[2]:
         st.header("📈 Forecast Evaluator")
         st.info("Compares actual results against the forecast generated the day before.")
@@ -770,10 +726,8 @@ if db:
             c1, c2 = st.columns(2)
             new_sales=c1.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
             new_customers=c2.number_input("Customer Count",min_value=0)
-            new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Use 'Not Normal Day' for unexpected events.")
-            new_notes = st.text_area("Notes (if Not Normal Day)", "") if new_day_type == "Not Normal Day" else ""
             if st.form_submit_button("✅ Save Record"):
-                add_to_firestore(db, 'historical_data', { "date":new_date, "sales":new_sales, "customers":new_customers, "day_type": new_day_type, "day_type_notes": new_notes, "add_on_sales": 0, "weather": "Cloudy" }, st.session_state.historical_df)
+                add_to_firestore(db, 'historical_data', { "date":new_date, "sales":new_sales, "customers":new_customers, "add_on_sales": 0, "weather": "Cloudy" }, st.session_state.historical_df)
                 st.cache_data.clear(); st.success("Record added!"); time.sleep(1); st.rerun()
 
     with tabs[4]:
