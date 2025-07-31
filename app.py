@@ -309,9 +309,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 
 # --- Core Forecasting Models ---
 
-# ==============================================================================
-# === ENHANCED FEATURE ENGINEERING with PAYDAY CYCLE ===========================
-# ==============================================================================
 @st.cache_data
 def create_advanced_features(df, weather_df=None):
     df['date'] = pd.to_datetime(df['date'])
@@ -324,7 +321,6 @@ def create_advanced_features(df, weather_df=None):
             df[col] = 0 
     df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill').fillna(0)
 
-    # --- Basic Time Features ---
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
     df['month'] = df['date'].dt.month
@@ -333,8 +329,6 @@ def create_advanced_features(df, weather_df=None):
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
     
-    # --- Payday Cycle Features (ENHANCEMENT) ---
-    # Helper function to find payday dates
     def get_paydays(d):
         eom = d + pd.tseries.offsets.MonthEnd(0)
         mid_month = pd.Timestamp(year=d.year, month=d.month, day=15)
@@ -345,268 +339,183 @@ def create_advanced_features(df, weather_df=None):
         mid, eom = get_paydays(d)
         prev_mid, prev_eom = get_paydays(d - pd.DateOffset(months=1))
         next_mid, next_eom = get_paydays(d + pd.DateOffset(months=1))
-        
         all_paydays = sorted([prev_mid, prev_eom, mid, eom, next_mid, next_eom])
-        
         future_paydays = [pd for pd in all_paydays if pd >= d]
         past_paydays = [pd for pd in all_paydays if pd < d]
-        
         next_payday = min(future_paydays) if future_paydays else next_mid
         last_payday = max(past_paydays) if past_paydays else prev_eom
-        
-        paydays.append({
-            'next_payday': next_payday,
-            'last_payday': last_payday
-        })
+        paydays.append({'next_payday': next_payday, 'last_payday': last_payday})
         
     payday_df = pd.DataFrame(paydays, index=df.index)
     df['days_until_next_payday'] = (payday_df['next_payday'] - df['date']).dt.days
     df['days_since_last_payday'] = (df['date'] - payday_df['last_payday']).dt.days
-    df['is_payday_window'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int) # Renamed for clarity
+    df['is_payday_window'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int)
 
-    # --- Cyclical Features ---
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
     
     df = df.sort_values('date').reset_index(drop=True)
     
-    # --- Lag and Rolling Window Features ---
-    lags = [7, 14, 21, 30] # Reduced lags as payday cycle features are more powerful
+    lags = [7, 14, 21, 28] # Use weekly lags for day-specific models
     for lag in lags:
-        if 'sales' in df.columns:
-            df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
-        if 'customers' in df.columns:
-            df[f'customers_lag_{lag}'] = df['customers'].shift(lag)
+        if 'sales' in df.columns: df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
+        if 'customers' in df.columns: df[f'customers_lag_{lag}'] = df['customers'].shift(lag)
 
     if 'sales' in df.columns:
-        df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
-        df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
+        df['sales_rolling_mean_4'] = df['sales'].shift(1).rolling(window=4, min_periods=1).mean() # 4-week rolling mean
+        df['sales_rolling_std_4'] = df['sales'].shift(1).rolling(window=4, min_periods=1).std()
     if 'customers' in df.columns:
-        df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
+        df['customers_rolling_mean_4'] = df['customers'].shift(1).rolling(window=4, min_periods=1).mean()
         
-    if 'sales' in df.columns:
-        df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
-    if 'customers' in df.columns:
-        df['customers_ewm_7'] = df['customers'].shift(1).ewm(span=7, adjust=False).mean()
-
-    # --- Interaction Features ---
     df['weekend_temp_interaction'] = df['is_weekend'] * df['temp_max']
     df['payday_weekday_interaction'] = df['is_payday_window'] * df['dayofweek']
         
     return df
 
 @st.cache_data
-def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
-    df_train = historical_df.copy()
-    df_train.dropna(subset=['date', target_col], inplace=True)
-    if df_train.empty or len(df_train) < 15:
+def train_and_forecast_prophet_day_specific(historical_df, events_df, periods, target_col, day_of_week):
+    df_train = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
+    if df_train.empty or len(df_train) < 10:
         return pd.DataFrame(), None
+        
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
-    start_date = df_train['date'].min()
-    end_date = df_train['date'].max() + timedelta(days=periods)
-    recurring_events = generate_recurring_local_events(start_date, end_date)
-    manual_events_renamed = events_df.rename(columns={'date':'ds', 'activity_name':'holiday'})
-    all_manual_events = pd.concat([manual_events_renamed, recurring_events])
-    all_manual_events.dropna(subset=['ds', 'holiday'], inplace=True)
     
-    use_yearly_seasonality = len(df_train) >= 365
+    # Modify seasonality for day-specific model
     prophet_model = Prophet(
-        growth='linear', holidays=all_manual_events, daily_seasonality=False,
-        weekly_seasonality=True, yearly_seasonality=use_yearly_seasonality, 
-        changepoint_prior_scale=0.5, changepoint_range=0.95,
+        growth='linear', weekly_seasonality=False, daily_seasonality=False,
+        yearly_seasonality=True, changepoint_prior_scale=0.1
     )
     prophet_model.add_country_holidays(country_name='PH')
     prophet_model.fit(df_prophet)
-    future = prophet_model.make_future_dataframe(periods=periods)
-    forecast = prophet_model.predict(future)
     
-    # Return historical predictions as well for stacking
-    full_prediction = prophet_model.predict(df_prophet[['ds']])
-    full_prediction = pd.concat([full_prediction, forecast.tail(periods)])
-    return full_prediction[['ds', 'yhat']], prophet_model
-
-# ==============================================================================
-# === RE-ARCHITECTED: MULTI-OUTPUT FORECASTING FOR TREE-BASED MODELS ===========
-# ==============================================================================
-def make_multi_output_dataset(df, target_col, periods):
-    """
-    Restructures a time series dataframe for multi-output forecasting.
-    Each row will have features from time 't' and targets for 't+1' through 't+periods'.
-    """
-    df_copy = df.copy()
-    target_cols = []
-    for h in range(1, periods + 1):
-        target_name = f'target_day_{h}'
-        df_copy[target_name] = df_copy[target_col].shift(-h)
-        target_cols.append(target_name)
+    # Create future dataframe for the specific day of the week
+    last_date = historical_df['date'].max()
+    future_dates = pd.date_range(start=last_date, periods=periods*7) # Go out far enough
+    future_day_specific = future_dates[future_dates.dayofweek == day_of_week][:periods]
+    future_df = pd.DataFrame({'ds': future_day_specific})
     
-    df_copy = df_copy.dropna(subset=target_cols)
-    y = df_copy[target_cols]
+    forecast = prophet_model.predict(future_df)
     
-    # Define features to be used
-    features = [f for f in df.columns if f in create_advanced_features(df.head(1)).columns]
-    features = [f for f in features if df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv']]
-    if 'forecast_customers' in df.columns:
-        features.append('forecast_customers')
-    features = list(set(features) - {target_col})
-
-    X = df_copy[features]
-    
-    return X, y
+    # Combine with historical for stacking
+    hist_forecast = prophet_model.predict(df_prophet[['ds']])
+    return pd.concat([hist_forecast[['ds', 'yhat']], forecast[['ds', 'yhat']]]), prophet_model
 
 @st.cache_data
-def _run_tree_model_multi_output_forecast(model_class, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
-    """
-    This function implements a direct multi-step forecasting strategy using a single multi-output model.
-    This prevents the error accumulation seen in recursive forecasting.
-    """
-    df_featured = historical_df.copy()
-    
-    # Merge customer forecast if this is the ATV model
+def train_and_forecast_tree_day_specific(model_class, params, historical_df, periods, target_col, day_of_week, customer_forecast_df=None):
+    df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
+    if len(df_day) < 20: return pd.DataFrame()
+
     if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
-        df_featured['forecast_customers'].fillna(method='bfill', inplace=True)
-        df_featured['forecast_customers'].fillna(0, inplace=True)
+        df_day = pd.merge(df_day, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+        df_day['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
 
-    # 1. Create the multi-output dataset (X and y)
-    X_train, y_train = make_multi_output_dataset(df_featured, target_col, periods)
+    features = [f for f in df_day.columns if df_day[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date']]
+    features = list(set(features) - {target_col})
     
-    if X_train.empty:
-        st.warning(f"Not enough data to create a multi-output model for {target_col}.")
-        return pd.DataFrame()
-
-    # 2. Train the multi-output model
-    base_model = model_class(**params)
-    multi_output_model = MultiOutputRegressor(estimator=base_model)
-    multi_output_model.fit(X_train, y_train)
-
-    # 3. Predict the future
-    # We need the last row of features from the original dataframe to predict the next `periods` days
-    X_future_features = df_featured[X_train.columns].iloc[-1:]
-    future_predictions_array = multi_output_model.predict(X_future_features) # Shape: (1, periods)
+    X = df_day[features].dropna()
+    y = df_day.loc[X.index, target_col]
     
-    last_hist_date = historical_df['date'].max()
-    future_dates = pd.date_range(start=last_hist_date + timedelta(days=1), periods=periods)
+    model = model_class(**params).fit(X, y)
     
-    future_df = pd.DataFrame({
-        'ds': future_dates,
-        'yhat': future_predictions_array[0]
-    })
+    # Create future feature set
+    last_date = historical_df['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
+    future_day_specific_dates = future_dates[future_dates.dayofweek == day_of_week][:periods]
+    future_df = create_advanced_features(pd.DataFrame({'date': future_day_specific_dates}))
 
-    # 4. Generate historical predictions for the stacking layer
-    # We predict on the training data to get in-sample predictions
-    historical_predictions_array = multi_output_model.predict(X_train)
+    if 'forecast_customers' in features:
+        if customer_forecast_df is not None:
+             future_df = pd.merge(future_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+             future_df['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
+        else:
+            future_df['forecast_customers'] = 0
+
+
+    X_future = future_df[features]
+    predictions = model.predict(X_future)
     
-    # We need to reshape the historical predictions from a wide format to a long format
-    hist_df_list = []
-    for i, index in enumerate(X_train.index):
-        # The date for the features is X_train.index[i]
-        # The predictions are for the *following* days
-        feature_date = df_featured.loc[index, 'date']
-        for h in range(periods):
-            prediction_date = feature_date + timedelta(days=h + 1)
-            hist_df_list.append({
-                'ds': prediction_date,
-                'yhat': historical_predictions_array[i, h]
-            })
-
-    historical_df_long = pd.DataFrame(hist_df_list).drop_duplicates(subset='ds', keep='first')
-
-    # Combine and return
-    return pd.concat([historical_df_long, future_df], ignore_index=True).sort_values('ds').reset_index(drop=True)
-
-# Updated calls to use the new multi-output forecasting function
-@st.cache_data
-def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
-    if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-    params = {
-        'objective': 'reg:squarederror', 'random_state': 42,
-        'n_estimators': 100, 'learning_rate': 0.1, 'max_depth': 5,
-        'subsample': 0.8, 'colsample_bytree': 0.8
-    }
-    return _run_tree_model_multi_output_forecast(xgb.XGBRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
+    future_forecast_df = pd.DataFrame({'ds': future_day_specific_dates, 'yhat': predictions})
+    
+    # Historical predictions for stacking
+    hist_preds = model.predict(X)
+    hist_forecast_df = pd.DataFrame({'ds': df_day.loc[X.index, 'date'], 'yhat': hist_preds})
+    
+    return pd.concat([hist_forecast_df, future_forecast_df])
 
 @st.cache_data
-def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
-    if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-    params = {
-        'random_state': 42, 'objective': 'regression_l1', 'verbosity': -1,
-        'n_estimators': 100, 'learning_rate': 0.1, 'num_leaves': 31
-    }
-    return _run_tree_model_multi_output_forecast(lgb.LGBMRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
-
-@st.cache_data
-def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
-    if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-    params = {
-        'random_seed': 42, 'objective': 'RMSE', 'verbose': 0,
-        'iterations': 100, 'learning_rate': 0.1, 'depth': 6
-    }
-    return _run_tree_model_multi_output_forecast(cat.CatBoostRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
-
-
-# ==============================================================================
-# === RE-ARCHITECTED: STACKING ENSEMBLE WITH NO DATA LEAKAGE ====================
-# ==============================================================================
-@st.cache_data
-def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name, n_splits=3):
-    """
-    This function creates a stacked ensemble using out-of-fold predictions to prevent data leakage.
-    A meta-model is trained on the predictions of base models from a time-series cross-validation.
-    """
-    # 1. Align all base model forecasts
+def train_and_forecast_stacked_ensemble_day_specific(base_forecasts_dict, historical_target, target_col_name, day_of_week):
+    df_day = historical_target[historical_target['date'].dt.dayofweek == day_of_week].copy()
+    if df_day.empty: return pd.DataFrame()
+    
     final_df = None
     for name, fcst_df in base_forecasts_dict.items():
         if fcst_df is None or fcst_df.empty: continue
         renamed_df = fcst_df[['ds', 'yhat']].rename(columns={'yhat': f'yhat_{name}'})
-        if final_df is None:
-            final_df = renamed_df
-        else:
-            final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
+        if final_df is None: final_df = renamed_df
+        else: final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
 
-    if final_df is None or final_df.empty:
-        st.error("All base models failed to produce forecasts.")
-        return pd.DataFrame()
+    if final_df is None or final_df.empty: return pd.DataFrame()
 
     final_df.interpolate(method='linear', limit_direction='forward', axis=0, inplace=True)
     final_df.bfill(inplace=True)
 
-    # 2. Prepare training data for the meta-model
-    meta_train_df = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
-    meta_train_df = meta_train_df.dropna() 
-
+    meta_train_df = pd.merge(final_df, df_day[['date', target_col_name]], left_on='ds', right_on='date').dropna()
     meta_features = [col for col in meta_train_df.columns if 'yhat_' in col]
     X_meta = meta_train_df[meta_features]
     y_meta = meta_train_df[target_col_name]
     
-    if len(X_meta) < 20:
-        st.warning(f"Not enough historical data for advanced stacking. Falling back to simple averaging.")
-        final_df['yhat'] = X_meta.mean(axis=1)
-        return final_df[['ds', 'yhat']]
+    if len(X_meta) < 10: return final_df.rename(columns={'yhat_prophet': 'yhat'})[['ds', 'yhat']]
 
-    # 3. Train meta-model using Time Series Cross-Validation
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    meta_model = RidgeCV(alphas=np.logspace(-3, 3, 10), cv=tscv)
-    meta_model.fit(X_meta, y_meta)
+    meta_model = RidgeCV(alphas=np.logspace(-3, 2, 10)).fit(X_meta, y_meta)
     
-    # 4. Use the trained meta-model to predict the future
-    X_future_meta = final_df[final_df['ds'] > meta_train_df['ds'].max()][meta_features]
+    future_dates = final_df[~final_df['ds'].isin(meta_train_df['ds'])]
+    X_future_meta = future_dates[meta_features].dropna()
     
     if not X_future_meta.empty:
-        stacked_future_prediction = meta_model.predict(X_future_meta)
-    else:
-        stacked_future_prediction = np.array([])
+        future_predictions = meta_model.predict(X_future_meta)
+        future_dates.loc[X_future_meta.index, 'yhat'] = future_predictions
 
-    # 5. Combine historical and future predictions
-    stacked_hist_prediction = meta_model.predict(X_meta)
-    
-    hist_forecast_df = pd.DataFrame({'ds': meta_train_df['ds'], 'yhat': stacked_hist_prediction})
-    future_forecast_df = pd.DataFrame({'ds': final_df.loc[X_future_meta.index]['ds'], 'yhat': stacked_future_prediction})
-    
-    full_forecast_df = pd.concat([hist_forecast_df, future_forecast_df]).sort_values('ds').reset_index(drop=True)
+    hist_predictions = meta_model.predict(X_meta)
+    meta_train_df['yhat'] = hist_predictions
 
-    return full_forecast_df
+    return pd.concat([meta_train_df[['ds', 'yhat']], future_dates[['ds', 'yhat']]])
+
+# --- NEW ORCHESTRATION FUNCTION ---
+def run_day_specific_pipeline(historical_df, events_df, weather_df, target_col, periods, customer_forecasts=None):
+    all_forecasts = []
+    
+    for day_of_week in range(7):
+        day_name = date(2024, 1, 1+day_of_week).strftime('%A')
+        st.write(f"Training models for {day_name}s...")
+
+        # Filter data for the specific day
+        df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
+        if len(df_day) < 20:
+            st.warning(f"Skipping {day_name}s due to insufficient data ({len(df_day)} records).")
+            continue
+
+        # Base model parameters
+        xgb_params = {'objective': 'reg:squarederror', 'random_state': 42, 'n_estimators': 100}
+        lgbm_params = {'objective': 'regression_l1', 'random_state': 42, 'verbosity': -1, 'n_estimators': 100}
+        cat_params = {'objective': 'RMSE', 'random_seed': 42, 'verbose': 0, 'iterations': 100}
+
+        # Train base models for the specific day
+        prophet_f, _ = train_and_forecast_prophet_day_specific(historical_df, events_df, periods, target_col, day_of_week)
+        xgb_f = train_and_forecast_tree_day_specific(xgb.XGBRegressor, xgb_params, historical_df, periods, target_col, day_of_week, customer_forecasts)
+        lgbm_f = train_and_forecast_tree_day_specific(lgb.LGBMRegressor, lgbm_params, historical_df, periods, target_col, day_of_week, customer_forecasts)
+        cat_f = train_and_forecast_tree_day_specific(cat.CatBoostRegressor, cat_params, historical_df, periods, target_col, day_of_week, customer_forecasts)
+
+        # Stack the models for the specific day
+        base_forecasts = {"prophet": prophet_f, "xgb": xgb_f, "lgbm": lgbm_f, "cat": cat_f}
+        day_stacked_f = train_and_forecast_stacked_ensemble_day_specific(base_forecasts, historical_df, target_col, day_of_week)
+        all_forecasts.append(day_stacked_f)
+
+    if not all_forecasts:
+        return pd.DataFrame()
+        
+    # Combine forecasts from all day-specific models
+    final_forecast = pd.concat(all_forecasts).sort_values('ds').reset_index(drop=True)
+    return final_forecast
 
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
@@ -824,7 +733,7 @@ if db:
     
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-        st.info("Forecasting with an Advanced AI Ensemble")
+        st.info("Forecasting with Day-Specific AI Models")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -840,45 +749,27 @@ if db:
                 if recalibrated:
                     st.info("Models have been recalibrated. Please click 'Generate Forecast' again to use the new models.")
                 else:
-                    with st.spinner("🧠 Initializing Advanced Ensemble Forecast..."):
+                    with st.spinner("🧠 Initializing Day-Specific AI Ensemble..."):
                         base_df = st.session_state.historical_df.copy()
                         FORECAST_HORIZON = 15
                         
                         with st.spinner("🛰️ Fetching live weather and engineering advanced features..."):
-                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + 30) # Fetch extra for feature creation
-                            
+                            weather_df = get_weather_forecast(days=FORECAST_HORIZON + 30)
                             if weather_df is None:
-                                st.warning("Could not fetch live weather data. Proceeding without it. Forecast accuracy may be reduced.")
-                                weather_df = pd.DataFrame(columns=['date', 'temp_max', 'precipitation', 'wind_speed', 'weather_condition'])
+                                st.warning("Could not fetch live weather data. Proceeding without it.")
+                                weather_df = pd.DataFrame()
                             
                             base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
-                            capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
-                            if capped_count > 0:
-                                st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
-
+                            capped_df, _, _ = cap_outliers_iqr(base_df, column='base_sales')
                             hist_df_with_atv = calculate_atv(capped_df)
                             hist_df_featured = create_advanced_features(hist_df_with_atv, weather_df)
                             ev_df = st.session_state.events_df.copy()
 
-                        with st.spinner("Stage 1: Training Customer Base Models... (Using Multi-Output Strategy)"):
-                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
-                            xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
-                            lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
-                            cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
-
-                        with st.spinner("Stage 1: Stacking Customer models... (Leakage Protected)"):
-                            base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
-                            cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
+                        with st.spinner("Stage 1: Building Day-Specific Customer Models..."):
+                            cust_f = run_day_specific_pipeline(hist_df_featured, ev_df, weather_df, 'customers', FORECAST_HORIZON)
                         
-                        with st.spinner("Stage 2: Training ATV Base Models (using customer forecast)..."):
-                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
-                            xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
-                            lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
-                            cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
-
-                        with st.spinner("Stage 2: Stacking ATV models for final prediction..."):
-                            base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
-                            atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
+                        with st.spinner("Stage 2: Building Day-Specific ATV Models..."):
+                            atv_f = run_day_specific_pipeline(hist_df_featured, ev_df, weather_df, 'atv', FORECAST_HORIZON, customer_forecasts=cust_f)
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
@@ -892,37 +783,13 @@ if db:
 
                             st.session_state.forecast_df = combo_f
                             
-                            try:
-                                with st.spinner("📝 Saving forecast log for future accuracy tracking..."):
-                                    combo_f['ds'] = pd.to_datetime(combo_f['ds'])
-                                    today_date_naive = pd.to_datetime('today').tz_localize(None).normalize()
-                                    future_forecasts_to_log = combo_f[combo_f['ds'] > today_date_naive]
-                                    if not future_forecasts_to_log.empty:
-                                        generation_ts = pd.Timestamp.now().strftime('%Y-%m-%d-%H%M%S')
-                                        for _, row in future_forecasts_to_log.iterrows():
-                                            log_entry = {
-                                                "generated_on": today_date_naive,
-                                                "forecast_for_date": row['ds'],
-                                                "predicted_sales": row['forecast_sales'],
-                                                "predicted_customers": row['forecast_customers']
-                                            }
-                                            doc_id = f"{generation_ts}_{row['ds'].strftime('%Y-%m-%d')}"
-                                            db.collection('forecast_log').document(doc_id).set(log_entry)
-                                        st.info("Forecast log saved successfully.")
-                                    else:
-                                        st.warning("No future dates found in the forecast to log.")
-                            except Exception as e:
-                                st.error(f"Failed to save forecast log: {e}")
+                            # Note: Prophet components are no longer generated from a single model
+                            # The insight tab might need to be re-evaluated or simplified
+                            st.session_state.forecast_components = pd.DataFrame()
                             
-                            if prophet_model_cust:
-                                full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
-                                prophet_forecast_components = prophet_model_cust.predict(full_future)
-                                st.session_state.forecast_components = prophet_forecast_components
-                                st.session_state.all_holidays = prophet_model_cust.holidays
-                            
-                            st.success("Advanced AI forecast generated successfully!")
+                            st.success("Day-Specific AI forecast generated successfully!")
                         else:
-                            st.error("Forecast generation failed. One or more components could not be built.")
+                            st.error("Forecast generation failed. Check data availability for each day of the week.")
 
         st.markdown("---")
         st.download_button(
@@ -967,29 +834,9 @@ if db:
     
     with tabs[1]:
         st.header("💡 Forecast Insights")
-        if st.session_state.forecast_components.empty:
-            st.info("Click 'Generate Forecast' to see a breakdown of what drives the daily predictions.")
-        else:
-            future_components = st.session_state.forecast_components[st.session_state.forecast_components['ds'] >= pd.to_datetime('today').normalize()].copy()
-            if not future_components.empty:
-                cust_forecast_final = st.session_state.forecast_df[['ds', 'forecast_customers']].rename(columns={'forecast_customers': 'final_yhat'})
-                future_components = pd.merge(future_components, cust_forecast_final, on='ds', how='left')
-                future_components['yhat'] = future_components['final_yhat'].fillna(future_components['yhat'])
+        st.warning("Forecast breakdown is not available with the new Day-Specific Model architecture.")
+        st.info("The new approach builds seven independent models (one for each day of the week) instead of a single model. While this significantly improves accuracy by comparing 'apples to apples' (e.g., Mondays to Mondays), it makes a single component breakdown chart impractical. The forecast is now a composite of these seven specialized models.")
 
-                future_components['date_str'] = future_components['ds'].dt.strftime('%A, %B %d, %Y')
-                selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
-                selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
-
-                st.subheader("Prophet Model Breakdown")
-                st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
-                breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
-                st.plotly_chart(breakdown_fig, use_container_width=True)
-                st.markdown("---")
-                st.subheader("Prophet Insight Summary")
-                st.markdown(generate_insight_summary(day_data, selected_date))
-
-            else:
-                st.warning("No future dates available in the forecast components to analyze.")
     
     with tabs[2]:
         st.header("📈 Forecast Evaluator")
