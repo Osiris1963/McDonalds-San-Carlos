@@ -10,7 +10,7 @@ from datetime import timedelta, date
 import firebase_admin
 from firebase_admin import credentials, firestore
 import logging
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error
 
 # --- Suppress informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
@@ -69,12 +69,25 @@ def add_to_firestore(db_client, collection_name, record, existing_df):
         st.error(f"A record for {date_to_check.strftime('%Y-%m-%d')} already exists.")
         return
     db_client.collection(collection_name).add(record)
+    st.success("Record added!")
+    st.cache_data.clear()
+    time.sleep(1)
+    st.rerun()
+
 
 def update_firestore_record(db_client, collection_name, doc_id, update_data):
     db_client.collection(collection_name).document(doc_id).update(update_data)
+    st.success("Record updated!")
+    st.cache_data.clear()
+    time.sleep(1)
+    st.rerun()
 
 def delete_from_firestore(db_client, collection_name, doc_id):
     db_client.collection(collection_name).document(doc_id).delete()
+    st.warning("Record deleted.")
+    st.cache_data.clear()
+    time.sleep(1)
+    st.rerun()
 
 # --- App State Management ---
 def initialize_state(db_client):
@@ -116,7 +129,7 @@ def calculate_atv(df):
     df_copy = df.copy()
     base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     with np.errstate(divide='ignore', invalid='ignore'):
-        atv = np.divide(base_sales, df_copy['customers'])
+        atv = np.divide(base_sales, df_copy['customers'].replace(0, np.nan)) # Avoid division by zero
     df_copy['atv'] = np.nan_to_num(atv)
     return df_copy
 
@@ -208,23 +221,37 @@ def train_and_forecast_prophet_day_specific(historical_df, periods, target_col, 
 def train_and_forecast_xgb_day_specific(historical_df, periods, target_col, day_of_week, customer_forecast_df=None, weather_df=None):
     df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
     if len(df_day) < 20: return pd.DataFrame()
+    
     last_date = historical_df['date'].max()
     future_dates_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
     future_day_specific_dates = future_dates_range[future_dates_range.dayofweek == day_of_week][:periods]
     future_df_placeholders = pd.DataFrame({'date': future_day_specific_dates})
+    
     combined_df = pd.concat([df_day, future_df_placeholders], ignore_index=True)
     combined_featured_df = create_advanced_features(combined_df, weather_df)
+    
     if target_col == 'atv' and customer_forecast_df is not None:
-        combined_featured_df = pd.merge(combined_featured_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        combined_featured_df['forecast_customers'].ffill(inplace=True).bfill(inplace=True)
+        combined_featured_df = pd.merge(
+            combined_featured_df, 
+            customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), 
+            on='date', 
+            how='left'
+        )
+        # Fill NaN values created by the merge for historical data rows
+        combined_featured_df['forecast_customers'].fillna(0, inplace=True)
+
     features = [f for f in combined_featured_df.columns if combined_featured_df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date', target_col]]
     train_df = combined_featured_df.dropna(subset=[target_col])
     predict_df = combined_featured_df[combined_featured_df[target_col].isna()]
+    
     X_train, y_train = train_df[features], train_df[target_col]
     X_future = predict_df[features]
+
     if X_train.empty or X_future.empty: return pd.DataFrame()
+    
     model = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=100, random_state=42).fit(X_train, y_train)
     predictions = model.predict(X_future)
+    
     return pd.DataFrame({'ds': predict_df['date'], 'yhat': predictions})
 
 # --- Simplified Orchestration Function ---
@@ -265,7 +292,7 @@ def log_forecast_to_firestore(db_client, forecast_df):
 # --- Plotting and UI Rendering ---
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
 
-def plot_forecast_breakdown(prophet_model, forecast_df, selected_date):
+def plot_forecast_breakdown(prophet_model, selected_date):
     if not prophet_model:
         st.warning("Prophet model not available for this day.")
         return go.Figure()
@@ -291,23 +318,19 @@ def render_activity_card(row, db_client):
             c1, c2 = st.columns(2)
             if c1.form_submit_button("💾 Update", use_container_width=True):
                 update_firestore_record(db_client, 'future_activities', doc_id, {"potential_sales": updated_sales, "remarks": updated_remarks})
-                st.success("Activity updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
             if c2.form_submit_button("🗑️ Delete", use_container_width=True):
                 delete_from_firestore(db_client, 'future_activities', doc_id)
-                st.warning("Activity deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
 
 def render_historical_record(row, db_client):
     with st.expander(f"{row['date'].strftime('%B %d, %Y')} - Sales: ₱{row.get('sales', 0):,.2f}"):
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             c1, c2 = st.columns(2)
-            updated_sales = c1.number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"sales_{row['doc_id']}")
-            updated_customers = c2.number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
+            updated_sales = c1.number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"h_sales_{row['doc_id']}")
+            updated_customers = c2.number_input("Customers", value=int(row.get('customers', 0)), key=f"h_cust_{row['doc_id']}")
             if c1.form_submit_button("💾 Update Record", use_container_width=True):
                 update_firestore_record(db_client, 'historical_data', row['doc_id'], {'sales': updated_sales, 'customers': updated_customers})
-                st.success("Record updated!"); st.cache_data.clear(); time.sleep(1); st.rerun()
             if c2.form_submit_button("🗑️ Delete Record", use_container_width=True, type="primary"):
                 delete_from_firestore(db_client, 'historical_data', row['doc_id'])
-                st.warning("Record deleted."); st.cache_data.clear(); time.sleep(1); st.rerun()
 
 # --- Main Application UI ---
 apply_custom_styling()
@@ -338,14 +361,11 @@ if db:
                         
                         hist_df_with_atv = calculate_atv(cap_outliers_iqr(base_df, column='sales'))
                         
-                        # Stage 1: Forecast Customers
                         cust_f, cust_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'customers', FORECAST_HORIZON, weather_df)
                         
-                        # Check if the customer forecast is valid before proceeding
                         if cust_f.empty:
                             st.error("Forecast Failed: Could not generate a customer forecast. Ensure sufficient data exists for each day of the week.")
                         else:
-                            # Stage 2: Forecast ATV (only if customer forecast was successful)
                             atv_f, atv_models = run_simplified_ensemble_pipeline(hist_df_with_atv, 'atv', FORECAST_HORIZON, weather_df, customer_forecasts=cust_f)
                             
                             if not atv_f.empty:
@@ -385,13 +405,10 @@ if db:
             day_of_week = selected_date.dayofweek
             target_to_view = st.radio("View insights for:", ["Customers", "Average Transaction Value (ATV)"], horizontal=True)
             
-            if target_to_view == "Customers" and day_of_week in st.session_state.prophet_models.get('customers', {}):
-                model = st.session_state.prophet_models['customers'][day_of_week]
-                fig = plot_forecast_breakdown(model, st.session_state.forecast_df, selected_date)
-                st.pyplot(fig)
-            elif target_to_view == "Average Transaction Value (ATV)" and day_of_week in st.session_state.prophet_models.get('atv', {}):
-                model = st.session_state.prophet_models['atv'][day_of_week]
-                fig = plot_forecast_breakdown(model, st.session_state.forecast_df, selected_date)
+            model_dict = st.session_state.prophet_models.get(target_to_view.lower().split(' ')[0], {})
+            if day_of_week in model_dict:
+                model = model_dict[day_of_week]
+                fig = plot_forecast_breakdown(model, selected_date)
                 st.pyplot(fig)
             else: st.warning("No insight components available for the selected day or target.")
         else: st.info("Generate a forecast to view insights.")
@@ -423,10 +440,9 @@ if db:
     with tabs[3]: # Add Data
         st.subheader("✍️ Add New Daily Record")
         with st.form("new_record_form", clear_on_submit=True):
-            new_date, new_sales, new_customers = st.date_input("Date", date.today()), st.number_input("Total Sales (₱)", 0.0, format="%.2f"), st.number_input("Customer Count", 0)
+            new_date, new_sales, new_customers = st.date_input("Date", date.today()), st.number_input("Total Sales (₱)", 0.0, format="%.2f"), st.number_input("Customer Count", 0, step=1)
             if st.form_submit_button("✅ Save Record", use_container_width=True):
-                add_to_firestore(db, 'historical_data', {"date":new_date, "sales":new_sales, "customers":new_customers}, st.session_state.historical_df)
-                st.success("Record added!"); st.cache_data.clear(); time.sleep(1); st.rerun()
+                add_to_firestore(db, 'historical_data', {"date":pd.to_datetime(new_date), "sales":new_sales, "customers":new_customers}, st.session_state.historical_df)
 
     with tabs[4]: # Activities
         st.subheader("📅 Future Activities")
@@ -439,7 +455,6 @@ if db:
             if st.form_submit_button("✅ Save Activity", use_container_width=True):
                 if activity_name and activity_date:
                     add_to_firestore(db, 'future_activities', {"activity_name": activity_name, "date": pd.to_datetime(activity_date), "potential_sales": potential_sales, "remarks": remarks}, pd.DataFrame())
-                    st.success(f"Activity '{activity_name}' saved!"); st.cache_data.clear(); time.sleep(1); st.rerun()
         
         with c2:
             upcoming_df = st.session_state.events_df[pd.to_datetime(st.session_state.events_df['date']).dt.date >= date.today()].copy()
@@ -455,7 +470,8 @@ if db:
         if not df.empty:
             year = st.selectbox("Select Year:", sorted(df['date'].dt.year.unique(), reverse=True))
             month_str = st.selectbox("Select Month:", sorted(df[df['date'].dt.year == year]['date'].dt.strftime('%B').unique(), key=lambda m: pd.to_datetime(m, format='%B').month, reverse=True))
-            month = pd.to_datetime(month_str, format='%B').month
-            filtered_df = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
-            for _, row in filtered_df.iterrows():
-                render_historical_record(row, db)
+            if month_str:
+                month = pd.to_datetime(month_str, format='%B').month
+                filtered_df = df[(df['date'].dt.year == year) & (df['date'].dt.month == month)]
+                for _, row in filtered_df.iterrows():
+                    render_historical_record(row, db)
