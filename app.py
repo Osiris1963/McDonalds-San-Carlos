@@ -390,7 +390,7 @@ def train_and_forecast_prophet_day_specific(historical_df, events_df, periods, t
     
     # Create future dataframe for the specific day of the week
     last_date = historical_df['date'].max()
-    future_dates = pd.date_range(start=last_date, periods=periods*7) # Go out far enough
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods*7) # Go out far enough
     future_day_specific = future_dates[future_dates.dayofweek == day_of_week][:periods]
     future_df = pd.DataFrame({'ds': future_day_specific})
     
@@ -400,35 +400,27 @@ def train_and_forecast_prophet_day_specific(historical_df, events_df, periods, t
     hist_forecast = prophet_model.predict(df_prophet[['ds']])
     return pd.concat([hist_forecast[['ds', 'yhat']], forecast[['ds', 'yhat']]]), prophet_model
 
-# ==============================================================================
-# === DEBUGGED FUNCTION: train_and_forecast_tree_day_specific ==================
-# ==============================================================================
 @st.cache_data
 def train_and_forecast_tree_day_specific(model_class, params, historical_df, periods, target_col, day_of_week, customer_forecast_df=None):
     df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
     if len(df_day) < 20: return pd.DataFrame()
 
-    # --- FIX START: Combine historical and future data BEFORE feature engineering ---
-    # 1. Create future date placeholders
+    # Create future date placeholders
     last_date = historical_df['date'].max()
     future_dates_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
     future_day_specific_dates = future_dates_range[future_dates_range.dayofweek == day_of_week][:periods]
     future_df_placeholders = pd.DataFrame({'date': future_day_specific_dates})
 
-    # 2. Combine historical data for the specific day with future placeholders
+    # Combine historical data for the specific day with future placeholders
     combined_df = pd.concat([df_day, future_df_placeholders], ignore_index=True)
     
-    # 3. Engineer features on the combined dataframe
-    # This allows lags and rolling windows to be calculated correctly for future dates
+    # Engineer features on the combined dataframe
     combined_featured_df = create_advanced_features(combined_df)
-    # --- FIX END ---
 
     if target_col == 'atv' and customer_forecast_df is not None:
         combined_featured_df = pd.merge(combined_featured_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        # --- FIX START: Separate the chained inplace fillna calls ---
         combined_featured_df['forecast_customers'].fillna(method='ffill', inplace=True)
         combined_featured_df['forecast_customers'].fillna(method='bfill', inplace=True)
-        # --- FIX END ---
 
     features = [f for f in combined_featured_df.columns if combined_featured_df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date']]
     features = list(set(features) - {target_col})
@@ -792,7 +784,18 @@ if db:
                             atv_f = run_day_specific_pipeline(hist_df_featured, ev_df, weather_df, 'atv', FORECAST_HORIZON, customer_forecasts=cust_f)
                         
                         if not cust_f.empty and not atv_f.empty:
-                            combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
+                            # --- FIX START: Use an outer merge to prevent data loss ---
+                            combo_f = pd.merge(
+                                cust_f.rename(columns={'yhat':'forecast_customers'}), 
+                                atv_f.rename(columns={'yhat':'forecast_atv'}), 
+                                on='ds', 
+                                how='outer'
+                            )
+                            # Interpolate to fill any gaps caused by sparse data for a specific day
+                            combo_f['forecast_customers'] = combo_f['forecast_customers'].interpolate(method='linear', limit_direction='both')
+                            combo_f['forecast_atv'] = combo_f['forecast_atv'].interpolate(method='linear', limit_direction='both')
+                            # --- FIX END ---
+                            
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
                             if not weather_df.empty:
@@ -803,8 +806,6 @@ if db:
 
                             st.session_state.forecast_df = combo_f
                             
-                            # Note: Prophet components are no longer generated from a single model
-                            # The insight tab might need to be re-evaluated or simplified
                             st.session_state.forecast_components = pd.DataFrame()
                             
                             st.success("Day-Specific AI forecast generated successfully!")
