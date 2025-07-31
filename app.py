@@ -323,7 +323,6 @@ def create_advanced_features(df, weather_df=None):
             df[col] = 0 
     df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill').fillna(0)
 
-    # --- ENHANCEMENT: Date-Based Features ---
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
     df['month'] = df['date'].dt.month
@@ -331,15 +330,12 @@ def create_advanced_features(df, weather_df=None):
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
-    # A simple but effective way to identify paydays
     df['is_payday'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int)
-    # Cyclical features for day of week
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
     
     df = df.sort_values('date')
     
-    # --- ENHANCEMENT: Expanded Lag Features ---
     lags = [1, 2, 7, 14, 21, 30]
     for lag in lags:
         if 'sales' in df.columns:
@@ -349,7 +345,6 @@ def create_advanced_features(df, weather_df=None):
         if 'atv' in df.columns:
             df[f'atv_lag_{lag}'] = df['atv'].shift(lag)
 
-    # Rolling features
     if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
@@ -358,7 +353,6 @@ def create_advanced_features(df, weather_df=None):
     if 'atv' in df.columns:
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         
-    # Exponentially Weighted Moving Averages
     if 'sales' in df.columns:
         df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
@@ -366,7 +360,6 @@ def create_advanced_features(df, weather_df=None):
     if 'atv' in df.columns:
         df['atv_ewm_7'] = df['atv'].shift(1).ewm(span=7, adjust=False).mean()
 
-    # --- ENHANCEMENT: Interaction Features ---
     df['weekend_temp_interaction'] = df['is_weekend'] * df['temp_max']
     df['payday_weekday_interaction'] = df['is_payday'] * df['dayofweek']
         
@@ -402,13 +395,11 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None, is_catboost=False):
     df_featured = historical_df.copy()
     
-    # --- ENHANCEMENT: Two-Stage Forecasting ---
-    # If we are forecasting ATV, merge the customer forecast to use as a feature
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True) # Fill any gaps
-    else:
-        df_featured['forecast_customers'] = 0 # Ensure column exists
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+    elif 'forecast_customers' not in df_featured.columns:
+        df_featured['forecast_customers'] = 0
 
     base_features = [
         'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'temp_max', 'precipitation', 'wind_speed',
@@ -418,21 +409,21 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     rolling_features = ['sales_rolling_mean_7', 'sales_rolling_std_7', 'customers_rolling_mean_7', 'atv_rolling_mean_7']
     ewm_features = ['sales_ewm_7', 'customers_ewm_7', 'atv_ewm_7']
 
-    if target_col == 'customers':
-        features = base_features + lag_features + rolling_features + ewm_features
-    else: # atv
-        features = base_features + lag_features + rolling_features + ewm_features + ['forecast_customers']
+    features = base_features + lag_features + rolling_features + ewm_features
+    if target_col == 'atv':
+        features.append('forecast_customers')
 
-    features = [f for f in features if f in df_featured.columns]
+    features = [f for f in features if f in df_featured.columns and f != target_col]
     
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
-    X.dropna(inplace=True)
-    y = y[X.index]
+    
+    # Align X and y after potential row drops from feature creation
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index].dropna()
+    y = y.loc[common_index]
     
     final_model = model_class(**params)
-    # --- ENHANCEMENT: Dynamic Weighting (via sample weights) ---
-    # Give more weight to recent observations
     sample_weights = np.exp(np.linspace(-2, 0, len(y)))
     
     if is_catboost:
@@ -467,21 +458,24 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         extended_featured_df = create_advanced_features(extended_history)
 
         if customer_lookup is not None:
-            extended_featured_df['forecast_customers'] = extended_featured_df['date'].map(customer_lookup.get).fillna(method='ffill')
-        else:
+            # Ensure the forecast_customers column is correctly propagated to the last row
+            last_known_cust = extended_featured_df['forecast_customers'].dropna().iloc[-1]
+            extended_featured_df['forecast_customers'] = customer_lookup.reindex(extended_featured_df['date']).values
+            extended_featured_df['forecast_customers'].fillna(method='ffill', inplace=True)
+            extended_featured_df['forecast_customers'].fillna(last_known_cust, inplace=True)
+
+        elif 'forecast_customers' not in extended_featured_df.columns:
             extended_featured_df['forecast_customers'] = 0
             
         X_future = extended_featured_df[features].tail(1)
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
         
-        # Update history with the new prediction for the next iteration's feature calculation
         history_with_features = extended_featured_df.copy()
         history_with_features.loc[history_with_features.index.max(), target_col] = prediction
         
-        # Update related columns based on the new prediction
         if target_col == 'customers':
-             forecasted_atv = history_with_features['atv'].dropna().tail(7).mean()
+             forecasted_atv = history_with_features['atv'].dropna().tail(7).mean() if not history_with_features['atv'].dropna().empty else 0
              history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
         elif target_col == 'atv' and customer_lookup is not None:
              forecasted_customers = customer_lookup.get(pd.to_datetime(next_date), 0)
@@ -498,11 +492,26 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
     
+    # BUG FIX: Prepare the feature-rich dataframe FIRST
+    df_featured = historical_df.copy()
+    if target_col == 'atv' and customer_forecast_df is not None:
+        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+    elif 'forecast_customers' not in df_featured.columns:
+        df_featured['forecast_customers'] = 0
+
+    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
+    features = list(set(all_possible_features))
+
+    # BUG FIX: Define the objective function AFTER df_featured and features are correctly set
     def objective(trial):
-        X = historical_df[features].copy()
-        y = historical_df[target_col].copy()
-        X.dropna(inplace=True)
-        y = y[X.index]
+        X = df_featured[features].copy()
+        y = df_featured[target_col].copy()
+        
+        common_index = X.dropna().index.intersection(y.dropna().index)
+        X = X.loc[common_index].dropna()
+        y = y.loc[common_index]
+
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
         for train_idx, val_idx in cv.split(X):
@@ -524,17 +533,9 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather
             scores.append(mean_squared_error(y_val, preds, squared=False))
         return np.mean(scores) if scores else float('inf')
 
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
-    
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv']]
-    features = all_possible_features
-
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180) # Reduced trials for speed
+        study.optimize(objective, n_trials=15, timeout=180)
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for XGBoost. Using default parameters. Error: {e}")
@@ -549,12 +550,25 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather
 @st.cache_data
 def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
-    
+
+    df_featured = historical_df.copy()
+    if target_col == 'atv' and customer_forecast_df is not None:
+        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+    elif 'forecast_customers' not in df_featured.columns:
+        df_featured['forecast_customers'] = 0
+
+    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
+    features = list(set(all_possible_features))
+
     def objective(trial):
-        X = historical_df[features].copy()
-        y = historical_df[target_col].copy()
-        X.dropna(inplace=True)
-        y = y[X.index]
+        X = df_featured[features].copy()
+        y = df_featured[target_col].copy()
+        
+        common_index = X.dropna().index.intersection(y.dropna().index)
+        X = X.loc[common_index].dropna()
+        y = y.loc[common_index]
+        
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
         for train_idx, val_idx in cv.split(X):
@@ -575,17 +589,9 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weathe
             scores.append(mean_squared_error(y_val, preds, squared=False))
         return np.mean(scores) if scores else float('inf')
 
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
-
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv']]
-    features = all_possible_features
-
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180) # Reduced trials for speed
+        study.optimize(objective, n_trials=15, timeout=180)
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for LightGBM. Using default parameters. Error: {e}")
@@ -600,11 +606,24 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weathe
 def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
 
+    df_featured = historical_df.copy()
+    if target_col == 'atv' and customer_forecast_df is not None:
+        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+    elif 'forecast_customers' not in df_featured.columns:
+        df_featured['forecast_customers'] = 0
+
+    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
+    features = list(set(all_possible_features))
+
     def objective(trial):
-        X = historical_df[features].copy()
-        y = historical_df[target_col].copy()
-        X.dropna(inplace=True)
-        y = y[X.index]
+        X = df_featured[features].copy()
+        y = df_featured[target_col].copy()
+
+        common_index = X.dropna().index.intersection(y.dropna().index)
+        X = X.loc[common_index].dropna()
+        y = y.loc[common_index]
+
         cv = TimeSeriesSplit(n_splits=3)
         scores = []
         for train_idx, val_idx in cv.split(X):
@@ -624,17 +643,9 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weathe
             scores.append(mean_squared_error(y_val, preds, squared=False))
         return np.mean(scores) if scores else float('inf')
 
-    df_featured = historical_df.copy()
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
-
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv']]
-    features = all_possible_features
-
     try:
         study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180) # Reduced trials
+        study.optimize(objective, n_trials=15, timeout=180)
         best_params = study.best_params
     except Exception as e:
         st.warning(f"Optuna tuning failed for CatBoost. Using default parameters. Error: {e}")
@@ -672,8 +683,6 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
         final_df['yhat'] = X_meta.mean(axis=1)
         return final_df[['ds', 'yhat']]
 
-    # --- ENHANCEMENT: Refined Stacking Ensemble ---
-    # Use a more powerful model like LightGBM as the meta-learner
     meta_model = lgb.LGBMRegressor(random_state=42, n_estimators=500, learning_rate=0.05, num_leaves=20)
     meta_model.fit(X_meta, y_meta)
     
@@ -937,7 +946,6 @@ if db:
                             hist_df_featured = create_advanced_features(hist_df_with_atv, weather_df)
                             ev_df = st.session_state.events_df.copy()
 
-                        # --- ENHANCEMENT: Two-Stage Forecasting Workflow ---
                         # STAGE 1: Forecast Customers
                         with st.spinner("Stage 1: Training Customer Base Models..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
