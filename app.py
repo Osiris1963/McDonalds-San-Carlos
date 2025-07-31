@@ -349,7 +349,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame(), None
+        return pd.DataFrame()
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -432,7 +432,7 @@ def train_and_forecast_xgboost(historical_df, periods, target_col, atv_forecast_
 
 @st.cache_resource
 def train_and_forecast_lightgbm(historical_df, periods, target_col, atv_forecast_df=None):
-    params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'num_leaves': 31}
+    params = {'random_state': 42, 'n_estimators': 200, 'learning_rate': 0.05, 'num_leaves': 31, 'verbosity': -1}
     return _run_tree_model_forecast(lgb.LGBMRegressor, params, historical_df, periods, target_col, atv_forecast_df)
 
 @st.cache_resource
@@ -579,8 +579,6 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     return forecast_df
 
 def convert_df_to_csv(df): return df.to_csv(index=False).encode('utf-8')
-
-# --- All other helper and UI functions are included below ---
 
 def plot_full_comparison_chart(hist, fcst, metrics, target_col):
     fig = go.Figure()
