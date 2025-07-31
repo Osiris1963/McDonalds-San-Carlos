@@ -10,6 +10,5 @@ scikit-learn==1.5.0
 plotly==5.22.0
 requests==2.31.0
 firebase-admin==6.5.0
-shap==0.45.1
 matplotlib==3.8.4
 PyYAML==6.0.1
