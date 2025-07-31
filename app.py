@@ -6,7 +6,8 @@ import lightgbm as lgb
 import catboost as cat
 from xgboost.callback import EarlyStopping as XGBEarlyStopping
 from lightgbm import early_stopping as lgb_early_stopping
-import optuna
+from skopt import BayesSearchCV
+from skopt.space import Real, Integer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import RidgeCV
@@ -28,7 +29,6 @@ import inspect
 # --- Suppress informational messages ---
 logging.getLogger('prophet').setLevel(logging.ERROR)
 logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
 # --- Page Configuration ---
@@ -279,7 +279,7 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         if day_ahead_logs.empty: return False
 
         true_accuracy_df = pd.merge(historical_df, day_ahead_logs, left_on='date', right_on='forecast_for_date', how='inner')
-        if len(true_accuracy_df) < long_term_days: return False # Not enough data to establish a baseline
+        if len(true_accuracy_df) < long_term_days: return False 
 
         today = pd.to_datetime('today').normalize()
         
@@ -334,7 +334,7 @@ def create_advanced_features(df, weather_df=None):
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
     
-    df = df.sort_values('date')
+    df = df.sort_values('date').reset_index(drop=True)
     
     lags = [1, 2, 7, 14, 21, 30]
     for lag in lags:
@@ -398,6 +398,7 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
         df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+        df_featured['forecast_customers'].fillna(0, inplace=True)
     elif 'forecast_customers' not in df_featured.columns:
         df_featured['forecast_customers'] = 0
 
@@ -418,7 +419,6 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     
-    # Align X and y after potential row drops from feature creation
     common_index = X.dropna().index.intersection(y.dropna().index)
     X = X.loc[common_index].dropna()
     y = y.loc[common_index]
@@ -458,11 +458,9 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         extended_featured_df = create_advanced_features(extended_history)
 
         if customer_lookup is not None:
-            # Ensure the forecast_customers column is correctly propagated to the last row
-            last_known_cust = extended_featured_df['forecast_customers'].dropna().iloc[-1]
-            extended_featured_df['forecast_customers'] = customer_lookup.reindex(extended_featured_df['date']).values
+            extended_featured_df['forecast_customers'] = customer_lookup.reindex(pd.to_datetime(extended_featured_df['date'])).values
             extended_featured_df['forecast_customers'].fillna(method='ffill', inplace=True)
-            extended_featured_df['forecast_customers'].fillna(last_known_cust, inplace=True)
+            extended_featured_df['forecast_customers'].fillna(0, inplace=True)
 
         elif 'forecast_customers' not in extended_featured_df.columns:
             extended_featured_df['forecast_customers'] = 0
@@ -492,56 +490,50 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
 def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather_forecast_df, customer_forecast_df=None):
     if historical_df.empty or len(historical_df) < 50: return pd.DataFrame()
     
-    # BUG FIX: Prepare the feature-rich dataframe FIRST
     df_featured = historical_df.copy()
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
     elif 'forecast_customers' not in df_featured.columns:
         df_featured['forecast_customers'] = 0
 
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
-    features = list(set(all_possible_features))
+    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
+    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
 
-    # BUG FIX: Define the objective function AFTER df_featured and features are correctly set
-    def objective(trial):
-        X = df_featured[features].copy()
-        y = df_featured[target_col].copy()
-        
-        common_index = X.dropna().index.intersection(y.dropna().index)
-        X = X.loc[common_index].dropna()
-        y = y.loc[common_index]
-
-        cv = TimeSeriesSplit(n_splits=3)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue 
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            param = {
-                'objective': 'reg:squarederror', 'booster': 'gbtree', 'random_state': 42,
-                'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-                'max_depth': trial.suggest_int('max_depth', 3, 8),
-                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                'lambda': trial.suggest_float('lambda', 1e-8, 1.0, log=True),
-            }
-            model = xgb.XGBRegressor(**param)
-            sample_weights = np.exp(np.linspace(-2, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False, sample_weight=sample_weights)
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
+    X = df_featured[features].copy()
+    y = df_featured[target_col].copy()
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index].dropna()
+    y = y.loc[common_index]
+    
+    search_spaces = {
+        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
+        'max_depth': Integer(3, 10),
+        'subsample': Real(0.6, 1.0, 'uniform'),
+        'colsample_bytree': Real(0.6, 1.0, 'uniform'),
+        'reg_lambda': Real(1e-8, 5.0, 'log-uniform'),
+        'n_estimators': Integer(500, 2000)
+    }
 
     try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180)
-        best_params = study.best_params
+        bayes_search = BayesSearchCV(
+            estimator=xgb.XGBRegressor(random_state=42, objective='reg:squarederror'),
+            search_spaces=search_spaces,
+            n_iter=15,
+            cv=TimeSeriesSplit(n_splits=3),
+            scoring='neg_root_mean_squared_error',
+            n_jobs=-1,
+            random_state=42,
+            verbose=0
+        )
+        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
+        bayes_search.fit(X, y, sample_weight=sample_weights)
+        best_params = bayes_search.best_params_
     except Exception as e:
-        st.warning(f"Optuna tuning failed for XGBoost. Using default parameters. Error: {e}")
+        st.warning(f"Bayesian search failed for XGBoost. Using default parameters. Error: {e}")
         best_params = {}
     
-    final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
+    final_params = {'objective': 'reg:squarederror', 'random_state': 42}
     final_params.update(best_params)
     
     return _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df)
@@ -554,50 +546,46 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, weathe
     df_featured = historical_df.copy()
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
     elif 'forecast_customers' not in df_featured.columns:
         df_featured['forecast_customers'] = 0
 
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
-    features = list(set(all_possible_features))
-
-    def objective(trial):
-        X = df_featured[features].copy()
-        y = df_featured[target_col].copy()
-        
-        common_index = X.dropna().index.intersection(y.dropna().index)
-        X = X.loc[common_index].dropna()
-        y = y.loc[common_index]
-        
-        cv = TimeSeriesSplit(n_splits=3)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            
-            param = {
-                'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'random_state': 42, 'verbosity': -1,
-                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-                'num_leaves': trial.suggest_int('num_leaves', 20, 50),
-                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            }
-            model = lgb.LGBMRegressor(**param)
-            sample_weights = np.exp(np.linspace(-2, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, callbacks=[lgb_early_stopping(50, verbose=False)])
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
+    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
+    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
+    
+    X = df_featured[features].copy()
+    y = df_featured[target_col].copy()
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index].dropna()
+    y = y.loc[common_index]
+    
+    search_spaces = {
+        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
+        'num_leaves': Integer(20, 60),
+        'subsample': Real(0.6, 1.0, 'uniform'),
+        'colsample_bytree': Real(0.6, 1.0, 'uniform'),
+        'n_estimators': Integer(500, 2000)
+    }
 
     try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180)
-        best_params = study.best_params
+        bayes_search = BayesSearchCV(
+            estimator=lgb.LGBMRegressor(random_state=42, objective='regression_l1', verbosity=-1),
+            search_spaces=search_spaces,
+            n_iter=15,
+            cv=TimeSeriesSplit(n_splits=3),
+            scoring='neg_root_mean_squared_error',
+            n_jobs=-1,
+            random_state=42,
+            verbose=0
+        )
+        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
+        bayes_search.fit(X, y, sample_weight=sample_weights)
+        best_params = bayes_search.best_params_
     except Exception as e:
-        st.warning(f"Optuna tuning failed for LightGBM. Using default parameters. Error: {e}")
+        st.warning(f"Bayesian search failed for LightGBM. Using default parameters. Error: {e}")
         best_params = {}
     
-    final_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'verbosity': -1}
+    final_params = {'random_state': 42, 'objective': 'regression_l1', 'verbosity': -1}
     final_params.update(best_params)
 
     return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df)
@@ -609,49 +597,45 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weathe
     df_featured = historical_df.copy()
     if target_col == 'atv' and customer_forecast_df is not None:
         df_featured = pd.merge(df_featured, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_featured['forecast_customers'].fillna(method='ffill', inplace=True)
+        df_featured['forecast_customers'].fillna(method='ffill', inplace=True).fillna(0, inplace=True)
     elif 'forecast_customers' not in df_featured.columns:
         df_featured['forecast_customers'] = 0
 
-    all_possible_features = [col for col in df_featured.columns if df_featured[col].dtype in ['int64', 'float64'] and col not in ['sales', 'customers', 'atv', target_col]]
-    features = list(set(all_possible_features))
+    features = [f for f in df_featured.columns if f in create_advanced_features(df_featured.head(1)).columns or f == 'forecast_customers']
+    features = [f for f in features if df_featured[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', target_col]]
 
-    def objective(trial):
-        X = df_featured[features].copy()
-        y = df_featured[target_col].copy()
+    X = df_featured[features].copy()
+    y = df_featured[target_col].copy()
+    common_index = X.dropna().index.intersection(y.dropna().index)
+    X = X.loc[common_index].dropna()
+    y = y.loc[common_index]
 
-        common_index = X.dropna().index.intersection(y.dropna().index)
-        X = X.loc[common_index].dropna()
-        y = y.loc[common_index]
-
-        cv = TimeSeriesSplit(n_splits=3)
-        scores = []
-        for train_idx, val_idx in cv.split(X):
-            if len(train_idx) < 10 or len(val_idx) < 10: continue
-            X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            
-            param = {
-                'objective': 'RMSE', 'iterations': 2000, 'random_seed': 42, 'verbose': 0,
-                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-                'depth': trial.suggest_int('depth', 4, 10),
-                'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1e-8, 10.0, log=True),
-            }
-            model = cat.CatBoostRegressor(**param)
-            sample_weights = np.exp(np.linspace(-2, 0, len(y_train)))
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, early_stopping_rounds=50)
-            preds = model.predict(X_val)
-            scores.append(mean_squared_error(y_val, preds, squared=False))
-        return np.mean(scores) if scores else float('inf')
-
+    search_spaces = {
+        'learning_rate': Real(1e-3, 0.2, 'log-uniform'),
+        'depth': Integer(4, 10),
+        'l2_leaf_reg': Real(1e-8, 10.0, 'log-uniform'),
+        'iterations': Integer(500, 2000)
+    }
+    
     try:
-        study = optuna.create_study(direction='minimize')
-        study.optimize(objective, n_trials=15, timeout=180)
-        best_params = study.best_params
+        bayes_search = BayesSearchCV(
+            estimator=cat.CatBoostRegressor(random_seed=42, objective='RMSE', verbose=0),
+            search_spaces=search_spaces,
+            n_iter=15,
+            cv=TimeSeriesSplit(n_splits=3),
+            scoring='neg_root_mean_squared_error',
+            n_jobs=-1,
+            random_state=42,
+            verbose=0
+        )
+        sample_weights = np.exp(np.linspace(-2, 0, len(y)))
+        bayes_search.fit(X, y, sample_weight=sample_weights)
+        best_params = bayes_search.best_params_
     except Exception as e:
-        st.warning(f"Optuna tuning failed for CatBoost. Using default parameters. Error: {e}")
+        st.warning(f"Bayesian search failed for CatBoost. Using default parameters. Error: {e}")
         best_params = {}
 
-    final_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 2000, 'verbose': 0}
+    final_params = {'random_seed': 42, 'objective': 'RMSE', 'verbose': 0}
     final_params.update(best_params)
     
     return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, weather_forecast_df, customer_forecast_df, is_catboost=True)
@@ -946,26 +930,22 @@ if db:
                             hist_df_featured = create_advanced_features(hist_df_with_atv, weather_df)
                             ev_df = st.session_state.events_df.copy()
 
-                        # STAGE 1: Forecast Customers
                         with st.spinner("Stage 1: Training Customer Base Models..."):
                             prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
                             xgb_cust_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
                             lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
                             cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', weather_df)
 
-                        cust_f = pd.DataFrame()
                         with st.spinner("Stage 1: Stacking Customer models..."):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                         
-                        # STAGE 2: Forecast ATV using Customer Forecast as a feature
                         with st.spinner("Stage 2: Training ATV Base Models (using customer forecast)..."):
                             prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
                             xgb_atv_f = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
                             lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
                             cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', weather_df, customer_forecast_df=cust_f)
 
-                        atv_f = pd.DataFrame()
                         with st.spinner("Stage 2: Stacking ATV models for final prediction..."):
                             base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
                             atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
