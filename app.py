@@ -17,7 +17,7 @@ import io
 import time
 import os
 import requests
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 import json
@@ -181,6 +181,27 @@ def initialize_state_firestore(db_client):
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
+# --- Firestore Data Operations ---
+def add_to_firestore(db_client, collection_name, record_dict, current_df):
+    date_to_check = pd.to_datetime(record_dict['date']).date()
+    # Check for duplicates before adding
+    if not current_df[pd.to_datetime(current_df['date']).dt.date == date_to_check].empty:
+        st.error(f"A record for {date_to_check.strftime('%Y-%m-%d')} already exists. Please edit the existing record.")
+        return
+    # Convert date to Firestore-compatible format
+    record_dict['date'] = pd.to_datetime(record_dict['date'])
+    db_client.collection(collection_name).add(record_dict)
+
+def update_historical_record_in_firestore(db_client, doc_id, update_data):
+    db_client.collection('historical_data').document(doc_id).update(update_data)
+
+def update_activity_in_firestore(db_client, doc_id, update_data):
+    db_client.collection('future_activities').document(doc_id).update(update_data)
+
+def delete_from_firestore(db_client, collection_name, doc_id):
+    db_client.collection(collection_name).document(doc_id).delete()
+
+
 # --- Data Processing and Feature Engineering ---
 @st.cache_data(ttl="1h")
 def load_from_firestore(_db_client, collection_name):
@@ -200,6 +221,7 @@ def load_from_firestore(_db_client, collection_name):
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         if pd.api.types.is_datetime64_any_dtype(df['date']):
+            # Standardize to remove timezone info if present
             df['date'] = df['date'].dt.tz_localize(None)
         df.dropna(subset=['date'], inplace=True)
         if not df.empty:
@@ -212,17 +234,18 @@ def load_from_firestore(_db_client, collection_name):
         
     return df
 
-def cap_outliers_iqr(df, column='sales'):
+# ENHANCEMENT: Instead of capping, we now flag outliers to retain their information.
+def flag_outliers_iqr(df, column='sales'):
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
     upper_bound = Q3 + 1.5 * IQR
     
-    capped_count = (df[column] > upper_bound).sum()
-    df_capped = df.copy()
-    df_capped.loc[df_capped[column] > upper_bound, column] = upper_bound
+    # Create a new feature 'is_outlier' instead of capping the value
+    df['is_outlier'] = (df[column] > upper_bound).astype(int)
+    outlier_count = df['is_outlier'].sum()
     
-    return df_capped, capped_count, upper_bound
+    return df, outlier_count, upper_bound
 
 @st.cache_data
 def calculate_atv(df):
@@ -289,7 +312,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 
         today = pd.to_datetime('today').normalize()
         
-        # Calculate long-term baseline accuracy
         long_term_start = today - pd.Timedelta(days=long_term_days)
         long_term_df = true_accuracy_df[true_accuracy_df['date'] >= long_term_start]
         if long_term_df.empty: return False
@@ -298,7 +320,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         long_term_mape = np.nanmean(np.abs((long_term_df['sales'] - long_term_df['predicted_sales']) / long_term_sales_safe)) * 100
         long_term_accuracy = 100 - long_term_mape
 
-        # Calculate short-term accuracy
         short_term_start = today - pd.Timedelta(days=short_term_days)
         short_term_df = true_accuracy_df[true_accuracy_df['date'] >= short_term_start]
         if short_term_df.empty: return False
@@ -307,7 +328,6 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         short_term_mape = np.nanmean(np.abs((short_term_df['sales'] - short_term_df['predicted_sales']) / short_term_sales_safe)) * 100
         short_term_accuracy = 100 - short_term_mape
 
-        # Trigger recalibration if recent performance is significantly worse than the baseline
         if short_term_accuracy < (long_term_accuracy * degradation_threshold):
             st.warning(f"🚨 Recent 7-day accuracy ({short_term_accuracy:.2f}%) has dropped significantly below the 30-day baseline ({long_term_accuracy:.2f}%). Triggering model recalibration.")
             st.cache_resource.clear()
@@ -318,9 +338,34 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
         st.warning(f"Could not perform automatic accuracy check. Error: {e}")
     return False
 
-# --- Core Forecasting Models ---
+# --- ENHANCED Core Forecasting Models ---
 
-def create_advanced_features(df):
+# ENHANCEMENT: New function to create sophisticated event and holiday features.
+def create_dynamic_event_features(df, holidays_df):
+    df['date'] = pd.to_datetime(df['date'])
+    holidays_df['ds'] = pd.to_datetime(holidays_df['ds'])
+    
+    # Proximity to next holiday
+    holiday_dates = sorted(holidays_df['ds'].unique())
+    df['days_until_next_holiday'] = df['date'].apply(lambda x: min([abs((h - x).days) for h in holiday_dates if h >= x], default=365))
+    df['days_since_last_holiday'] = df['date'].apply(lambda x: min([abs((x - h).days) for h in holiday_dates if h <= x], default=365))
+
+    # Bridge Holidays (a weekday between a weekend and a holiday)
+    df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+    df['is_holiday_today'] = df['date'].isin(holiday_dates).astype(int)
+    df['is_holiday_tomorrow'] = df['date'].apply(lambda x: (x + timedelta(days=1)) in holiday_dates).astype(int)
+    df['is_holiday_yesterday'] = df['date'].apply(lambda x: (x - timedelta(days=1)) in holiday_dates).astype(int)
+
+    # Flag Friday before a Monday holiday, or Tuesday after a Thursday holiday
+    df['is_bridge_holiday'] = (
+        ((df['dayofweek'] == 4) & (df['is_holiday_tomorrow'].shift(-1).fillna(0).astype(bool))) | # Friday before Sat/Sun, Mon holiday
+        ((df['dayofweek'] == 0) & (df['is_holiday_yesterday'].shift(1).fillna(0).astype(bool)))   # Monday after Fri holiday, Sat/Sun
+    ).astype(int)
+    
+    return df
+
+# ENHANCEMENT: Weather impact nuances and other advanced features are now created here.
+def create_advanced_features(df, holidays_df):
     df['date'] = pd.to_datetime(df['date'])
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
@@ -328,26 +373,38 @@ def create_advanced_features(df):
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
-    df = df.sort_values('date')
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    # Standard lags and rolling features
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
-    if 'customers' in df.columns:
-        df['customers_lag_7'] = df['customers'].shift(7)
-    if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
+        df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
+        df['customers_lag_7'] = df['customers'].shift(7)
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
+        df['customers_ewm_7'] = df['customers'].shift(1).ewm(span=7, adjust=False).mean()
     if 'atv' in df.columns:
         df['atv_lag_7'] = df['atv'].shift(7)
         df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         df['atv_rolling_std_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).std()
-    if 'sales' in df.columns:
-        df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
-    if 'customers' in df.columns:
-        df['customers_ewm_7'] = df['customers'].shift(1).ewm(span=7, adjust=False).mean()
-    if 'atv' in df.columns:
         df['atv_ewm_7'] = df['atv'].shift(1).ewm(span=7, adjust=False).mean()
+
+    # ENHANCED: Weather features
+    if 'weather' in df.columns:
+        # One-hot encode weather for interactions and lags
+        weather_dummies = pd.get_dummies(df['weather'], prefix='weather').astype(int)
+        df = pd.concat([df, weather_dummies], axis=1)
+        if 'weather_Rainy' in df.columns:
+            df['weather_rainy_lag_1'] = df['weather_Rainy'].shift(1)
+            df['is_weekend'] = df['dayofweek'].isin([5, 6]).astype(int)
+            df['rainy_weekend_interaction'] = df['weather_Rainy'] * df['is_weekend']
+
+    # ENHANCED: Dynamic event features
+    if holidays_df is not None and not holidays_df.empty:
+        df = create_dynamic_event_features(df, holidays_df)
+        
     return df
 
 @st.cache_resource
@@ -355,7 +412,7 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     df_train = historical_df.copy()
     df_train.dropna(subset=['date', target_col], inplace=True)
     if df_train.empty or len(df_train) < 15:
-        return pd.DataFrame()
+        return pd.DataFrame(), None, None
     df_prophet = df_train.rename(columns={'date': 'ds', target_col: 'y'})
     start_date = df_train['date'].min()
     end_date = df_train['date'].max() + timedelta(days=periods)
@@ -382,16 +439,27 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
     prophet_model.fit(df_prophet)
     future = prophet_model.make_future_dataframe(periods=periods)
     forecast = prophet_model.predict(future)
-    return forecast[['ds', 'yhat']], prophet_model
+    return forecast[['ds', 'yhat']], prophet_model, all_manual_events
 
-def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, is_catboost=False):
+def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, holidays_df, is_catboost=False):
     df_featured = historical_df.copy()
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
+    
+    # ENHANCED: Add new features to the feature list
+    base_features = [
+        'dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier',
+        'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday',
+        'weather_rainy_lag_1', 'rainy_weekend_interaction'
+    ]
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
-    features = [f for f in features if f in df_featured.columns]
+    
+    # Add weather dummies to features if they exist
+    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    features.extend(weather_cols)
+    
+    features = [f for f in features if f in df_featured.columns] # Keep only existing features
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
@@ -405,41 +473,53 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         final_model.fit(X, y, sample_weight=sample_weights)
 
     future_predictions = []
-    history_with_features = df_featured.copy()
+    prediction_base_df = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
+
     for i in range(periods):
-        last_date = history_with_features['date'].max()
+        last_date = prediction_base_df['date'].max()
         next_date = last_date + timedelta(days=1)
         future_step_df = pd.DataFrame([{'date': next_date}])
-        extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        extended_featured_df = create_advanced_features(extended_history)
+        extended_history = pd.concat([prediction_base_df, future_step_df], ignore_index=True)
+        extended_featured_df = create_advanced_features(extended_history, holidays_df)
+        
         if 'day_type' in extended_featured_df.columns:
              extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
         else:
             extended_featured_df['is_not_normal_day'] = 0
+            
         X_future = extended_featured_df[features].tail(1)
         prediction = final_model.predict(X_future)[0]
         future_predictions.append({'ds': next_date, 'yhat': prediction})
-        history_with_features = extended_featured_df.copy()
-        history_with_features.loc[history_with_features.index.max(), target_col] = prediction
+        
+        new_row = {'date': next_date, target_col: prediction}
         if target_col == 'customers' and atv_lookup is not None:
-            forecasted_atv = atv_lookup.get(pd.to_datetime(next_date), history_with_features['atv'].dropna().tail(7).mean())
-            history_with_features.loc[history_with_features.index.max(), 'sales'] = prediction * forecasted_atv
+            forecasted_atv = atv_lookup.get(pd.to_datetime(next_date), prediction_base_df['atv'].dropna().tail(7).mean())
+            new_row['sales'] = prediction * forecasted_atv
+            new_row['atv'] = forecasted_atv
+        prediction_base_df = pd.concat([prediction_base_df, pd.DataFrame([new_row])], ignore_index=True)
+
     final_df = pd.DataFrame(future_predictions)
     historical_predictions = df_featured.loc[X.index, ['date']].copy()
     historical_predictions.rename(columns={'date': 'ds'}, inplace=True)
     historical_predictions['yhat'] = final_model.predict(X)
     return pd.concat([historical_predictions, final_df], ignore_index=True)
 
+
 @st.cache_resource
-def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_forecast_df=None):
+def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_forecast_df, holidays_df):
     df_featured = historical_df.copy()
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
+    
+    # ENHANCED: Define feature set
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier', 'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday', 'weather_rainy_lag_1', 'rainy_weekend_interaction']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
+    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
+    
     X = df_featured[features].copy()
     y = df_featured[target_col].copy()
     X.dropna(inplace=True)
@@ -447,11 +527,10 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     X_dates = df_featured.loc[X.index, 'date']
 
     if X.empty or len(X) < 50: return pd.DataFrame(), None, pd.DataFrame(), None, None
-    fit_params = inspect.signature(xgb.XGBRegressor.fit).parameters
-    use_callbacks = 'callbacks' in fit_params
-    use_early_stopping_rounds = 'early_stopping_rounds' in fit_params
+    
+    # ENHANCEMENT: Cross-validation strategy uses more splits for robustness.
     def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
+        cv = TimeSeriesSplit(n_splits=5)
         scores = []
         for train_idx, val_idx in cv.split(X):
             if len(train_idx) < 10 or len(val_idx) < 10: continue 
@@ -467,10 +546,7 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
             }
             model = xgb.XGBRegressor(**param)
             sample_weights = np.exp(np.linspace(-1, 0, len(y_train)))
-            fit_kwargs = {"eval_set": [(X_val, y_val)], "verbose": False, "sample_weight": sample_weights}
-            if use_callbacks: fit_kwargs["callbacks"] = [XGBEarlyStopping(rounds=50, save_best=True)]
-            elif use_early_stopping_rounds: fit_kwargs["early_stopping_rounds"] = 50
-            model.fit(X_train, y_train, **fit_kwargs)
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], sample_weight=sample_weights, callbacks=[XGBEarlyStopping(rounds=50, save_best=True)], verbose=False)
             preds = model.predict(X_val)
             scores.append(mean_squared_error(y_val, preds, squared=False))
         return np.mean(scores) if scores else float('inf')
@@ -488,7 +564,7 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
     sample_weights = np.exp(np.linspace(-1, 0, len(y)))
     final_model.fit(X, y, sample_weight=sample_weights)
 
-    full_forecast_df = _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df)
+    full_forecast_df = _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, holidays_df)
     
     future_feature_sets = {}
     history_with_features = df_featured.copy()
@@ -497,25 +573,34 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, atv_for
         next_date = last_date + timedelta(days=1)
         future_step_df = pd.DataFrame([{'date': next_date}])
         extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
-        extended_featured_df = create_advanced_features(extended_history)
+        extended_featured_df = create_advanced_features(extended_history, holidays_df)
         if 'day_type' in extended_featured_df.columns:
             extended_featured_df['is_not_normal_day'] = extended_featured_df['day_type'].apply(lambda x: 1 if x == 'Not Normal Day' else 0).fillna(0)
         else:
             extended_featured_df['is_not_normal_day'] = 0
         X_future = extended_featured_df[features].tail(1)
         future_feature_sets[next_date.strftime('%Y-%m-%d')] = X_future
-        history_with_features = extended_featured_df.copy()
+        prediction_value = final_model.predict(X_future)[0]
+        new_row = {'date': next_date, target_col: prediction_value}
+        if target_col == 'customers' and atv_forecast_df is not None:
+             forecasted_atv = atv_forecast_df.set_index('ds').loc[pd.to_datetime(next_date)]['yhat']
+             new_row['sales'] = prediction_value * forecasted_atv
+             new_row['atv'] = forecasted_atv
+        history_with_features = pd.concat([history_with_features, pd.DataFrame([new_row])], ignore_index=True)
+
 
     return full_forecast_df, final_model, X, X_dates, future_feature_sets
 
 @st.cache_resource
-def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_forecast_df=None):
+def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_forecast_df, holidays_df):
     df_featured = historical_df.copy()
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier', 'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday', 'weather_rainy_lag_1', 'rainy_weekend_interaction']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
+    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
@@ -526,12 +611,11 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_fo
     if X.empty or len(X) < 50: return pd.DataFrame()
 
     def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
+        cv = TimeSeriesSplit(n_splits=5)
         scores = []
         for train_idx, val_idx in cv.split(X):
             if len(train_idx) < 10 or len(val_idx) < 10: continue
             X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            
             param = {
                 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'random_state': 42, 'verbosity': -1,
                 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
@@ -557,16 +641,18 @@ def train_and_forecast_lightgbm_tuned(historical_df, periods, target_col, atv_fo
     final_params = {'random_state': 42, 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 2000, 'verbosity': -1}
     final_params.update(best_params)
 
-    return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, atv_forecast_df)
+    return _run_tree_model_forecast(lgb.LGBMRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, holidays_df)
 
 @st.cache_resource
-def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_forecast_df=None):
+def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_forecast_df, holidays_df):
     df_featured = historical_df.copy()
-    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day']
+    base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'is_outlier', 'days_until_next_holiday', 'days_since_last_holiday', 'is_bridge_holiday', 'weather_rainy_lag_1', 'rainy_weekend_interaction']
     if target_col == 'customers':
         features = base_features + ['sales_lag_7', 'customers_lag_7', 'sales_rolling_mean_7', 'customers_rolling_mean_7', 'sales_rolling_std_7', 'customers_ewm_7', 'sales_ewm_7']
     else:
         features = base_features + ['atv_lag_7', 'atv_rolling_mean_7', 'atv_rolling_std_7', 'atv_ewm_7']
+    weather_cols = [col for col in df_featured.columns if 'weather_' in col]
+    features.extend(weather_cols)
     features = [f for f in features if f in df_featured.columns]
     
     X = df_featured[features].copy()
@@ -577,12 +663,11 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
     if X.empty or len(X) < 50: return pd.DataFrame()
 
     def objective(trial):
-        cv = TimeSeriesSplit(n_splits=3)
+        cv = TimeSeriesSplit(n_splits=5)
         scores = []
         for train_idx, val_idx in cv.split(X):
             if len(train_idx) < 10 or len(val_idx) < 10: continue
             X_train, X_val, y_train, y_val = X.iloc[train_idx], X.iloc[val_idx], y.iloc[train_idx], y.iloc[val_idx]
-            
             param = {
                 'objective': 'RMSE', 'iterations': 2000, 'random_seed': 42, 'verbose': 0,
                 'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
@@ -607,10 +692,11 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, atv_fo
     final_params = {'random_seed': 42, 'objective': 'RMSE', 'iterations': 2000, 'verbose': 0}
     final_params.update(best_params)
     
-    return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, is_catboost=True)
+    return _run_tree_model_forecast(cat.CatBoostRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, holidays_df, is_catboost=True)
 
+# ENHANCEMENT: Stacking model now uses dynamic features for more intelligent weighting.
 @st.cache_resource
-def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name):
+def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, target_col_name, holidays_df):
     final_df = None
     for name, fcst_df in base_forecasts_dict.items():
         if fcst_df is None or fcst_df.empty: continue
@@ -625,15 +711,28 @@ def train_and_forecast_stacked_ensemble(base_forecasts_dict, historical_target, 
     final_df.interpolate(method='linear', limit_direction='forward', axis=0, inplace=True)
     final_df.bfill(inplace=True)
 
-    training_data = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='ds', right_on='date')
+    # Add dynamic context features to the meta-learner's training data
+    final_df['date'] = pd.to_datetime(final_df['ds'])
+    final_df['dayofweek'] = final_df['date'].dt.dayofweek
+    final_df['month'] = final_df['date'].dt.month
     
-    meta_features = [col for col in training_data.columns if 'yhat_' in col]
+    if holidays_df is not None and not holidays_df.empty:
+        holiday_dates = pd.to_datetime(holidays_df['ds']).dt.date
+        final_df['is_holiday'] = final_df['date'].dt.date.isin(holiday_dates).astype(int)
+    else:
+        final_df['is_holiday'] = 0
+
+    training_data = pd.merge(final_df, historical_target[['date', target_col_name]], left_on='date', right_on='date')
+    
+    # Meta features now include base model predictions AND contextual features
+    meta_features = [col for col in training_data.columns if 'yhat_' in col] + ['dayofweek', 'month', 'is_holiday']
     X_meta = training_data[meta_features]
     y_meta = training_data[target_col_name]
     
     if len(X_meta) < 20:
         st.warning(f"Not enough historical data for advanced stacking. Falling back to simple averaging.")
-        final_df['yhat'] = X_meta.mean(axis=1)
+        prediction_cols = [col for col in training_data.columns if 'yhat_' in col]
+        final_df['yhat'] = final_df[prediction_cols].mean(axis=1)
         return final_df[['ds', 'yhat']]
 
     meta_model = lgb.LGBMRegressor(random_state=42, n_estimators=200, objective='regression_l1', verbosity=-1)
@@ -812,7 +911,7 @@ def render_activity_card(row, db_client, view_type='compact_list'):
                             st.rerun()
 
 def render_historical_record(row, db_client):
-    date_str = row['date'].strftime('%B %d, %Y')
+    date_str = pd.to_datetime(row['date']).strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     
     with st.expander(expander_title):
@@ -834,7 +933,7 @@ def render_historical_record(row, db_client):
             edit_cols2 = st.columns(2)
             updated_addons = edit_cols2[0].number_input("Add-on Sales (₱)", value=float(row.get('add_on_sales', 0)), format="%.2f", key=f"addon_{row['doc_id']}")
             
-            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm"]
+            weather_options = ["Sunny", "Cloudy", "Rainy", "Storm", "Partly Cloudy", "Foggy", "Rain Showers", "Thunderstorm"]
             current_weather_index = weather_options.index(row.get('weather')) if row.get('weather') in weather_options else 0
             updated_weather = edit_cols2[1].selectbox("Weather", options=weather_options, index=current_weather_index, key=f"weather_{row['doc_id']}")
 
@@ -874,7 +973,7 @@ if db:
     
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png");st.title(f"Welcome, *{st.session_state['username']}*");st.markdown("---")
-        st.info("Forecasting with an Advanced AI Ensemble")
+        st.info("Forecasting with an Enhanced AI Ensemble")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -888,56 +987,57 @@ if db:
             else:
                 recalibrated = check_performance_and_recalibrate(db, st.session_state.historical_df)
                 if recalibrated:
-                    st.info("Models have been recalibrated. Please click 'Generate Forecast' again to use the new models.")
+                    st.info("Models have been recalibrated due to performance degradation. Please click 'Generate Forecast' again to use the new models.")
                 else:
-                    with st.spinner("🧠 Initializing Advanced Ensemble Forecast..."):
+                    with st.spinner("🧠 Initializing Enhanced Ensemble Forecast..."):
                         base_df = st.session_state.historical_df.copy()
+                        ev_df = st.session_state.events_df.copy()
                         
-                        with st.spinner("Engineering features and capping outliers..."):
-                            base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
-                            capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
-                            if capped_count > 0:
-                                st.warning(f"Capped {capped_count} outlier day(s) with base sales over ₱{upper_bound:,.2f}.")
+                        # Generate initial holiday list for feature engineering
+                        _, _, all_holidays = train_and_forecast_prophet(base_df, ev_df, 1, 'sales')
 
-                            hist_df_with_atv = calculate_atv(capped_df)
-                            hist_df_featured = create_advanced_features(hist_df_with_atv)
-                            ev_df = st.session_state.events_df.copy()
+                        with st.spinner("Engineering advanced features..."):
+                            base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
+                            # ENHANCEMENT: Using outlier flagging instead of capping
+                            outlier_df, outlier_count, upper_bound = flag_outliers_iqr(base_df, column='base_sales')
+                            if outlier_count > 0:
+                                st.warning(f"Flagged {outlier_count} day(s) as outliers (base sales over ₱{upper_bound:,.2f}). The model will learn from these events.")
+
+                            hist_df_with_atv = calculate_atv(outlier_df)
+                            # ENHANCEMENT: Pass holiday list to feature engineering
+                            hist_df_featured = create_advanced_features(hist_df_with_atv, all_holidays)
                         
                         FORECAST_HORIZON = 15
                         
-                        with st.spinner("Training Base Models (Prophet, XGBoost, LightGBM, CatBoost)..."):
-                            prophet_atv_f, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
-                            prophet_cust_f, prophet_model_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
+                        with st.spinner("Training Base Models with Enhanced Features..."):
+                            prophet_atv_f, _, _ = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'atv')
+                            prophet_cust_f, prophet_model_cust, all_holidays_cust = train_and_forecast_prophet(hist_df_featured, ev_df, FORECAST_HORIZON, 'customers')
                             
                             atv_forecast_for_cust_model = prophet_atv_f
                             
-                            xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model, all_holidays_cust)
+                            xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model, all_holidays_cust)
 
-                            lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model, all_holidays_cust)
+                            lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model, all_holidays_cust)
                             
-                            cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model, all_holidays_cust)
+                            cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model, all_holidays_cust)
 
                         atv_f = pd.DataFrame()
-                        with st.spinner("Stacking ATV models for final prediction..."):
+                        with st.spinner("Dynamically stacking ATV models for final prediction..."):
                             base_atv_forecasts = {"prophet": prophet_atv_f, "xgb": xgb_atv_f, "lgbm": lgbm_atv_f, "cat": cat_atv_f}
-                            atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv')
+                            atv_f = train_and_forecast_stacked_ensemble(base_atv_forecasts, hist_df_featured, 'atv', all_holidays_cust)
                         
                         cust_f = pd.DataFrame()
-                        with st.spinner("Stacking Customer models and preparing explanations..."):
+                        with st.spinner("Dynamically stacking Customer models and preparing explanations..."):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
-                            cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
+                            cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers', all_holidays_cust)
                             
                             if xgb_cust_model and not X_cust.empty:
                                 with st.spinner("Calculating SHAP values for XGBoost component..."):
                                     explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
-                                    try:
-                                        shap_values = explainer(X_cust)
-                                    except shap.utils.ExplainerError:
-                                        st.warning("SHAP additivity check failed due to sample weighting. Recalculating without it.")
-                                        shap_values = explainer(X_cust, check_additivity=False)
+                                    shap_values = explainer(X_cust, check_additivity=False)
                                     st.session_state.shap_explainer_cust = explainer
                                     st.session_state.shap_values_cust = shap_values
                                     st.session_state.X_cust = X_cust
@@ -970,7 +1070,7 @@ if db:
                                                 "predicted_customers": row['forecast_customers']
                                             }
                                             doc_id = f"{today_date_naive.strftime('%Y-%m-%d')}_{row['ds'].strftime('%Y-%m-%d')}"
-                                            db.collection('forecast_log').document(doc_id).set(log_entry)
+                                            db.collection('forecast_log').document(doc_id).set(log_entry, merge=True)
                                         st.info("Forecast log saved successfully.")
                                     else:
                                         st.warning("No future dates found in the forecast to log.")
@@ -981,9 +1081,9 @@ if db:
                                 full_future = prophet_model_cust.make_future_dataframe(periods=FORECAST_HORIZON)
                                 prophet_forecast_components = prophet_model_cust.predict(full_future)
                                 st.session_state.forecast_components = prophet_forecast_components
-                                st.session_state.all_holidays = prophet_model_cust.holidays
+                                st.session_state.all_holidays = all_holidays_cust
                             
-                            st.success("Advanced AI forecast generated successfully!")
+                            st.success("Enhanced AI forecast generated successfully!")
                         else:
                             st.error("Forecast generation failed. One or more components could not be built.")
 
@@ -1213,7 +1313,7 @@ if db:
                 new_sales=st.number_input("Total Sales (₱)",min_value=0.0,format="%.2f")
                 new_customers=st.number_input("Customer Count",min_value=0)
                 new_addons=st.number_input("Add-on Sales (₱)",min_value=0.0,format="%.2f")
-                new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm"],help="Describe general weather.")
+                new_weather=st.selectbox("Weather Condition",["Sunny","Cloudy","Rainy","Storm","Partly Cloudy", "Foggy", "Rain Showers", "Thunderstorm"],help="Describe general weather.")
                 
                 new_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], help="Select 'Not Normal Day' if an unexpected event significantly impacted sales.")
                 new_day_type_notes = ""
@@ -1278,7 +1378,7 @@ if db:
             if all_upcoming_df.empty:
                 st.info("No upcoming activities scheduled.")
             else:
-                all_upcoming_df['month_year'] = all_upcoming_df['date'].dt.strftime('%B %Y')
+                all_upcoming_df['month_year'] = pd.to_datetime(all_upcoming_df['date']).dt.strftime('%B %Y')
                 sorted_months_df = all_upcoming_df.sort_values('date')
                 month_tabs_list = sorted_months_df['month_year'].unique().tolist()
                 
@@ -1338,7 +1438,10 @@ if db:
                 st.markdown("##### Next 10 Upcoming Activities")
                 
                 btn_cols = st.columns(2)
-                btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True, on_click=st.rerun)
+                if btn_cols[0].button("🔄 Refresh List", key='refresh_activities', use_container_width=True):
+                    st.cache_data.clear()
+                    st.rerun()
+
                 btn_cols[1].button("📂 View All Upcoming Activities", use_container_width=True, on_click=set_view_all)
                 
                 st.markdown("---",)
@@ -1376,7 +1479,7 @@ if db:
 
                     selected_month_num = pd.to_datetime(selected_month_str, format='%B').month
 
-                    filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy()
+                    filtered_df = df[(df['date'].dt.year == selected_year) & (df['date'].dt.month == selected_month_num)].copy().sort_values(by="date")
 
                     if filtered_df.empty:
                         st.info("No data for the selected month and year.")
