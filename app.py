@@ -244,7 +244,8 @@ def get_weather_forecast(days=16):
         df['date']=pd.to_datetime(df['date']);df['weather_condition']=df['weather_code'].apply(map_weather_code)
         return df[['date', 'temp_max', 'precipitation', 'wind_speed', 'weather_condition']]
     except requests.exceptions.RequestException as e:
-        st.error(f"Could not fetch weather data. Please try again later. Error: {e}")
+        # Do not show a full error, just return None so the main app can handle it
+        print(f"Weather API Error: {e}")
         return None
 
 def map_weather_code(code):
@@ -317,11 +318,16 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 def create_advanced_features(df, weather_df=None):
     df['date'] = pd.to_datetime(df['date'])
     
-    # --- FIXED: Integrate weather data before creating features ---
-    if weather_df is not None:
+    if weather_df is not None and not weather_df.empty:
         df = pd.merge(df, weather_df, on='date', how='left')
-        # Simple forward fill for any missing weather data (e.g., on weekends if API has gaps)
-        df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill')
+    
+    # Ensure weather columns exist even if the merge fails or weather_df is empty
+    for col in ['temp_max', 'precipitation', 'wind_speed']:
+        if col not in df.columns:
+            df[col] = 0 # Default to a neutral value
+
+    # --- CORRECTED: Robustly fill missing weather data with 0 after trying to forward-fill ---
+    df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill').fillna(0)
 
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
@@ -332,7 +338,7 @@ def create_advanced_features(df, weather_df=None):
     
     df = df.sort_values('date')
     
-    # Lag and Rolling features (using shift(1) to prevent data leakage from the current day)
+    # Lag and Rolling features
     if 'sales' in df.columns:
         df['sales_lag_7'] = df['sales'].shift(7)
     if 'customers' in df.columns:
@@ -395,7 +401,6 @@ def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
 def _run_tree_model_forecast(model_class, params, historical_df, periods, target_col, atv_forecast_df, weather_forecast_df, is_catboost=False):
     df_featured = historical_df.copy()
     
-    # --- Weather features are now part of the standard feature set ---
     base_features = ['dayofyear', 'dayofweek', 'month', 'year', 'weekofyear', 'is_not_normal_day', 'temp_max', 'precipitation', 'wind_speed']
 
     if target_col == 'customers':
@@ -421,7 +426,7 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
     history_with_features = df_featured.copy()
     atv_lookup = atv_forecast_df.set_index('ds')['yhat'] if atv_forecast_df is not None and not atv_forecast_df.empty else None
     
-    weather_lookup = weather_forecast_df.set_index('date') if weather_forecast_df is not None else None
+    weather_lookup = weather_forecast_df.set_index('date') if weather_forecast_df is not None and not weather_forecast_df.empty else None
 
     for i in range(periods):
         last_date = history_with_features['date'].max()
@@ -429,18 +434,20 @@ def _run_tree_model_forecast(model_class, params, historical_df, periods, target
         
         future_step_df = pd.DataFrame([{'date': next_date}])
         
-        # Add future weather data to the step
         if weather_lookup is not None:
             try:
                 weather_for_day = weather_lookup.loc[next_date]
                 future_step_df['temp_max'] = weather_for_day['temp_max']
                 future_step_df['precipitation'] = weather_for_day['precipitation']
                 future_step_df['wind_speed'] = weather_for_day['wind_speed']
-            except KeyError: # If weather forecast doesn't cover this day, forward fill
-                last_weather = history_with_features[['temp_max', 'precipitation', 'wind_speed']].iloc[-1]
-                future_step_df['temp_max'] = last_weather['temp_max']
-                future_step_df['precipitation'] = last_weather['precipitation']
-                future_step_df['wind_speed'] = last_weather['wind_speed']
+            except KeyError:
+                future_step_df['temp_max'] = 0
+                future_step_df['precipitation'] = 0
+                future_step_df['wind_speed'] = 0
+        else:
+             future_step_df['temp_max'] = 0
+             future_step_df['precipitation'] = 0
+             future_step_df['wind_speed'] = 0
 
         extended_history = pd.concat([history_with_features, future_step_df], ignore_index=True)
         extended_featured_df = create_advanced_features(extended_history)
@@ -526,7 +533,6 @@ def train_and_forecast_xgboost_tuned(historical_df, periods, target_col, weather
     final_params = {'objective': 'reg:squarederror', 'n_estimators': 1000, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'random_state': 42}
     final_params.update(best_params)
     
-    # SHAP logic removed, so we only need the forecast dataframe.
     return _run_tree_model_forecast(xgb.XGBRegressor, final_params, df_featured, periods, target_col, atv_forecast_df, weather_forecast_df)
 
 
@@ -919,14 +925,14 @@ if db:
                         FORECAST_HORIZON = 15
                         
                         with st.spinner("🛰️ Fetching live weather and engineering features..."):
-                            # Logic to fetch enough weather data for historical records and the forecast period
                             weather_df = get_weather_forecast(days=FORECAST_HORIZON + len(base_df))
                             
-                            # --- CORRECTED: Ensure weather data is available before proceeding ---
+                            # --- CORRECTED: Handle weather API failure gracefully ---
                             if weather_df is None:
-                                st.error("Weather data fetch failed. Cannot proceed with forecast. Please try again later.")
-                                st.stop() # Stop execution if weather data is not available
-
+                                st.warning("Could not fetch live weather data. Proceeding without it. Forecast accuracy may be reduced.")
+                                # Create an empty dataframe to prevent crashes downstream
+                                weather_df = pd.DataFrame(columns=['date', 'temp_max', 'precipitation', 'wind_speed', 'weather_condition'])
+                            
                             base_df['base_sales'] = base_df['sales'] - base_df['add_on_sales']
                             capped_df, capped_count, upper_bound = cap_outliers_iqr(base_df, column='base_sales')
                             if capped_count > 0:
@@ -960,16 +966,17 @@ if db:
                         with st.spinner("Stacking Customer models..."):
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
-                            
-                        # --- REMOVED: All SHAP calculation logic has been taken out. ---
                         
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
                             
-                            combo_f = pd.merge(combo_f, weather_df[['date', 'weather_condition']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
-                            combo_f.rename(columns={'weather_condition': 'weather'}, inplace=True)
-                            
+                            if not weather_df.empty:
+                                combo_f = pd.merge(combo_f, weather_df[['date', 'weather_condition']], left_on='ds', right_on='date', how='left').drop(columns=['date'])
+                                combo_f.rename(columns={'weather_condition': 'weather'}, inplace=True)
+                            else:
+                                combo_f['weather'] = 'Unavailable'
+
                             st.session_state.forecast_df = combo_f
                             
                             try:
@@ -1059,7 +1066,6 @@ if db:
                 selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
                 selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
 
-                # --- REMOVED: SHAP tab and logic are gone. Only showing Prophet breakdown now. ---
                 st.subheader("Prophet Model Breakdown")
                 st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
                 breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
