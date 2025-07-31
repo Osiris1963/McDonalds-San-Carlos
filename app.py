@@ -6,7 +6,6 @@ import lightgbm as lgb
 import catboost as cat
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.linear_model import Ridge
 import numpy as np
 import plotly.graph_objs as go
 import yaml
@@ -21,7 +20,6 @@ from firebase_admin import credentials, firestore
 import json
 import logging
 import matplotlib.pyplot as plt
-import inspect
 
 # --- Deep Learning Imports ---
 import torch
@@ -856,14 +854,14 @@ if db:
                             
                             atv_forecast_for_cust_model = prophet_atv_f
                             
-                            xgb_atv_f, _, _, _, _ = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            xgb_cust_f, xgb_cust_model, X_cust, X_cust_dates, future_X_cust = train_and_forecast_xgboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            xgb_atv_f = train_and_forecast_xgboost(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            xgb_cust_f = train_and_forecast_xgboost(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
 
-                            lgbm_atv_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            lgbm_cust_f = train_and_forecast_lightgbm_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            lgbm_atv_f = train_and_forecast_lightgbm(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            lgbm_cust_f = train_and_forecast_lightgbm(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
                             
-                            cat_atv_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
-                            cat_cust_f = train_and_forecast_catboost_tuned(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
+                            cat_atv_f = train_and_forecast_catboost(hist_df_featured, FORECAST_HORIZON, 'atv', atv_forecast_for_cust_model)
+                            cat_cust_f = train_and_forecast_catboost(hist_df_featured, FORECAST_HORIZON, 'customers', atv_forecast_for_cust_model)
 
                             tft_atv_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'atv')
                             tft_cust_f = train_and_forecast_tft(hist_df_featured, FORECAST_HORIZON, 'customers')
@@ -878,20 +876,6 @@ if db:
                             base_cust_forecasts = {"prophet": prophet_cust_f, "xgb": xgb_cust_f, "lgbm": lgbm_cust_f, "cat": cat_cust_f, "tft": tft_cust_f}
                             cust_f = train_and_forecast_stacked_ensemble(base_cust_forecasts, hist_df_featured, 'customers')
                             
-                            if xgb_cust_model and not X_cust.empty:
-                                with st.spinner("Calculating SHAP values for XGBoost component..."):
-                                    explainer = shap.TreeExplainer(xgb_cust_model, feature_perturbation="tree_path_dependent")
-                                    try:
-                                        shap_values = explainer(X_cust)
-                                    except shap.utils.ExplainerError:
-                                        st.warning("SHAP additivity check failed due to sample weighting. Recalculating without it.")
-                                        shap_values = explainer(X_cust, check_additivity=False)
-                                    st.session_state.shap_explainer_cust = explainer
-                                    st.session_state.shap_values_cust = shap_values
-                                    st.session_state.X_cust = X_cust
-                                    st.session_state.X_cust_dates = X_cust_dates
-                                    st.session_state.future_X_cust = future_X_cust
-
                         if not cust_f.empty and not atv_f.empty:
                             combo_f = pd.merge(cust_f.rename(columns={'yhat':'forecast_customers'}), atv_f.rename(columns={'yhat':'forecast_atv'}), on='ds')
                             combo_f['forecast_sales'] = combo_f['forecast_customers'] * combo_f['forecast_atv']
@@ -991,74 +975,13 @@ if db:
                 selected_date_str = st.selectbox("Select a day to analyze its forecast drivers:", options=future_components['date_str'])
                 selected_date = pd.to_datetime(future_components[future_components['date_str'] == selected_date_str]['ds'].iloc[0])
 
-                insight_tab1, insight_tab2 = st.tabs(["Prophet Model Drivers", "XGBoost Model Drivers (SHAP)"])
-
-                with insight_tab1:
-                    st.subheader("Prophet Model Breakdown")
-                    st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
-                    breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
-                    st.plotly_chart(breakdown_fig, use_container_width=True)
-                    st.markdown("---")
-                    st.subheader("Prophet Insight Summary")
-                    st.markdown(generate_insight_summary(day_data, selected_date))
-
-                with insight_tab2:
-                    st.subheader("XGBoost Prediction Breakdown (SHAP Analysis)")
-                    st.info("This waterfall chart shows how each feature contributed to the **XGBoost base model's** prediction. The analysis is limited to the XGBoost component of the ensemble.")
-                    
-                    if st.session_state.shap_explainer_cust is None:
-                        st.warning("SHAP values not available. Please regenerate the forecast.")
-                    else:
-                        try:
-                            plot_generated = False
-                            target_date_dt = pd.to_datetime(selected_date).date()
-                            
-                            if st.session_state.X_cust_dates is not None:
-                                historical_dates = pd.to_datetime(st.session_state.X_cust_dates).dt.date
-                                date_match = (historical_dates == target_date_dt)
-                                if date_match.any():
-                                    date_idx_loc = np.where(date_match)[0][0]
-                                    
-                                    st.markdown(f"##### SHAP Explanation for {selected_date_str} (from historical data)")
-                                    fig, ax = plt.subplots(figsize=(10, 5))
-                                    shap.waterfall_plot(st.session_state.shap_values_cust[date_idx_loc], show=False)
-                                    plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
-                                    plt.tight_layout()
-                                    st.pyplot(fig)
-                                    plt.clf()
-                                    plot_generated = True
-
-                            if not plot_generated and st.session_state.future_X_cust is not None:
-                                future_key = selected_date.strftime('%Y-%m-%d')
-                                future_feature_row = st.session_state.future_X_cust.get(future_key)
-
-                                if future_feature_row is not None:
-                                    st.markdown(f"##### SHAP Explanation for {selected_date_str} (future forecast)")
-                                    with st.spinner("Generating on-demand SHAP explanation..."):
-                                        explainer = st.session_state.shap_explainer_cust
-                                        shap_values_future = explainer(future_feature_row, check_additivity=False)
-                                        
-                                        fig, ax = plt.subplots(figsize=(10, 5))
-                                        shap.waterfall_plot(shap_values_future[0], show=False)
-                                        plt.title(f'XGBoost Driver Analysis for {selected_date_str}')
-                                        plt.tight_layout()
-                                        st.pyplot(fig)
-                                        plt.clf()
-                                    plot_generated = True
-
-                            if not plot_generated:
-                                st.error(f"Could not find feature data for {selected_date_str} to generate a SHAP plot.")
-                            
-                            with st.expander("View Overall Feature Importance (Summary Plot)"):
-                                st.info("This plot shows the average impact of each feature across all historical predictions. Features at the top have the highest impact on the model.")
-                                fig_summary, ax_summary = plt.subplots(figsize=(10, 5))
-                                shap.summary_plot(st.session_state.shap_values_cust.values, st.session_state.X_cust, plot_type="bar", show=False)
-                                plt.tight_layout()
-                                st.pyplot(fig_summary)
-                                plt.clf()
-
-                        except Exception as e:
-                            st.error(f"An error occurred while building the SHAP plot: {e}")
+                st.subheader("Prophet Model Breakdown")
+                st.info("This waterfall chart shows the foundational drivers from the Prophet model, such as overall trend and seasonal effects, before the final stacking process.")
+                breakdown_fig, day_data = plot_forecast_breakdown(future_components, selected_date, st.session_state.all_holidays)
+                st.plotly_chart(breakdown_fig, use_container_width=True)
+                st.markdown("---")
+                st.subheader("Prophet Insight Summary")
+                st.markdown(generate_insight_summary(day_data, selected_date))
             else:
                 st.warning("No future dates available in the forecast components to analyze.")
 
