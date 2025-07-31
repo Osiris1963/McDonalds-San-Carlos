@@ -400,47 +400,64 @@ def train_and_forecast_prophet_day_specific(historical_df, events_df, periods, t
     hist_forecast = prophet_model.predict(df_prophet[['ds']])
     return pd.concat([hist_forecast[['ds', 'yhat']], forecast[['ds', 'yhat']]]), prophet_model
 
+# ==============================================================================
+# === DEBUGGED FUNCTION: train_and_forecast_tree_day_specific ==================
+# ==============================================================================
 @st.cache_data
 def train_and_forecast_tree_day_specific(model_class, params, historical_df, periods, target_col, day_of_week, customer_forecast_df=None):
     df_day = historical_df[historical_df['date'].dt.dayofweek == day_of_week].copy()
     if len(df_day) < 20: return pd.DataFrame()
 
-    if target_col == 'atv' and customer_forecast_df is not None:
-        df_day = pd.merge(df_day, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        df_day['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
+    # --- FIX START: Combine historical and future data BEFORE feature engineering ---
+    # 1. Create future date placeholders
+    last_date = historical_df['date'].max()
+    future_dates_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
+    future_day_specific_dates = future_dates_range[future_dates_range.dayofweek == day_of_week][:periods]
+    future_df_placeholders = pd.DataFrame({'date': future_day_specific_dates})
 
-    features = [f for f in df_day.columns if df_day[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date']]
+    # 2. Combine historical data for the specific day with future placeholders
+    combined_df = pd.concat([df_day, future_df_placeholders], ignore_index=True)
+    
+    # 3. Engineer features on the combined dataframe
+    # This allows lags and rolling windows to be calculated correctly for future dates
+    combined_featured_df = create_advanced_features(combined_df)
+    # --- FIX END ---
+
+    if target_col == 'atv' and customer_forecast_df is not None:
+        combined_featured_df = pd.merge(combined_featured_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
+        combined_featured_df['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
+
+    features = [f for f in combined_featured_df.columns if combined_featured_df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date']]
     features = list(set(features) - {target_col})
     
-    X = df_day[features].dropna()
-    y = df_day.loc[X.index, target_col]
+    # Split back into historical (for training) and future (for prediction)
+    train_df = combined_featured_df.dropna(subset=[target_col])
+    predict_df = combined_featured_df[combined_featured_df[target_col].isna()]
+
+    X_train = train_df[features]
+    y_train = train_df[target_col]
     
-    model = model_class(**params).fit(X, y)
+    # Ensure no NaN values slip into training data
+    valid_indices = X_train.dropna().index
+    X_train = X_train.loc[valid_indices]
+    y_train = y_train.loc[valid_indices]
+
+    if X_train.empty: return pd.DataFrame()
+
+    model = model_class(**params).fit(X_train, y_train)
     
-    # Create future feature set
-    last_date = historical_df['date'].max()
-    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
-    future_day_specific_dates = future_dates[future_dates.dayofweek == day_of_week][:periods]
-    future_df = create_advanced_features(pd.DataFrame({'date': future_day_specific_dates}))
-
-    if 'forecast_customers' in features:
-        if customer_forecast_df is not None:
-             future_df = pd.merge(future_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-             future_df['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
-        else:
-            future_df['forecast_customers'] = 0
-
-
-    X_future = future_df[features]
+    # Predict on the future dataframe which now has all required features
+    X_future = predict_df[features]
     predictions = model.predict(X_future)
     
-    future_forecast_df = pd.DataFrame({'ds': future_day_specific_dates, 'yhat': predictions})
+    future_forecast_df = pd.DataFrame({'ds': predict_df['date'], 'yhat': predictions})
     
     # Historical predictions for stacking
-    hist_preds = model.predict(X)
-    hist_forecast_df = pd.DataFrame({'ds': df_day.loc[X.index, 'date'], 'yhat': hist_preds})
+    hist_preds = model.predict(X_train)
+    hist_forecast_df = pd.DataFrame({'ds': train_df.loc[X_train.index, 'date'], 'yhat': hist_preds})
     
     return pd.concat([hist_forecast_df, future_forecast_df])
+
 
 @st.cache_data
 def train_and_forecast_stacked_ensemble_day_specific(base_forecasts_dict, historical_target, target_col_name, day_of_week):
