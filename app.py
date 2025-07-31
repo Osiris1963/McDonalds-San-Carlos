@@ -199,7 +199,6 @@ def load_from_firestore(_db_client, collection_name):
     numeric_cols = ['sales', 'customers', 'add_on_sales', 'last_year_sales', 'last_year_customers', 'potential_sales']
     for col in numeric_cols:
         if col in df.columns:
-            # Use interpolation first, then fill remaining with a more reasonable value like 0
             df[col] = pd.to_numeric(df[col], errors='coerce')
             df[col] = df[col].interpolate(method='linear').fillna(0)
         
@@ -310,6 +309,9 @@ def check_performance_and_recalibrate(db, historical_df, degradation_threshold=0
 
 # --- Core Forecasting Models ---
 
+# ==============================================================================
+# === ENHANCED FEATURE ENGINEERING with PAYDAY CYCLE ===========================
+# ==============================================================================
 @st.cache_data
 def create_advanced_features(df, weather_df=None):
     df['date'] = pd.to_datetime(df['date'])
@@ -322,6 +324,7 @@ def create_advanced_features(df, weather_df=None):
             df[col] = 0 
     df[['temp_max', 'precipitation', 'wind_speed']] = df[['temp_max', 'precipitation', 'wind_speed']].fillna(method='ffill').fillna(0)
 
+    # --- Basic Time Features ---
     df['dayofweek'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
     df['month'] = df['date'].dt.month
@@ -329,41 +332,68 @@ def create_advanced_features(df, weather_df=None):
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
     df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
-    df['is_payday'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int)
+    
+    # --- Payday Cycle Features (ENHANCEMENT) ---
+    # Helper function to find payday dates
+    def get_paydays(d):
+        eom = d + pd.tseries.offsets.MonthEnd(0)
+        mid_month = pd.Timestamp(year=d.year, month=d.month, day=15)
+        return mid_month, eom
+
+    paydays = []
+    for d in df['date']:
+        mid, eom = get_paydays(d)
+        prev_mid, prev_eom = get_paydays(d - pd.DateOffset(months=1))
+        next_mid, next_eom = get_paydays(d + pd.DateOffset(months=1))
+        
+        all_paydays = sorted([prev_mid, prev_eom, mid, eom, next_mid, next_eom])
+        
+        future_paydays = [pd for pd in all_paydays if pd >= d]
+        past_paydays = [pd for pd in all_paydays if pd < d]
+        
+        next_payday = min(future_paydays) if future_paydays else next_mid
+        last_payday = max(past_paydays) if past_paydays else prev_eom
+        
+        paydays.append({
+            'next_payday': next_payday,
+            'last_payday': last_payday
+        })
+        
+    payday_df = pd.DataFrame(paydays, index=df.index)
+    df['days_until_next_payday'] = (payday_df['next_payday'] - df['date']).dt.days
+    df['days_since_last_payday'] = (df['date'] - payday_df['last_payday']).dt.days
+    df['is_payday_window'] = df['date'].dt.day.isin([15, 30, 31, 1, 2]).astype(int) # Renamed for clarity
+
+    # --- Cyclical Features ---
     df['dayofweek_sin'] = np.sin(2 * np.pi * df['dayofweek'] / 7)
     df['dayofweek_cos'] = np.cos(2 * np.pi * df['dayofweek'] / 7)
     
     df = df.sort_values('date').reset_index(drop=True)
     
-    lags = [1, 2, 7, 14, 21, 30]
+    # --- Lag and Rolling Window Features ---
+    lags = [7, 14, 21, 30] # Reduced lags as payday cycle features are more powerful
     for lag in lags:
         if 'sales' in df.columns:
             df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
         if 'customers' in df.columns:
             df[f'customers_lag_{lag}'] = df['customers'].shift(lag)
-        if 'atv' in df.columns:
-            df[f'atv_lag_{lag}'] = df['atv'].shift(lag)
 
     if 'sales' in df.columns:
         df['sales_rolling_mean_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).mean()
         df['sales_rolling_std_7'] = df['sales'].shift(1).rolling(window=7, min_periods=1).std()
     if 'customers' in df.columns:
         df['customers_rolling_mean_7'] = df['customers'].shift(1).rolling(window=7, min_periods=1).mean()
-    if 'atv' in df.columns:
-        df['atv_rolling_mean_7'] = df['atv'].shift(1).rolling(window=7, min_periods=1).mean()
         
     if 'sales' in df.columns:
         df['sales_ewm_7'] = df['sales'].shift(1).ewm(span=7, adjust=False).mean()
     if 'customers' in df.columns:
         df['customers_ewm_7'] = df['customers'].shift(1).ewm(span=7, adjust=False).mean()
-    if 'atv' in df.columns:
-        df['atv_ewm_7'] = df['atv'].shift(1).ewm(span=7, adjust=False).mean()
 
+    # --- Interaction Features ---
     df['weekend_temp_interaction'] = df['is_weekend'] * df['temp_max']
-    df['payday_weekday_interaction'] = df['is_payday'] * df['dayofweek']
+    df['payday_weekday_interaction'] = df['is_payday_window'] * df['dayofweek']
         
     return df
-
 
 @st.cache_data
 def train_and_forecast_prophet(historical_df, events_df, periods, target_col):
@@ -513,13 +543,6 @@ def train_and_forecast_catboost_tuned(historical_df, periods, target_col, weathe
         'random_seed': 42, 'objective': 'RMSE', 'verbose': 0,
         'iterations': 100, 'learning_rate': 0.1, 'depth': 6
     }
-    # CatBoost can be slow with MultiOutputRegressor, so we use a simple wrapper
-    from sklearn.base import clone
-    class CatBoostMulti(MultiOutputRegressor):
-        def fit(self, X, y, sample_weight=None):
-            self.estimators_ = [clone(self.estimator).fit(X, y.iloc[:, i]) for i in range(y.shape[1])]
-            return self
-
     return _run_tree_model_multi_output_forecast(cat.CatBoostRegressor, params, historical_df, periods, target_col, weather_forecast_df, customer_forecast_df)
 
 
