@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-from prophet import Prophet
 import xgboost as xgb
 import lightgbm as lgb
 import catboost as cat
@@ -27,8 +26,7 @@ import matplotlib.pyplot as plt
 import inspect
 
 # --- Suppress informational messages ---
-logging.getLogger('prophet').setLevel(logging.ERROR)
-logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+# Removed prophet-related logging
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
