@@ -5,7 +5,6 @@ import logging
 from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
-import bcrypt
 import time
 import plotly.graph_objs as go
 import numpy as np
@@ -59,30 +58,6 @@ st.markdown("""
         height: 30px;
         margin-right: 10px;
     }
-    .nav-links {
-        display: flex;
-        gap: 5px;
-    }
-    .nav-button {
-        padding: 8px 16px;
-        border-radius: 8px;
-        border: none;
-        background-color: transparent;
-        font-weight: 600;
-        cursor: pointer;
-        transition: all 0.2s ease;
-    }
-    .nav-button:hover {
-        background-color: #f0f0f0;
-    }
-    .nav-button.active {
-        background-color: #DA291C;
-        color: white;
-    }
-    .logout-button {
-        background-color: #4B5563;
-        color: white;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -91,31 +66,26 @@ st.markdown("""
 def init_firestore():
     """Initializes a connection to the Firestore database."""
     try:
+        # Check if the app is already initialized to prevent errors on rerun
         if not firebase_admin._apps:
+            # Assuming secrets are stored in Streamlit's secrets management
             creds_dict = st.secrets.firebase_credentials
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
         st.error(f"Firestore Connection Error: {e}")
+        # In a no-auth setup, we might want the app to proceed with cached data if available
         return None
-
-# --- User Management Functions ---
-def get_user(db_client, username):
-    """Retrieves a user document from Firestore by username."""
-    users_ref = db_client.collection('users')
-    query = users_ref.where('username', '==', username).limit(1)
-    results = list(query.stream())
-    return results[0] if results else None
-
-def verify_password(plain_password, hashed_password):
-    """Verifies a plain text password against a bcrypt hashed password."""
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 # --- Data Loading ---
 @st.cache_data(ttl="10m")
 def load_all_data(_db_client):
     """Loads all necessary collections from Firestore into pandas DataFrames."""
+    if _db_client is None:
+        st.warning("Could not connect to database. Displaying cached data if available.")
+        return {}
+        
     collections = ["historical_data", "future_activities", "future_events", "users", "forecast_log", "forecast_insights"]
     data = {}
     for collection in collections:
@@ -135,7 +105,7 @@ def load_all_data(_db_client):
         data[collection] = df
     return data
 
-# --- NEW DAY-SPECIFIC FORECASTING ENGINE ---
+# --- DAY-SPECIFIC FORECASTING ENGINE ---
 @st.cache_data(ttl="1h")
 def train_and_forecast_day_specific(_historical_df, target_col, horizon):
     """
@@ -154,8 +124,6 @@ def train_and_forecast_day_specific(_historical_df, target_col, horizon):
         day_specific_df = historical_df[historical_df['day_of_week'] == i]
         
         if len(day_specific_df) > 2: # Prophet needs at least 2 data points
-            # The seasonality_mode is set to 'multiplicative' as sales often exhibit
-            # multiplicative rather than additive patterns (e.g., holidays cause a percentage increase).
             m = Prophet(seasonality_mode='multiplicative', daily_seasonality=False, weekly_seasonality=False, yearly_seasonality=True)
             m.add_country_holidays(country_name='PH')
             m.fit(day_specific_df[['ds', 'y']])
@@ -178,44 +146,33 @@ def train_and_forecast_day_specific(_historical_df, target_col, horizon):
         return pd.DataFrame(columns=['ds', 'yhat']), None
 
     forecast_df = pd.DataFrame(forecast_list)
-    return forecast_df, models # Returning models can be useful for plotting components
+    return forecast_df, models
 
-# --- UI Rendering Functions (Placeholders) ---
-# NOTE: The UI rendering functions are kept as placeholders as requested.
-# The focus is on the backend logic. You would fill these with your
-# specific Streamlit components (charts, tables, etc.).
-
+# --- UI Rendering Functions ---
 def render_dashboard(data):
     st.header("📈 Sales Forecast Dashboard")
-    st.info("The core logic has been updated to a day-specific forecasting model for higher accuracy.")
     
     historical_df = data.get("historical_data")
     if historical_df is not None and not historical_df.empty:
-        target_col = st.selectbox("Select Target Variable for Forecasting", options=['sales', 'transactions', 'average_sale'], index=0)
+        target_col = st.selectbox("Select Target Variable", options=['sales', 'transactions', 'average_sale'], index=0)
         horizon = st.slider("Select Forecast Horizon (Days)", min_value=7, max_value=30, value=14)
 
         if st.button(f"Generate {horizon}-Day Forecast for {target_col.replace('_', ' ').title()}"):
-            with st.spinner("Training 7 specialized models and predicting..."):
+            with st.spinner("Training 7 specialized models and predicting... This may take a moment."):
                 forecast_df, _ = train_and_forecast_day_specific(historical_df, target_col, horizon)
             
             if not forecast_df.empty:
                 st.subheader("Forecast Results")
                 
-                # Plotting forecast
                 fig = go.Figure()
-                # Historical Data
                 fig.add_trace(go.Scatter(x=historical_df['date'], y=historical_df[target_col], mode='lines', name='Historical Data'))
-                # Forecasted Data
                 fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat'], mode='lines+markers', name='Forecasted Data', line=dict(color='red', dash='dash')))
                 
                 fig.update_layout(
                     title=f"Forecast for {target_col.replace('_', ' ').title()}",
-                    xaxis_title="Date",
-                    yaxis_title="Value",
-                    font=dict(family="Poppins, sans-serif")
+                    xaxis_title="Date", yaxis_title="Value", font=dict(family="Poppins, sans-serif")
                 )
                 st.plotly_chart(fig, use_container_width=True)
-
                 st.dataframe(forecast_df.rename(columns={'ds': 'Date', 'yhat': 'Predicted Value'}).set_index('Date'))
             else:
                 st.warning("Not enough historical data to generate a forecast.")
@@ -247,88 +204,56 @@ def render_historical(db, data):
 def render_admin(db, data):
     st.header("⚙️ Admin Panel")
     st.write("Manage users and system settings.")
+    if "users" in data and not data["users"].empty:
+        st.subheader("Current Users")
+        st.dataframe(data["users"], use_container_width=True)
 
 # --- Main Application ---
 db = init_firestore()
 
-# Initialize session state variables if they don't exist
-if 'authentication_status' not in st.session_state:
-    st.session_state.authentication_status = False
-    st.session_state.username = None
-    st.session_state.access_level = 3 # Default access level (read-only)
+# Initialize session state for view management if it doesn't exist
+if 'current_view' not in st.session_state:
     st.session_state.current_view = "dashboard"
 
-# --- Login Interface ---
-if not st.session_state.authentication_status:
-    st.title("McDonald's San Carlos 688 Forecasting Suite")
-    username = st.text_input("Username (Email)")
-    password = st.text_input("Password", type="password")
-    
-    if st.button("Login"):
-        if db:
-            user_record = get_user(db, username)
-            if user_record and verify_password(password, user_record.to_dict().get('password', '')):
-                st.session_state.authentication_status = True
-                st.session_state.username = username
-                st.session_state.access_level = user_record.to_dict().get('access_level', 3)
-                st.rerun()
-            else:
-                st.error("Incorrect username or password.")
-        else:
-            st.error("Database connection failed. Please check credentials.")
-# --- Main Application Interface ---
-else:
-    # --- Custom Navigation Bar ---
-    st.markdown("""
-        <div class="nav-container">
-            <div class="nav-title">
-                <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png" alt="Logo">
-                <span>McDonald's San Carlos 688</span>
-            </div>
+# --- Custom Navigation Bar ---
+st.markdown("""
+    <div class="nav-container">
+        <div class="nav-title">
+            <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png" alt="Logo">
+            <span>McDonald's San Carlos 688</span>
         </div>
-    """, unsafe_allow_html=True)
+    </div>
+""", unsafe_allow_html=True)
 
-    # --- Load Data ---
-    data = load_all_data(db) if db else {}
+# --- Load Data ---
+data = load_all_data(db)
 
-    # --- Navigation Tabs ---
-    tabs = ["Dashboard", "Insights", "Evaluator", "Add Data", "Activities", "History"]
-    if st.session_state.access_level == 1: # Only show Admin tab to level 1 users
-        tabs.append("Admin")
-    
-    # Use st.columns to create a horizontal button layout
-    cols = st.columns(len(tabs) + 1)
-    for i, tab in enumerate(tabs):
-        if cols[i].button(tab, key=f"nav_{tab}", use_container_width=True):
-            # Convert tab name to a simple key for session state
-            st.session_state.current_view = tab.lower().replace(" ", "")
-    
-    # Logout button at the end
-    if cols[-1].button("Logout", key="logout", use_container_width=True):
-        st.session_state.authentication_status = False
-        st.session_state.username = None
-        st.session_state.access_level = 3
-        st.session_state.current_view = "dashboard"
-        st.rerun()
+# --- Navigation Tabs ---
+tabs = ["Dashboard", "Insights", "Evaluator", "Add Data", "Activities", "History", "Admin"]
 
-    st.markdown("<hr>", unsafe_allow_html=True)
+cols = st.columns(len(tabs))
+for i, tab in enumerate(tabs):
+    if cols[i].button(tab, key=f"nav_{tab}", use_container_width=True):
+        st.session_state.current_view = tab.lower().replace(" ", "")
 
-    # --- Display Current View Based on Session State ---
-    view = st.session_state.current_view
-    if view == "dashboard":
-        render_dashboard(data)
-    elif view == "insights":
-        render_insights(data)
-    elif view == "evaluator":
-        render_evaluator(data)
-    elif view == "adddata":
-        render_add_data(db)
-    elif view == "activities":
-        render_activities(db, data)
-    elif view == "history":
-        render_historical(db, data)
-    elif view == "admin" and st.session_state.access_level == 1:
-        render_admin(db, data)
-    else:
-        # Default to dashboard if view is somehow invalid
-        render_dashboard(data)
+st.markdown("<hr>", unsafe_allow_html=True)
+
+# --- Display Current View Based on Session State ---
+view = st.session_state.current_view
+if view == "dashboard":
+    render_dashboard(data)
+elif view == "insights":
+    render_insights(data)
+elif view == "evaluator":
+    render_evaluator(data)
+elif view == "adddata":
+    render_add_data(db)
+elif view == "activities":
+    render_activities(db, data)
+elif view == "history":
+    render_historical(db, data)
+elif view == "admin":
+    render_admin(db, data)
+else:
+    # Default to dashboard if view is somehow invalid
+    render_dashboard(data)
