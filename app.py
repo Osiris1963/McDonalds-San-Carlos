@@ -425,7 +425,10 @@ def train_and_forecast_tree_day_specific(model_class, params, historical_df, per
 
     if target_col == 'atv' and customer_forecast_df is not None:
         combined_featured_df = pd.merge(combined_featured_df, customer_forecast_df[['ds', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'forecast_customers'}), on='date', how='left')
-        combined_featured_df['forecast_customers'].fillna(method='ffill', inplace=True).fillna(method='bfill', inplace=True)
+        # --- FIX START: Separate the chained inplace fillna calls ---
+        combined_featured_df['forecast_customers'].fillna(method='ffill', inplace=True)
+        combined_featured_df['forecast_customers'].fillna(method='bfill', inplace=True)
+        # --- FIX END ---
 
     features = [f for f in combined_featured_df.columns if combined_featured_df[f].dtype in ['int64', 'float64'] and f not in ['sales', 'customers', 'atv', 'date']]
     features = list(set(features) - {target_col})
