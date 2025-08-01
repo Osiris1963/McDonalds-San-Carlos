@@ -1,4 +1,4 @@
-# forecasting.py (Final Version with Robust Fallback)
+# forecasting.py (Final Version with Robust Fallback and Safeguards)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -6,14 +6,11 @@ import xgboost as xgb
 from datetime import timedelta
 import warnings
 
-# Suppress verbose warnings from modeling libraries
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# --- Import from our data processing module ---
 from data_processing import create_features
 
 def generate_ph_holidays(start_date, end_date, events_df):
-    """Generates a DataFrame of PH holidays for Prophet, including user-provided future activities."""
     holidays_list = [
         {'holiday': 'New Year\'s Day', 'ds': '2025-01-01'},
         {'holiday': 'Maundy Thursday', 'ds': '2025-04-17'},
@@ -50,10 +47,6 @@ def generate_ph_holidays(start_date, end_date, events_df):
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
 
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
-    """
-    Trains Prophet, LightGBM, XGBoost on data for only a *specific day of the week*
-    and returns their combined forecast for that day. Includes robust fallback logic.
-    """
     if len(df_day_featured) < 20: 
         return pd.DataFrame(), None
 
@@ -70,7 +63,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    # --- Prophet Model (Always runs as it's more robust) ---
     df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
@@ -78,19 +70,13 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     future_prophet_df = pd.DataFrame({'ds': future_dates})
     forecast_prophet = prophet_model.predict(future_prophet_df)
 
-    # --- ROBUSTNESS CHECK & FALLBACK ---
-    # After dropping NaNs, if we have too few samples, tree models will be unstable.
-    # In this case, we fall back to using only the Prophet forecast.
     MIN_SAMPLES_FOR_TREE_MODELS = 10
     if len(df_train) < MIN_SAMPLES_FOR_TREE_MODELS:
-        # Return only Prophet's forecast in the expected format.
         return forecast_prophet[['ds', 'yhat']], prophet_model
-    # --- END OF CHECK ---
         
     X_train = df_train[final_features]
     y_train = df_train[target]
 
-    # --- Tree-Based Models ---
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
@@ -108,7 +94,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     xgb_model.fit(X_train, y_train)
     xgb_preds = xgb_model.predict(X_future)
     
-    # --- Ensemble Forecast ---
     weights = {'prophet': 0.3, 'lgbm': 0.4, 'xgb': 0.3}
     final_preds = (
         forecast_prophet['yhat'].values * weights['prophet'] +
@@ -121,14 +106,9 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """
-    Main forecasting function. Implements the "Team of Specialists" approach.
-    """
     df_featured = create_features(historical_df, events_df)
     
-    all_cust_forecasts = []
-    all_atv_forecasts = []
-    
+    all_cust_forecasts, all_atv_forecasts = [], []
     prophet_model = None 
     
     for day_of_week in range(7):
@@ -150,14 +130,22 @@ def generate_forecast(historical_df, events_df, periods=15):
     cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
     atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds').reset_index(drop=True)
     
+    # --- FINAL SAFEGUARD ---
+    # Ensure both dataframes are not empty before merging
+    if cust_forecast_final.empty or atv_forecast_final.empty:
+        return pd.DataFrame(), None
+
     cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
     atv_forecast_final.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
 
-    final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds')
+    final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
+    if final_df.empty:
+        return pd.DataFrame(), None # Merge might result in empty if ds values don't align
+        
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
 
-    return final_df, prophet_model
+    return final_df.head(periods), prophet_model
