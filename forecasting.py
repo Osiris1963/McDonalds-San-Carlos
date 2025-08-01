@@ -93,7 +93,7 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
                 
-                # --- ROBUST FIX: Use the explicit callback object for XGBoost ---
+                # --- FINAL FIX: Use the explicit callback object for XGBoost ---
                 early_stopping_callback = XGBEarlyStopping(rounds=10, save_best=True)
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
                           callbacks=[early_stopping_callback], verbose=False)
