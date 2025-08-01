@@ -12,7 +12,7 @@ from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v2.1",
+    page_title="Sales Forecaster v2.2",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -75,11 +75,12 @@ def init_firestore():
         st.error(f"Firestore Connection Error: Failed to initialize. Check your Streamlit Secrets. Details: {e}")
         return None
 
-# --- ADDED: Function to save the forecast to a log collection ---
+# --- RE-ENGINEERED FOR ORDERED LOGGING ---
 def save_forecast_to_log(db_client, forecast_df):
     """
     Saves the generated forecast to the 'forecast_log' collection in Firestore.
-    This is critical for tracking model performance over time.
+    This version uses the forecast date (YYYY-MM-DD) as the document ID to ensure
+    the collection is always stored in chronological order.
     """
     if db_client is None or forecast_df.empty:
         st.warning("Database client not available or forecast is empty. Skipping log.")
@@ -91,8 +92,9 @@ def save_forecast_to_log(db_client, forecast_df):
         generated_on_ts = pd.to_datetime('today').normalize()
 
         for _, row in forecast_df.iterrows():
-            # Let Firestore create a unique document ID for each log entry
-            log_doc_ref = log_collection_ref.document()
+            # Create a deterministic, sortable document ID from the forecast date.
+            doc_id = row['ds'].strftime('%Y-%m-%d')
+            log_doc_ref = log_collection_ref.document(doc_id)
             
             log_data = {
                 'generated_on': generated_on_ts,
@@ -101,6 +103,7 @@ def save_forecast_to_log(db_client, forecast_df):
                 'predicted_customers': int(row['forecast_customers']),
                 'predicted_atv': float(row['forecast_atv'])
             }
+            # Use set() with a specific doc_ref to create or overwrite.
             batch.set(log_doc_ref, log_data)
         
         batch.commit()
@@ -156,8 +159,8 @@ if db:
     # --- Sidebar ---
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v2.1")
-        st.info("Re-architected for precision and automated logging.")
+        st.title("AI Forecaster v2.2")
+        st.info("Re-architected for precision and ordered logging.")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -177,7 +180,6 @@ if db:
                     st.session_state.forecast_df = forecast_df
                     st.session_state.prophet_model = prophet_model
                 
-                # --- MODIFIED: Added automatic saving workflow ---
                 if not forecast_df.empty:
                     with st.spinner("📡 Logging forecast to database for performance tracking..."):
                         save_successful = save_forecast_to_log(db, forecast_df)
