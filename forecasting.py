@@ -42,8 +42,6 @@ def run_base_models(df_featured, target, periods, events_df):
     """Trains Prophet, LightGBM, XGBoost and returns their forecasts."""
     base_forecasts = {}
     
-    # --- ROBUST FIX: Explicitly define the list of features for the models ---
-    # This prevents text-based columns from being included by mistake.
     FEATURES = [
         'month', 'dayofyear', 'weekofyear', 'year', 'dayofweek_num',
         'is_payday_period', 'is_event', 'is_not_normal_day',
@@ -53,23 +51,15 @@ def run_base_models(df_featured, target, periods, events_df):
         'customers_lag_7', 'customers_lag_14', 'customers_rolling_mean_7', 'customers_rolling_std_7',
         'atv_lag_7', 'atv_lag_14', 'atv_rolling_mean_7', 'atv_rolling_std_7'
     ]
-    # Ensure we only use features that actually exist in the dataframe
     valid_features = [f for f in FEATURES if f in df_featured.columns]
-    # --- END OF FIX ---
 
     df_train = df_featured.dropna(subset=valid_features + [target])
     X = df_train[valid_features]
     y = df_train[target]
     
-    # --- Future DataFrame ---
+    # --- Prophet Model ---
     last_date = df_featured['date'].max()
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
-    future_df_template = pd.DataFrame({'date': future_dates})
-    temp_history = pd.concat([df_featured, future_df_template], ignore_index=True)
-    future_with_features = create_features(temp_history, events_df)
-    X_future = future_with_features[future_with_features['date'].isin(future_dates)][valid_features].copy()
-
-    # --- Prophet Model ---
     df_prophet = df_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
@@ -78,6 +68,40 @@ def run_base_models(df_featured, target, periods, events_df):
     forecast = prophet_model.predict(future)
     base_forecasts['prophet'] = forecast[['ds', 'yhat']].tail(periods)
     
+    # --- ROBUST FIX: Build the future DataFrame for tree models from scratch ---
+    X_future = pd.DataFrame(index=future_dates)
+    
+    # 1. Add date features
+    X_future['month'] = X_future.index.month
+    X_future['dayofyear'] = X_future.index.dayofyear
+    X_future['weekofyear'] = X_future.index.isocalendar().week.astype(int)
+    X_future['year'] = X_future.index.year
+    X_future['dayofweek_num'] = X_future.index.dayofweek
+    
+    # 2. Add one-hot encoded day of week
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    for day_name in day_names:
+        X_future[f'day_{day_name}'] = (X_future.index.day_name() == day_name).astype(int)
+
+    # 3. Add event and payday features
+    X_future['is_payday_period'] = [1 if d.day in [14,15,16,29,30,31,1,2] else 0 for d in X_future.index]
+    if events_df is not None:
+        future_event_dates = pd.to_datetime(events_df['date']).dt.date
+        X_future['is_event'] = X_future.index.to_series().dt.date.isin(future_event_dates).astype(int)
+    else:
+        X_future['is_event'] = 0
+    X_future['is_not_normal_day'] = 0 # Assume future days are normal unless specified
+
+    # 4. Add lag and rolling features by broadcasting the last known value
+    for col in valid_features:
+        if 'lag' in col or 'rolling' in col:
+            # Use the most recent value from the historical data
+            X_future[col] = df_featured[col].iloc[-1]
+            
+    # Ensure column order matches the training set
+    X_future = X_future[valid_features]
+    # --- END OF FIX ---
+
     # --- LightGBM Model ---
     lgbm = lgb.LGBMRegressor(random_state=42)
     lgbm.fit(X, y)
