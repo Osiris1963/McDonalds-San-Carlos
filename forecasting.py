@@ -13,6 +13,9 @@ import numpy as np
 # --- Import from our data processing module ---
 from data_processing import create_features
 
+# --- Import the specific EarlyStopping callback for XGBoost ---
+from xgboost.callback import EarlyStopping as XGBEarlyStopping
+
 # Suppress Optuna's trial logging to keep the console clean
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -76,7 +79,6 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 scores.append(rmse)
 
         else: # xgb
-            # --- FINAL FIX: 'eval_metric' is now part of the constructor params ---
             params = {
                 'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 1000,
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
@@ -90,13 +92,16 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
             for train_index, val_index in tscv.split(X):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
-                # Use XGBoost's specific parameter for early stopping
+                
+                # --- ROBUST FIX: Use the explicit callback object for XGBoost ---
+                early_stopping_callback = XGBEarlyStopping(rounds=10, save_best=True)
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
-                          early_stopping_rounds=10, verbose=False)
+                          callbacks=[early_stopping_callback], verbose=False)
+                # --- END OF FIX ---
+
                 preds = model.predict(X_val)
                 rmse = np.sqrt(mean_squared_error(y_val, preds))
                 scores.append(rmse)
-        # --- END OF FIX ---
         
         return np.mean(scores)
 
