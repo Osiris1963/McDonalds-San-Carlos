@@ -52,7 +52,7 @@ def generate_ph_holidays(start_date, end_date, events_df):
 def tune_model_hyperparameters(X, y, model_name='lgbm'):
     """Uses Optuna to find the best hyperparameters for a given model."""
     
-    # --- ROBUST FIX: Create separate objective functions for each model ---
+    # --- DEFINITIVE FIX: Create separate, explicit objective functions for each model ---
     if model_name == 'lgbm':
         def objective_lgbm(trial):
             tscv = TimeSeriesSplit(n_splits=3)
@@ -101,7 +101,7 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
                 
-                # Use the specific callback object for XGBoost
+                # Use the specific callback object for XGBoost, passed to the 'callbacks' parameter
                 early_stopping_callback = XGBEarlyStopping(rounds=10, save_best=True)
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
                           callbacks=[early_stopping_callback], verbose=False)
