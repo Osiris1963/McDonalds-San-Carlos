@@ -52,11 +52,11 @@ def generate_ph_holidays(start_date, end_date, events_df):
 def tune_model_hyperparameters(X, y, model_name='lgbm'):
     """Uses Optuna to find the best hyperparameters for a given model."""
     
-    def objective(trial):
-        tscv = TimeSeriesSplit(n_splits=3)
-        scores = []
-
-        if model_name == 'lgbm':
+    # --- ROBUST FIX: Create separate objective functions for each model ---
+    if model_name == 'lgbm':
+        def objective_lgbm(trial):
+            tscv = TimeSeriesSplit(n_splits=3)
+            scores = []
             params = {
                 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000,
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
@@ -77,8 +77,16 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 preds = model.predict(X_val)
                 rmse = np.sqrt(mean_squared_error(y_val, preds))
                 scores.append(rmse)
+            return np.mean(scores)
+        
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective_lgbm, n_trials=25, show_progress_bar=False)
+        return study.best_params
 
-        else: # xgb
+    else: # xgb
+        def objective_xgb(trial):
+            tscv = TimeSeriesSplit(n_splits=3)
+            scores = []
             params = {
                 'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 1000,
                 'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
@@ -93,23 +101,20 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
                 
-                # --- THE ROBUST FIX ---
-                # 1. Create the specific callback object for XGBoost.
+                # Use the specific callback object for XGBoost
                 early_stopping_callback = XGBEarlyStopping(rounds=10, save_best=True)
-                # 2. Pass it using the 'callbacks' argument and REMOVE the incorrect 'early_stopping_rounds'.
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
                           callbacks=[early_stopping_callback], verbose=False)
-                # --- END OF FIX ---
-
+                
                 preds = model.predict(X_val)
                 rmse = np.sqrt(mean_squared_error(y_val, preds))
                 scores.append(rmse)
-        
-        return np.mean(scores)
+            return np.mean(scores)
 
-    study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=25, show_progress_bar=False)
-    return study.best_params
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective_xgb, n_trials=25, show_progress_bar=False)
+        return study.best_params
+    # --- END OF FIX ---
 
 def run_base_models(df_featured, target, periods, events_df):
     """Trains tuned Prophet, LightGBM, XGBoost and returns their forecasts."""
