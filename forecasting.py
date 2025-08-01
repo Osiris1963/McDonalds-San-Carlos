@@ -1,4 +1,4 @@
-# forecasting.py (Final Version with Robust Fallback and Safeguards)
+# forecasting.py (Final Production Version)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -50,7 +50,7 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(df_day_featured) < 20: 
         return pd.DataFrame(), None
 
-    all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv']]
+    all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv', 'date']]
     constant_cols = [col for col in all_features if df_day_featured[col].nunique() < 2]
     final_features = [f for f in all_features if f not in constant_cols]
     
@@ -130,17 +130,16 @@ def generate_forecast(historical_df, events_df, periods=15):
     cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
     atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds').reset_index(drop=True)
     
-    # --- FINAL SAFEGUARD ---
-    # Ensure both dataframes are not empty before merging
     if cust_forecast_final.empty or atv_forecast_final.empty:
         return pd.DataFrame(), None
 
     cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
     atv_forecast_final.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
 
+    # Use an inner merge as a final safeguard to ensure dates align perfectly
     final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
     if final_df.empty:
-        return pd.DataFrame(), None # Merge might result in empty if ds values don't align
+        return pd.DataFrame(), None
         
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
