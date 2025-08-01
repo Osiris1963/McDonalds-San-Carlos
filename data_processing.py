@@ -1,10 +1,10 @@
-# data_processing.py
+# data_processing.py (Final Robust Version)
 import pandas as pd
 import numpy as np
 from datetime import timedelta
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data from a Firestore collection."""
+    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
     if db_client is None:
         return pd.DataFrame()
     
@@ -20,48 +20,42 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    # --- Robust Date Handling ---
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df.dropna(subset=['date'], inplace=True)
-        
-        # --- PRIMARY FIX: Remove duplicate dates, keeping the last entry ---
-        # This prevents data contamination from affecting the entire pipeline.
-        df.sort_values(by='date', inplace=True)
-        df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-        
-        if pd.api.types.is_datetime64_any_dtype(df['date']):
-            df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
+    if 'date' not in df.columns:
+        return pd.DataFrame()
+
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df.dropna(subset=['date'], inplace=True)
     
-    # --- Numeric Type Conversion ---
+    # --- PRIMARY FIX 1: Remove duplicate dates from source data, keeping the last entry ---
+    df.sort_values(by='date', inplace=True)
+    df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+    
+    if pd.api.types.is_datetime64_any_dtype(df['date']):
+        df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
+    
     numeric_cols = ['sales', 'customers', 'add_on_sales']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # --- Sort and return ---
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df, events_df):
-    """
-    This is the robust feature engineering pipeline.
-    It creates time-based, event-based, and lag/rolling features for all key metrics.
-    This function is now idempotent, meaning it can be run multiple times without error.
-    """
+    """Creates time-based, event-based, and lag/rolling features."""
     df_copy = df.copy()
 
+    # Idempotency: Drop existing feature columns to prevent duplication
     feature_cols_to_drop = [
         'atv', 'month', 'dayofyear', 'weekofyear', 'year', 'dayofweek_num', 'dayofweek',
         'is_payday_period', 'is_event', 'is_not_normal_day',
         'day_Friday', 'day_Monday', 'day_Saturday', 'day_Sunday', 'day_Thursday', 'day_Tuesday', 'day_Wednesday'
     ]
-
     for col in df_copy.columns:
         if 'lag' in str(col) or 'rolling' in str(col):
             feature_cols_to_drop.append(col)
-            
     df_copy.drop(columns=[col for col in feature_cols_to_drop if col in df_copy.columns], inplace=True, errors='ignore')
 
+    # Basic features
     base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     customers_safe = df_copy['customers'].replace(0, np.nan)
     df_copy['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
@@ -72,17 +66,21 @@ def create_features(df, events_df):
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek
 
+    # One-hot encode day of week
     df_copy['dayofweek'] = df_copy['date'].dt.day_name()
     day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day', drop_first=False)
     df_copy = pd.concat([df_copy, day_dummies], axis=1)
 
+    # Contextual features
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
     
+    # --- PRIMARY FIX 2: De-duplicate events data before merging to prevent row fan-out ---
     if events_df is not None and not events_df.empty:
-        events_df['date'] = pd.to_datetime(events_df['date']).dt.normalize()
-        df_copy = pd.merge(df_copy, events_df[['date', 'activity_name']], on='date', how='left')
+        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
+        events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
+        df_copy = pd.merge(df_copy, events_df_unique[['date', 'activity_name']], on='date', how='left')
         df_copy['is_event'] = df_copy['activity_name'].notna().astype(int)
         df_copy.drop(columns=['activity_name'], inplace=True)
     else:
@@ -93,9 +91,9 @@ def create_features(df, events_df):
     else:
         df_copy['is_not_normal_day'] = 0
 
+    # Lag and rolling window features
     shift_val = 1 
-    targets_for_features = ['sales', 'customers', 'atv']
-    for target in targets_for_features:
+    for target in ['sales', 'customers', 'atv']:
         if target in df_copy.columns:
             df_copy[f'{target}_lag_7'] = df_copy[target].shift(shift_val + 6)
             df_copy[f'{target}_lag_14'] = df_copy[target].shift(shift_val + 13)
