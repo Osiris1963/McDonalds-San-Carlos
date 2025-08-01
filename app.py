@@ -12,7 +12,7 @@ from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v2.2",
+    page_title="Sales Forecaster v3.0",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -75,7 +75,6 @@ def init_firestore():
         st.error(f"Firestore Connection Error: Failed to initialize. Check your Streamlit Secrets. Details: {e}")
         return None
 
-# --- RE-ENGINEERED FOR ORDERED LOGGING ---
 def save_forecast_to_log(db_client, forecast_df):
     """
     Saves the generated forecast to the 'forecast_log' collection in Firestore.
@@ -92,7 +91,6 @@ def save_forecast_to_log(db_client, forecast_df):
         generated_on_ts = pd.to_datetime('today').normalize()
 
         for _, row in forecast_df.iterrows():
-            # Create a deterministic, sortable document ID from the forecast date.
             doc_id = row['ds'].strftime('%Y-%m-%d')
             log_doc_ref = log_collection_ref.document(doc_id)
             
@@ -103,7 +101,6 @@ def save_forecast_to_log(db_client, forecast_df):
                 'predicted_customers': int(row['forecast_customers']),
                 'predicted_atv': float(row['forecast_atv'])
             }
-            # Use set() with a specific doc_ref to create or overwrite.
             batch.set(log_doc_ref, log_data)
         
         batch.commit()
@@ -112,7 +109,6 @@ def save_forecast_to_log(db_client, forecast_df):
         st.error(f"Error logging forecast to database: {e}")
         return False
 
-# --- UI Component Rendering Functions ---
 def render_historical_record(row, db_client):
     """Renders an editable historical data record."""
     if 'doc_id' not in row or pd.isna(row['doc_id']):
@@ -150,17 +146,15 @@ apply_custom_styling()
 db = init_firestore()
 
 if db:
-    # Initialize session state
     if 'forecast_df' not in st.session_state:
         st.session_state.forecast_df = pd.DataFrame()
     if 'prophet_model' not in st.session_state:
         st.session_state.prophet_model = None
 
-    # --- Sidebar ---
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v2.2")
-        st.info("Re-architected for precision and ordered logging.")
+        st.title("AI Forecaster v3.0")
+        st.info("Anti-Fragile Production Build")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -174,8 +168,8 @@ if db:
             if len(historical_df) < 50:
                 st.error("Need at least 50 days of data for a reliable forecast.")
             else:
-                forecast_df = pd.DataFrame() # Ensure variable exists
-                with st.spinner("🧠 Running advanced ensemble forecast..."):
+                forecast_df = pd.DataFrame() 
+                with st.spinner("🧠 Running Day-Specific Specialist Models..."):
                     forecast_df, prophet_model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
                     st.session_state.prophet_model = prophet_model
@@ -189,14 +183,11 @@ if db:
                     else:
                         st.warning("Forecast was generated but failed to log to the database.")
                 else:
-                    st.error("Forecast generation failed. Could not create or log forecast.")
+                    st.error("Forecast generation failed. Check data for unusual patterns or sparsity.")
 
-
-    # --- Main Content Area with Tabs ---
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Edit Data"]
     tabs = st.tabs(tab_list)
 
-    # --- Forecast Dashboard Tab ---
     with tabs[0]:
         st.header("🔮 Forecast Dashboard")
         if not st.session_state.forecast_df.empty:
@@ -208,19 +199,23 @@ if db:
         else:
             st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
-    # --- Forecast Insights Tab ---
     with tabs[1]:
         st.header("💡 Forecast Insights")
+        st.warning("Component breakdown is derived from the last trained specialist model (typically Sunday) and is for general insight only. The final forecast is a composite of all seven specialist models.")
         if st.session_state.prophet_model:
             future = st.session_state.prophet_model.make_future_dataframe(periods=15)
-            forecast_components = st.session_state.prophet_model.predict(future)
-            st.info("This chart shows the foundational drivers from the Prophet model for customer forecasts.")
-            fig = st.session_state.prophet_model.plot_components(forecast_components)
-            st.pyplot(fig)
+            # Filter for the specific day of the week of the last model
+            last_model_weekday = st.session_state.prophet_model.history['ds'].dt.dayofweek.iloc[-1]
+            future = future[future['ds'].dt.dayofweek == last_model_weekday]
+            if not future.empty:
+                forecast_components = st.session_state.prophet_model.predict(future)
+                fig = st.session_state.prophet_model.plot_components(forecast_components)
+                st.pyplot(fig)
+            else:
+                st.info("Not enough future dates for this specific day's component breakdown.")
         else:
             st.info("Generate a forecast to see the breakdown of its components.")
 
-    # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
         st.info("Here you can correct the 'Day Type' for past dates if an unusual event occurred.")
