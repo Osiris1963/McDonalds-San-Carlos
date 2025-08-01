@@ -38,14 +38,27 @@ def generate_ph_holidays(start_date, end_date, events_df):
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
 
-def run_base_models(df_featured, target, periods):
+def run_base_models(df_featured, target, periods, events_df):
     """Trains Prophet, LightGBM, XGBoost and returns their forecasts."""
     base_forecasts = {}
     
-    # --- Define Features for Tree Models ---
-    FEATURES = [col for col in df_featured.columns if col not in ['date', 'sales', 'customers', 'atv', 'dayofweek']]
-    df_train = df_featured.dropna(subset=FEATURES + [target])
-    X = df_train[FEATURES]
+    # --- ROBUST FIX: Explicitly define the list of features for the models ---
+    # This prevents text-based columns from being included by mistake.
+    FEATURES = [
+        'month', 'dayofyear', 'weekofyear', 'year', 'dayofweek_num',
+        'is_payday_period', 'is_event', 'is_not_normal_day',
+        'day_Friday', 'day_Monday', 'day_Saturday', 'day_Sunday', 
+        'day_Thursday', 'day_Tuesday', 'day_Wednesday',
+        'sales_lag_7', 'sales_lag_14', 'sales_rolling_mean_7', 'sales_rolling_std_7',
+        'customers_lag_7', 'customers_lag_14', 'customers_rolling_mean_7', 'customers_rolling_std_7',
+        'atv_lag_7', 'atv_lag_14', 'atv_rolling_mean_7', 'atv_rolling_std_7'
+    ]
+    # Ensure we only use features that actually exist in the dataframe
+    valid_features = [f for f in FEATURES if f in df_featured.columns]
+    # --- END OF FIX ---
+
+    df_train = df_featured.dropna(subset=valid_features + [target])
+    X = df_train[valid_features]
     y = df_train[target]
     
     # --- Future DataFrame ---
@@ -53,12 +66,12 @@ def run_base_models(df_featured, target, periods):
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
     future_df_template = pd.DataFrame({'date': future_dates})
     temp_history = pd.concat([df_featured, future_df_template], ignore_index=True)
-    future_with_features = create_features(temp_history, None) # Events already in df_featured
-    X_future = future_with_features[future_with_features['date'].isin(future_dates)][FEATURES].copy()
+    future_with_features = create_features(temp_history, events_df)
+    X_future = future_with_features[future_with_features['date'].isin(future_dates)][valid_features].copy()
 
     # --- Prophet Model ---
     df_prophet = df_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
-    prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), None)
+    prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
     prophet_model.fit(df_prophet)
     future = prophet_model.make_future_dataframe(periods=periods)
@@ -77,12 +90,10 @@ def run_base_models(df_featured, target, periods):
     xgb_preds = xgb_model.predict(X_future)
     base_forecasts['xgb'] = pd.DataFrame({'ds': future_dates, 'yhat': xgb_preds})
 
-    # Return the base forecasts and the trained Prophet model for insights
     return base_forecasts, prophet_model
 
-def train_stacked_ensemble(base_forecasts, historical_df, target):
-    """Combines base model forecasts using a meta-learner."""
-    # Combine forecasts into a single DataFrame
+def train_stacked_ensemble(base_forecasts):
+    """Combines base model forecasts using a weighted average."""
     final_df = None
     for name, fcst_df in base_forecasts.items():
         renamed_df = fcst_df.rename(columns={'yhat': f'yhat_{name}'})
@@ -91,9 +102,6 @@ def train_stacked_ensemble(base_forecasts, historical_df, target):
         else:
             final_df = pd.merge(final_df, renamed_df, on='ds', how='outer')
     
-    # For this simplified version, we'll use a weighted average.
-    # A true stacking model would require historical out-of-sample predictions.
-    # This provides a robust and fast alternative.
     weights = {'prophet': 0.3, 'lgbm': 0.4, 'xgb': 0.3}
     final_df['yhat'] = (
         final_df['yhat_prophet'] * weights['prophet'] +
@@ -103,27 +111,20 @@ def train_stacked_ensemble(base_forecasts, historical_df, target):
     return final_df[['ds', 'yhat']]
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """
-    Main forecasting function using a hierarchical approach and ensemble models.
-    """
-    # --- 1. Full Feature Engineering ---
+    """Main forecasting function using a hierarchical approach and ensemble models."""
     df_featured = create_features(historical_df, events_df)
 
-    # --- 2. Forecast ATV (Average Transaction Value) ---
-    atv_base_forecasts, _ = run_base_models(df_featured, 'atv', periods)
-    atv_forecast = train_stacked_ensemble(atv_base_forecasts, df_featured, 'atv')
+    atv_base_forecasts, _ = run_base_models(df_featured, 'atv', periods, events_df)
+    atv_forecast = train_stacked_ensemble(atv_base_forecasts)
     atv_forecast.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
 
-    # --- 3. Forecast Customers ---
-    cust_base_forecasts, prophet_model_cust = run_base_models(df_featured, 'customers', periods)
-    cust_forecast = train_stacked_ensemble(cust_base_forecasts, df_featured, 'customers')
+    cust_base_forecasts, prophet_model_cust = run_base_models(df_featured, 'customers', periods, events_df)
+    cust_forecast = train_stacked_ensemble(cust_base_forecasts)
     cust_forecast.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
 
-    # --- 4. Combine for Final Sales Forecast ---
     final_df = pd.merge(cust_forecast, atv_forecast, on='ds')
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
-    # --- 5. Clean up and Finalize ---
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
