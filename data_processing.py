@@ -1,5 +1,6 @@
 # data_processing.py
 import pandas as pd
+import numpy as np
 from datetime import timedelta
 
 def load_from_firestore(db_client, collection_name):
@@ -8,7 +9,12 @@ def load_from_firestore(db_client, collection_name):
         return pd.DataFrame()
     
     docs = db_client.collection(collection_name).stream()
-    records = [doc.to_dict() for doc in docs]
+    records = []
+    for doc in docs:
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+        
     if not records:
         return pd.DataFrame()
     
@@ -29,34 +35,37 @@ def load_from_firestore(db_client, collection_name):
     # --- Sort and return ---
     return df.sort_values(by='date').reset_index(drop=True)
 
-
 def create_features(df, events_df):
     """
     This is the new, robust feature engineering pipeline.
-    It creates time-based, event-based, and lag/rolling features.
+    It creates time-based, event-based, and lag/rolling features for all key metrics.
     """
     df_copy = df.copy()
     
-    # --- 1. Foundational Time Features ---
+    # --- 1. Calculate ATV (Average Transaction Value) ---
+    # Use base sales for a more stable ATV
+    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    customers_safe = df_copy['customers'].replace(0, np.nan) # Avoid division by zero
+    df_copy['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
+
+    # --- 2. Foundational Time Features ---
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
     df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype(int)
     df_copy['year'] = df_copy['date'].dt.year
+    df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek # For cyclical features if needed
 
-    # --- 2. CRITICAL: Day of Week (One-Hot Encoded) ---
-    # This is the "apples-to-apples" fix you wanted.
+    # --- 3. CRITICAL: Day of Week (One-Hot Encoded) ---
     df_copy['dayofweek'] = df_copy['date'].dt.day_name()
-    day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day')
+    day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day', drop_first=False) # Keep all days
     df_copy = pd.concat([df_copy, day_dummies], axis=1)
 
-    # --- 3. CRITICAL: Payday Feature (Context-Aware) ---
-    # Recognizes the 15/30 kinsenas/katapusan cycle in the Philippines.
+    # --- 4. CRITICAL: Payday Feature (Context-Aware) ---
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
     
-    # --- 4. Holiday & Events Features ---
-    # Merge future activities and known PH holidays for a complete event calendar
+    # --- 5. Holiday & Events Features ---
     if events_df is not None and not events_df.empty:
         events_df['date'] = pd.to_datetime(events_df['date']).dt.normalize()
         df_copy = pd.merge(df_copy, events_df[['date', 'activity_name']], on='date', how='left')
@@ -65,25 +74,24 @@ def create_features(df, events_df):
     else:
         df_copy['is_event'] = 0
 
-    # Let's also add 'day_type' from your data entry as a feature
     if 'day_type' in df_copy.columns:
         df_copy['is_not_normal_day'] = (df_copy['day_type'] == 'Not Normal Day').astype(int)
+    else:
+        df_copy['is_not_normal_day'] = 0
 
-    # --- 5. Lag & Rolling Window Features (Momentum) ---
-    # Shift by the forecast horizon (15) + 1 to avoid data leakage for future predictions
-    future_shift = 1 
+    # --- 6. Lag & Rolling Window Features (Momentum) ---
+    # Shift by 1 to prevent data leakage for training
+    shift_val = 1 
     
-    # Lag features
-    df_copy['sales_lag_7'] = df_copy['sales'].shift(7 + future_shift)
-    df_copy['sales_lag_15'] = df_copy['sales'].shift(15 + future_shift)
-    df_copy['customers_lag_7'] = df_copy['customers'].shift(7 + future_shift)
+    targets_for_features = ['sales', 'customers', 'atv']
+    for target in targets_for_features:
+        if target in df_copy.columns:
+            # Lag features (what happened last week, two weeks ago?)
+            df_copy[f'{target}_lag_7'] = df_copy[target].shift(shift_val + 6)
+            df_copy[f'{target}_lag_14'] = df_copy[target].shift(shift_val + 13)
 
-    # Rolling features
-    df_copy['sales_rolling_mean_7'] = df_copy['sales'].shift(future_shift).rolling(window=7, min_periods=1).mean()
-    df_copy['sales_rolling_std_7'] = df_copy['sales'].shift(future_shift).rolling(window=7, min_periods=1).std()
-    
-    # --- 6. Calculate ATV ---
-    df_copy['customers'] = df_copy['customers'].replace(0, pd.NA) # Avoid division by zero
-    df_copy['atv'] = (df_copy['sales'] / df_copy['customers']).fillna(0)
+            # Rolling features (what's the recent trend?)
+            df_copy[f'{target}_rolling_mean_7'] = df_copy[target].shift(shift_val).rolling(window=7).mean()
+            df_copy[f'{target}_rolling_std_7'] = df_copy[target].shift(shift_val).rolling(window=7).std()
 
-    return df_copy
+    return df_copy.fillna(0)
