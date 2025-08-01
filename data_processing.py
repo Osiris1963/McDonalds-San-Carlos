@@ -39,13 +39,27 @@ def create_features(df, events_df):
     """
     This is the new, robust feature engineering pipeline.
     It creates time-based, event-based, and lag/rolling features for all key metrics.
+    This function is now idempotent, meaning it can be run multiple times without error.
     """
     df_copy = df.copy()
-    
+
+    # --- IDEMPOTENCY FIX: Drop existing feature columns to prevent duplication ---
+    feature_cols_to_drop = [
+        'atv', 'month', 'dayofyear', 'weekofyear', 'year', 'dayofweek_num', 'dayofweek',
+        'is_payday_period', 'is_event', 'is_not_normal_day',
+        'day_Friday', 'day_Monday', 'day_Saturday', 'day_Sunday', 'day_Thursday', 'day_Tuesday', 'day_Wednesday'
+    ]
+    # Also find and drop existing lag/rolling features
+    for col in df_copy.columns:
+        if 'lag' in str(col) or 'rolling' in str(col):
+            feature_cols_to_drop.append(col)
+            
+    df_copy.drop(columns=[col for col in feature_cols_to_drop if col in df_copy.columns], inplace=True, errors='ignore')
+    # --- END OF FIX ---
+
     # --- 1. Calculate ATV (Average Transaction Value) ---
-    # Use base sales for a more stable ATV
     base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-    customers_safe = df_copy['customers'].replace(0, np.nan) # Avoid division by zero
+    customers_safe = df_copy['customers'].replace(0, np.nan)
     df_copy['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
 
     # --- 2. Foundational Time Features ---
@@ -53,11 +67,11 @@ def create_features(df, events_df):
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
     df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype(int)
     df_copy['year'] = df_copy['date'].dt.year
-    df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek # For cyclical features if needed
+    df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek
 
     # --- 3. CRITICAL: Day of Week (One-Hot Encoded) ---
     df_copy['dayofweek'] = df_copy['date'].dt.day_name()
-    day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day', drop_first=False) # Keep all days
+    day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day', drop_first=False)
     df_copy = pd.concat([df_copy, day_dummies], axis=1)
 
     # --- 4. CRITICAL: Payday Feature (Context-Aware) ---
@@ -80,22 +94,16 @@ def create_features(df, events_df):
         df_copy['is_not_normal_day'] = 0
 
     # --- 6. Lag & Rolling Window Features (Momentum) ---
-    # Shift by 1 to prevent data leakage for training
     shift_val = 1 
-    
     targets_for_features = ['sales', 'customers', 'atv']
     for target in targets_for_features:
         if target in df_copy.columns:
-            # Lag features (what happened last week, two weeks ago?)
             df_copy[f'{target}_lag_7'] = df_copy[target].shift(shift_val + 6)
             df_copy[f'{target}_lag_14'] = df_copy[target].shift(shift_val + 13)
-
-            # Rolling features (what's the recent trend?)
             df_copy[f'{target}_rolling_mean_7'] = df_copy[target].shift(shift_val).rolling(window=7).mean()
             df_copy[f'{target}_rolling_std_7'] = df_copy[target].shift(shift_val).rolling(window=7).std()
 
-    # --- 7. ROBUST FIX: Convert all boolean/uint8 columns to integer ---
-    # This ensures all feature columns are compatible with LightGBM
+    # --- 7. Convert all boolean/uint8 columns to integer ---
     for col in df_copy.columns:
         if df_copy[col].dtype == 'bool' or df_copy[col].dtype == 'uint8':
             df_copy[col] = df_copy[col].astype(int)
