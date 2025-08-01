@@ -1,4 +1,4 @@
-# forecasting.py (Re-architected with Day-Specific Models)
+# forecasting.py (Corrected to fix ValueError)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -63,8 +63,7 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     # --- Prepare Data ---
     FEATURES = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col != target]
     
-    # Remove features that are constant for a specific day (e.g., 'day_Monday' is always 1 in the Monday model)
-    constant_cols = [col for col in FEATURES if df_day_featured[col].nunique() == 1]
+    constant_cols = [col for col in FEATURES if df_day_featured[col].nunique() < 2]
     FEATURES = [f for f in FEATURES if f not in constant_cols]
     
     df_train = df_day_featured.dropna(subset=FEATURES + [target])
@@ -73,7 +72,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     
     # --- Future DataFrame Logic ---
     last_date = df_day_featured['date'].max()
-    # Generate enough dates to capture the desired number of specific weekdays
     future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7) 
     future_dates = future_date_range[future_date_range.dayofweek == day_of_week][:periods]
     
@@ -83,26 +81,28 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     # --- Prophet Model (Day-Specific) ---
     df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
-    # Weekly seasonality is false because we are already modeling a specific day
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
     prophet_model.fit(df_prophet)
     future_prophet_df = pd.DataFrame({'ds': future_dates})
     forecast_prophet = prophet_model.predict(future_prophet_df)
     
     # --- Tree-Based Models (LGBM, XGB) ---
-    # To create future features correctly, we need to append future placeholders to the historical data
-    # and then engineer features on the combined dataframe.
-    future_placeholder = pd.DataFrame(index=future_dates)
-    future_placeholder.index.name = 'date'
     
-    # Combine historical data for the specific day with future placeholders
-    combined_df_for_features = pd.concat([df_day_featured, future_placeholder])
-    combined_df_for_features = create_features(combined_df_for_features, events_df)
+    # --- FIX: Construct the placeholder with a 'date' COLUMN to prevent NaT issues ---
+    future_placeholder = pd.DataFrame({'date': future_dates})
     
-    X_future = combined_df_for_features[combined_df_for_features.index.isin(future_dates)]
+    # Concatenate along rows, ensuring a clean index and a single 'date' column
+    combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
+    # --- END OF FIX ---
+    
+    # Now, create features on the correctly formed combined DataFrame
+    combined_df_with_features = create_features(combined_df_for_features, events_df)
+    
+    # Isolate the future rows which now have all features correctly engineered
+    X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)]
     X_future = X_future[FEATURES]
-    X_future.fillna(method='ffill', inplace=True) # Fill any gaps with the last known value
-    X_future.fillna(0, inplace=True) # Fill any remaining NaNs
+    X_future.fillna(method='ffill', inplace=True) 
+    X_future.fillna(0, inplace=True)
 
     # --- LightGBM Model ---
     lgbm = lgb.LGBMRegressor(random_state=42)
@@ -136,15 +136,18 @@ def generate_forecast(historical_df, events_df, periods=15):
     all_cust_forecasts = []
     all_atv_forecasts = []
     
+    prophet_model = None # To hold the last generated prophet model for insights
+    
     # --- Main Orchestration Loop ---
-    # Iterate through each day of the week (0=Monday, 6=Sunday)
     for day_of_week in range(7):
         df_day = df_featured[df_featured['date'].dt.dayofweek == day_of_week].copy()
         
         # Forecast Customers for this day
-        cust_fcst, prophet_model = run_day_specific_models(df_day, 'customers', day_of_week, periods, events_df)
+        cust_fcst, prophet_model_cust = run_day_specific_models(df_day, 'customers', day_of_week, periods, events_df)
         if not cust_fcst.empty:
             all_cust_forecasts.append(cust_fcst)
+            if prophet_model_cust:
+                prophet_model = prophet_model_cust # Save the last valid model
             
         # Forecast ATV for this day
         atv_fcst, _ = run_day_specific_models(df_day, 'atv', day_of_week, periods, events_df)
@@ -152,7 +155,7 @@ def generate_forecast(historical_df, events_df, periods=15):
             all_atv_forecasts.append(atv_fcst)
 
     if not all_cust_forecasts or not all_atv_forecasts:
-        return pd.DataFrame(), None # Return empty if no forecasts could be made
+        return pd.DataFrame(), None 
 
     # --- Combine forecasts from all 7 specialist models ---
     cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
@@ -165,11 +168,9 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds')
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
-    # Post-processing to ensure logical values (no negative sales/customers)
+    # Post-processing to ensure logical values
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
 
-    # The 'prophet_model' returned is just the one for the last day (Sunday), mainly for debugging/insight purposes.
-    # The true forecast is the composite `final_df`.
     return final_df, prophet_model
