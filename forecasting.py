@@ -93,8 +93,10 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
                 
-                # --- FINAL FIX: Use the explicit callback object for XGBoost ---
+                # --- THE ROBUST FIX ---
+                # 1. Create the specific callback object for XGBoost.
                 early_stopping_callback = XGBEarlyStopping(rounds=10, save_best=True)
+                # 2. Pass it using the 'callbacks' argument and REMOVE the incorrect 'early_stopping_rounds'.
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
                           callbacks=[early_stopping_callback], verbose=False)
                 # --- END OF FIX ---
@@ -106,7 +108,7 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
         return np.mean(scores)
 
     study = optuna.create_study(direction='minimize')
-    study.optimize(objective, n_trials=25, show_progress_bar=False) # Reduced trials for faster UI
+    study.optimize(objective, n_trials=25, show_progress_bar=False)
     return study.best_params
 
 def run_base_models(df_featured, target, periods, events_df):
