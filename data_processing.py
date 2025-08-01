@@ -94,4 +94,10 @@ def create_features(df, events_df):
             df_copy[f'{target}_rolling_mean_7'] = df_copy[target].shift(shift_val).rolling(window=7).mean()
             df_copy[f'{target}_rolling_std_7'] = df_copy[target].shift(shift_val).rolling(window=7).std()
 
+    # --- 7. ROBUST FIX: Convert all boolean/uint8 columns to integer ---
+    # This ensures all feature columns are compatible with LightGBM
+    for col in df_copy.columns:
+        if df_copy[col].dtype == 'bool' or df_copy[col].dtype == 'uint8':
+            df_copy[col] = df_copy[col].astype(int)
+            
     return df_copy.fillna(0)
