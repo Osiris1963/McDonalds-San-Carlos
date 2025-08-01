@@ -80,11 +80,10 @@ def init_firestore():
         return None
 
 # --- Firestore Data Management Functions (from your original file) ---
-# In a larger app, these could also be in a separate firestore_utils.py file
 def add_to_firestore(db_client, collection_name, record, existing_df):
     """Adds a new record to Firestore, checking for duplicates by date."""
     record_date = pd.to_datetime(record['date']).normalize()
-    if record_date in pd.to_datetime(existing_df['date']).dt.normalize().values:
+    if not existing_df.empty and record_date in pd.to_datetime(existing_df['date']).dt.normalize().values:
         st.error(f"A record for {record_date.strftime('%Y-%m-%d')} already exists.")
         return
     db_client.collection(collection_name).add(record)
@@ -98,9 +97,13 @@ def update_firestore_record(db_client, collection_name, doc_id, update_data):
     db_client.collection(collection_name).document(doc_id).update(update_data)
 
 # --- UI Component Rendering Functions (from your original file) ---
-# In a larger app, these could be in a ui_components.py file
 def render_historical_record(row, db_client):
     """Renders an editable historical data record."""
+    # Defensive check for doc_id
+    if 'doc_id' not in row or pd.isna(row['doc_id']):
+        # st.warning(f"Skipping record for date {row['date'].strftime('%Y-%m-%d')} due to missing document ID.")
+        return
+
     date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     
@@ -116,7 +119,19 @@ def render_historical_record(row, db_client):
             updated_sales = edit_cols[0].number_input("Sales (₱)", value=float(row.get('sales', 0)), key=f"sales_{row['doc_id']}")
             updated_customers = edit_cols[1].number_input("Customers", value=int(row.get('customers', 0)), key=f"cust_{row['doc_id']}")
             
-            updated_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], index=["Normal Day", "Not Normal Day"].index(row.get('day_type', 'Normal Day')), key=f"day_type_{row['doc_id']}")
+            # --- ROBUST FIX FOR ValueError ---
+            day_type_options = ["Normal Day", "Not Normal Day"]
+            current_day_type = row.get('day_type', 'Normal Day')
+            
+            # If the value from the database isn't valid, default to the first option
+            if current_day_type not in day_type_options:
+                current_day_type = day_type_options[0] 
+            
+            current_index = day_type_options.index(current_day_type)
+            
+            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
+            # --- END OF FIX ---
+
             updated_day_type_notes = st.text_input("Notes", value=row.get('day_type_notes', ''), key=f"notes_{row['doc_id']}")
 
             btn_cols = st.columns(2)
@@ -248,9 +263,16 @@ if db:
             df = st.session_state.historical_df.copy()
             if not df.empty:
                 df['date'] = pd.to_datetime(df['date'])
-                # Add doc_id to df for editing
-                docs = db.collection('historical_data').stream()
-                id_map = {doc.to_dict()['date'].strftime('%Y-%m-%d'): doc.id for doc in docs}
+                
+                # More robustly get doc_ids to prevent errors
+                docs_with_ids = {doc.id: doc.to_dict() for doc in db.collection('historical_data').stream()}
+                id_map = {}
+                for doc_id, doc_data in docs_with_ids.items():
+                    if 'date' in doc_data:
+                        # Ensure timezone consistency before formatting
+                        doc_date = pd.to_datetime(doc_data['date']).tz_localize(None).strftime('%Y-%m-%d')
+                        id_map[doc_date] = doc_id
+                
                 df['doc_id'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d').map(id_map)
                 
                 recent_df = df.sort_values(by="date", ascending=False).head(15)
