@@ -53,6 +53,7 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
         tscv = TimeSeriesSplit(n_splits=3)
         scores = []
 
+        # --- FIX: Separate logic for LGBM and XGBoost ---
         if model_name == 'lgbm':
             params = {
                 'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000,
@@ -89,11 +90,13 @@ def tune_model_hyperparameters(X, y, model_name='lgbm'):
             for train_index, val_index in tscv.split(X):
                 X_train, X_val = X.iloc[train_index], X.iloc[val_index]
                 y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+                # Use XGBoost's specific parameter for early stopping
                 model.fit(X_train, y_train, eval_set=[(X_val, y_val)], 
                           early_stopping_rounds=10, verbose=False)
                 preds = model.predict(X_val)
                 rmse = np.sqrt(mean_squared_error(y_val, preds))
                 scores.append(rmse)
+        # --- END OF FIX ---
         
         return np.mean(scores)
 
