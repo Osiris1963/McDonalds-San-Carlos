@@ -1,4 +1,4 @@
-# forecasting.py (Corrected for Feature Consistency)
+# forecasting.py (Final Version with Robust Fallback)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -52,26 +52,16 @@ def generate_ph_holidays(start_date, end_date, events_df):
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
     """
     Trains Prophet, LightGBM, XGBoost on data for only a *specific day of the week*
-    and returns their combined forecast for that day.
+    and returns their combined forecast for that day. Includes robust fallback logic.
     """
     if len(df_day_featured) < 20: 
         return pd.DataFrame(), None
 
-    # --- FIX: Define one definitive list of features to be used for both training and prediction ---
     all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv']]
-    
-    # Remove features that are constant for a specific day (e.g., 'day_Monday' is always 1 in the Monday model)
     constant_cols = [col for col in all_features if df_day_featured[col].nunique() < 2]
     final_features = [f for f in all_features if f not in constant_cols]
-    # --- END OF FIX ---
     
     df_train = df_day_featured.dropna(subset=final_features + [target])
-
-    if df_train.empty:
-        return pd.DataFrame(), None
-        
-    X_train = df_train[final_features]
-    y_train = df_train[target]
     
     last_date = df_day_featured['date'].max()
     future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7) 
@@ -80,31 +70,40 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    # --- Prophet Model ---
+    # --- Prophet Model (Always runs as it's more robust) ---
     df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
     prophet_model.fit(df_prophet)
     future_prophet_df = pd.DataFrame({'ds': future_dates})
     forecast_prophet = prophet_model.predict(future_prophet_df)
-    
+
+    # --- ROBUSTNESS CHECK & FALLBACK ---
+    # After dropping NaNs, if we have too few samples, tree models will be unstable.
+    # In this case, we fall back to using only the Prophet forecast.
+    MIN_SAMPLES_FOR_TREE_MODELS = 10
+    if len(df_train) < MIN_SAMPLES_FOR_TREE_MODELS:
+        # Return only Prophet's forecast in the expected format.
+        return forecast_prophet[['ds', 'yhat']], prophet_model
+    # --- END OF CHECK ---
+        
+    X_train = df_train[final_features]
+    y_train = df_train[target]
+
     # --- Tree-Based Models ---
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
     
-    # Use the definitive 'final_features' list for prediction data
     X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)]
     X_future = X_future[final_features] 
     X_future.fillna(method='ffill', inplace=True) 
     X_future.fillna(0, inplace=True)
 
-    # --- LightGBM Model ---
     lgbm = lgb.LGBMRegressor(random_state=42)
     lgbm.fit(X_train, y_train)
     lgbm_preds = lgbm.predict(X_future)
 
-    # --- XGBoost Model ---
     xgb_model = xgb.XGBRegressor(random_state=42)
     xgb_model.fit(X_train, y_train)
     xgb_preds = xgb_model.predict(X_future)
