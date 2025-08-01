@@ -12,7 +12,7 @@ from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v2.0",
+    page_title="Sales Forecaster v2.1",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -75,6 +75,40 @@ def init_firestore():
         st.error(f"Firestore Connection Error: Failed to initialize. Check your Streamlit Secrets. Details: {e}")
         return None
 
+# --- ADDED: Function to save the forecast to a log collection ---
+def save_forecast_to_log(db_client, forecast_df):
+    """
+    Saves the generated forecast to the 'forecast_log' collection in Firestore.
+    This is critical for tracking model performance over time.
+    """
+    if db_client is None or forecast_df.empty:
+        st.warning("Database client not available or forecast is empty. Skipping log.")
+        return False
+
+    try:
+        batch = db_client.batch()
+        log_collection_ref = db_client.collection('forecast_log')
+        generated_on_ts = pd.to_datetime('today').normalize()
+
+        for _, row in forecast_df.iterrows():
+            # Let Firestore create a unique document ID for each log entry
+            log_doc_ref = log_collection_ref.document()
+            
+            log_data = {
+                'generated_on': generated_on_ts,
+                'forecast_for_date': row['ds'],
+                'predicted_sales': float(row['forecast_sales']),
+                'predicted_customers': int(row['forecast_customers']),
+                'predicted_atv': float(row['forecast_atv'])
+            }
+            batch.set(log_doc_ref, log_data)
+        
+        batch.commit()
+        return True
+    except Exception as e:
+        st.error(f"Error logging forecast to database: {e}")
+        return False
+
 # --- UI Component Rendering Functions ---
 def render_historical_record(row, db_client):
     """Renders an editable historical data record."""
@@ -122,8 +156,8 @@ if db:
     # --- Sidebar ---
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v2.0")
-        st.info("Re-architected for precision and speed.")
+        st.title("AI Forecaster v2.1")
+        st.info("Re-architected for precision and automated logging.")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -137,11 +171,24 @@ if db:
             if len(historical_df) < 50:
                 st.error("Need at least 50 days of data for a reliable forecast.")
             else:
+                forecast_df = pd.DataFrame() # Ensure variable exists
                 with st.spinner("🧠 Running advanced ensemble forecast..."):
                     forecast_df, prophet_model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
                     st.session_state.prophet_model = prophet_model
-                st.success("Forecast Generated!")
+                
+                # --- MODIFIED: Added automatic saving workflow ---
+                if not forecast_df.empty:
+                    with st.spinner("📡 Logging forecast to database for performance tracking..."):
+                        save_successful = save_forecast_to_log(db, forecast_df)
+                    
+                    if save_successful:
+                        st.success("Forecast Generated and Logged Successfully!")
+                    else:
+                        st.warning("Forecast was generated but failed to log to the database.")
+                else:
+                    st.error("Forecast generation failed. Could not create or log forecast.")
+
 
     # --- Main Content Area with Tabs ---
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Edit Data"]
