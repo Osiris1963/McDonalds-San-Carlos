@@ -1,9 +1,9 @@
-# data_processing.py (Final Version with Feature Isolation)
+# data_processing.py (Definitive Version with Correct Data Types)
 import pandas as pd
 import numpy as np
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data, creating a clean 'base_sales' column for modeling."""
+    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
     if db_client is None: return pd.DataFrame()
     
     docs = db_client.collection(collection_name).stream()
@@ -34,15 +34,18 @@ def create_features_for_customers(df, events_df):
     """Creates a pure, non-financial feature set for customer forecasting."""
     df_copy = df.copy()
     
-    # Date-based features
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
-    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('Int64')
+    
+    # --- DEFINITIVE FIX: Cast weekofyear to a standard int after filling potential NaNs ---
+    week_series = df_copy['date'].dt.isocalendar().week
+    df_copy['weekofyear'] = week_series.fillna(0).astype(int)
+    # --- END OF FIX ---
+
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek
     df_copy['is_weekend'] = (df_copy['dayofweek_num'] >= 5).astype(int)
     
-    # Contextual features
     df_copy['is_payday_period'] = df_copy['date'].apply(lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0).astype(int)
     
     if 'add_on_sales' in df_copy.columns:
@@ -59,7 +62,6 @@ def create_features_for_customers(df, events_df):
     else:
         df_copy['is_event'] = 0
 
-    # Lag features of itself ONLY
     if 'customers' in df_copy.columns:
         df_copy['customers_lag_7'] = df_copy['customers'].shift(7)
         df_copy['customers_lag_14'] = df_copy['customers'].shift(14)
@@ -69,15 +71,12 @@ def create_features_for_customers(df, events_df):
 
 def create_features_for_atv(df, events_df):
     """Creates a feature set for ATV, which can include customer-related features."""
-    # Start with the pure customer features
     df_copy = create_features_for_customers(df, events_df)
     
-    # Calculate ATV - this is the only place it should be calculated
     if 'base_sales' in df_copy.columns and 'customers' in df_copy.columns:
         customers_safe = df_copy['customers'].replace(0, np.nan)
         df_copy['atv'] = (df_copy['base_sales'] / customers_safe).fillna(method='ffill').fillna(0)
 
-    # Add ATV's own lags
     if 'atv' in df_copy.columns:
         df_copy['atv_lag_7'] = df_copy['atv'].shift(7)
         df_copy['atv_lag_14'] = df_copy['atv'].shift(14)
