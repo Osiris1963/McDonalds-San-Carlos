@@ -1,114 +1,76 @@
 # forecasting.py
-# Implements the state-of-the-art Temporal Fusion Transformer model.
-# Final robust version with aggressive data sanitization to prevent TypeErrors.
+# Implements a Hybrid Ensemble model: Prophet for trend, LightGBM for residuals.
 
 import pandas as pd
 from datetime import timedelta
 import numpy as np
 from prophet import Prophet
+import lightgbm as lgb
 
-# --- New Imports for TFT ---
-import torch
-import pytorch_lightning as pl
-from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-from pytorch_forecasting.data import GroupNormalizer
-from pytorch_forecasting.metrics import MAE, SMAPE
+from data_processing import create_hybrid_features, create_atv_features, get_weather_data
 
-from data_processing import create_tft_features, create_atv_features, get_weather_data
-
-def train_customer_model(historical_df, periods):
+def train_customer_model(historical_df, events_df, periods):
     """
-    Trains a Temporal Fusion Transformer model to forecast customer counts.
+    Trains a Hybrid Ensemble model to forecast customer counts.
     """
-    # 1. Fetch weather data for the entire historical and future period
+    # --- Part 1: Train the Trend Specialist (Prophet) ---
+    df_prophet = historical_df[['date', 'customers']].rename(columns={'date': 'ds', 'customers': 'y'})
+    
+    # Configure Prophet to be highly sensitive to recent trend changes
+    trend_model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        changepoint_prior_scale=0.5 # Higher value makes trend more flexible
+    )
+    
+    # Add holidays if available
+    if events_df is not None and not events_df.empty:
+        holidays = events_df[['date', 'activity_name']].rename(columns={'date': 'ds', 'activity_name': 'holiday'})
+        trend_model.holidays = holidays
+        
+    trend_model.fit(df_prophet)
+    
+    # Get the trend forecast for the entire historical and future period
+    future_dates = trend_model.make_future_dataframe(periods=periods)
+    trend_forecast = trend_model.predict(future_dates)
+
+    # --- Part 2: Train the Context Specialist (LightGBM on Residuals) ---
+    
+    # 1. Calculate the residuals (errors) from the trend model on historical data
+    df_residuals = pd.merge(historical_df, trend_forecast[['ds', 'yhat']], left_on='date', right_on='ds')
+    df_residuals['residuals'] = df_residuals['customers'] - df_residuals['yhat']
+    
+    # 2. Fetch weather data and create features
     start_date = historical_df['date'].min()
     end_date = historical_df['date'].max() + timedelta(days=periods)
     weather_df = get_weather_data(start_date, end_date)
-
-    # 2. Create features for the TFT model
-    df_featured = create_tft_features(historical_df, weather_df)
+    df_featured = create_hybrid_features(df_residuals, weather_df)
     
-    # Create a master calendar dataframe from the first date to the last forecast date
-    full_date_range = pd.date_range(start=df_featured['date'].min(), end=end_date, freq='D')
-    scaffold_df = pd.DataFrame({'date': full_date_range})
+    # 3. Define features for the residual model
+    features = [
+        'dayofweek', 'dayofyear', 'month', 'is_weekend',
+        'customers_lag_7', 'customers_rolling_mean_4_weeks_same_day',
+        'weather_temp', 'weather_precip', 'weather_wind'
+    ]
+    target = 'residuals'
     
-    # Merge the actual data onto the scaffold. This creates a perfect sequence.
-    merged_df = pd.merge(scaffold_df, df_featured, on='date', how='left')
+    # 4. Train LightGBM to predict the residuals
+    residual_model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=500, random_state=42)
+    residual_model.fit(df_featured[features], df_featured[target])
     
-    # --- FINAL ROBUSTNESS FIX: Sanitize all categorical columns ---
-    categorical_cols = ["series", "month", "dayofweek", "weather_code"]
-    for col in categorical_cols:
-        if col in merged_df.columns:
-            # Fill any NaN values created by the merge with a placeholder string
-            merged_df[col].fillna("missing", inplace=True)
-            # Enforce string type one last time to prevent any mixed types
-            merged_df[col] = merged_df[col].astype(str)
-    # --- END FIX ---
-
-    # Re-create time_idx on the final merged dataframe to ensure it's perfectly sequential
-    merged_df['time_idx'] = (merged_df['date'] - merged_df['date'].min()).dt.days
-
-    # 3. Define the TimeSeriesDataSet using the new, complete, and sanitized dataframe
-    max_encoder_length = 30
-    max_prediction_length = periods
-
-    training_cutoff = merged_df["time_idx"].max() - max_prediction_length
-
-    training_data = TimeSeriesDataSet(
-        merged_df[lambda x: x.time_idx <= training_cutoff],
-        time_idx="time_idx",
-        target="customers",
-        group_ids=["series"],
-        max_encoder_length=max_encoder_length,
-        max_prediction_length=max_prediction_length,
-        static_categoricals=["series"],
-        time_varying_known_categoricals=["month", "dayofweek", "weather_code"],
-        time_varying_known_reals=["time_idx", "weather_temp", "weather_precip", "weather_wind"],
-        time_varying_unknown_categoricals=[],
-        time_varying_unknown_reals=["customers"],
-        target_normalizer=GroupNormalizer(groups=["series"], transformation="softplus"),
-        allow_missing_timesteps=True
-    )
-
-    # 4. Create validation set and dataloaders
-    validation_data = TimeSeriesDataSet.from_dataset(training_data, merged_df, predict=True, stop_randomization=True)
-    batch_size = 16
-    train_dataloader = training_data.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
-    val_dataloader = validation_data.to_dataloader(train=False, batch_size=batch_size * 10, num_workers=0)
-
-    # 5. Configure and Train the TFT Model
-    pl.seed_everything(42)
-    trainer = pl.Trainer(
-        max_epochs=30, accelerator="cpu", gradient_clip_val=0.1,
-        limit_train_batches=30, callbacks=[], logger=False,
-        enable_model_summary=False, enable_progress_bar=False
-    )
+    # 5. Predict future residuals
+    future_feature_df = create_hybrid_features(trend_forecast, weather_df)
+    future_residuals = residual_model.predict(future_feature_df[features])
     
-    tft = TemporalFusionTransformer.from_dataset(
-        training_data, learning_rate=0.03, hidden_size=16, attention_head_size=1,
-        dropout=0.1, hidden_continuous_size=8, output_size=7, loss=SMAPE(),
-        log_interval=10, reduce_on_plateau_patience=4,
-    )
+    # --- Part 3: Combine the Forecasts ---
+    final_forecast = trend_forecast.copy()
+    final_forecast['residual_forecast'] = future_residuals
+    final_forecast['forecast_customers'] = final_forecast['yhat'] + final_forecast['residual_forecast']
     
-    trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
-
-    # 6. Predict on the future data
-    best_model_path = trainer.checkpoint_callback.best_model_path
-    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
-    
-    raw_predictions = best_tft.predict(val_dataloader, return_index=True, fast=True)
-    
-    # 7. Format the output
-    all_preds = []
-    for i in range(len(raw_predictions.index)):
-        date = raw_predictions.index.iloc[i]['date']
-        prediction = raw_predictions.prediction.iloc[i][3] 
-        all_preds.append({'ds': date, 'forecast_customers': prediction})
-
-    forecast_df = pd.DataFrame(all_preds)
-    forecast_df = forecast_df.sort_values('ds').drop_duplicates('ds').reset_index(drop=True)
-
-    return forecast_df
+    # Return only the future predictions
+    last_hist_date = historical_df['date'].max()
+    return final_forecast[final_forecast['ds'] > last_hist_date][['ds', 'forecast_customers']]
 
 
 def train_atv_model(historical_df, events_df, periods):
@@ -135,16 +97,16 @@ def train_atv_model(historical_df, events_df, periods):
     forecast = model.predict(future)
     forecast_df = forecast[forecast['ds'] > last_hist_date][['ds', 'yhat']]
     forecast_df.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
-    return forecast_df, model
+    # Pass back the trend model for UI plotting
+    return forecast_df, trend_model 
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Orchestrates the new TFT + Prophet forecasting process."""
-    if len(historical_df) < 90:
-        print("TFT model requires at least 90 days of data.")
+    """Orchestrates the new Hybrid Ensemble forecasting process."""
+    if len(historical_df) < 30:
         return pd.DataFrame(), None
     
-    cust_forecast_df = train_customer_model(historical_df, periods)
-    atv_forecast_df, prophet_model_for_ui = train_atv_model(historical_df, events_df, periods)
+    cust_forecast_df, trend_model_for_ui = train_customer_model(historical_df, events_df, periods)
+    atv_forecast_df, _ = train_atv_model(historical_df, events_df, periods)
     
     if cust_forecast_df.empty or atv_forecast_df.empty:
         return pd.DataFrame(), None
@@ -157,4 +119,5 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     
-    return final_df.head(periods), prophet_model_for_ui
+    # We pass back the customer trend model for visualization
+    return final_df.head(periods), trend_model_for_ui
