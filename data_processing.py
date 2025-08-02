@@ -1,9 +1,12 @@
-# data_processing.py (Final Version with Base Sales Logic)
+# data_processing.py (Final Version with Robust Loading)
 import pandas as pd
 import numpy as np
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data, creating a clean 'base_sales' column for modeling."""
+    """
+    Loads and preprocesses data from a Firestore collection.
+    This version is robust and handles different collection schemas gracefully.
+    """
     if db_client is None:
         return pd.DataFrame()
     
@@ -19,34 +22,32 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
+    # All our collections should have a date, so this check is essential.
     if 'date' not in df.columns:
-        return pd.DataFrame()
+        return df # Return as-is if no date column
 
+    # --- Generic Date Handling ---
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
-    
     df.sort_values(by='date', inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
     if pd.api.types.is_datetime64_any_dtype(df['date']):
         df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
-    
-    # --- NEW: Base Sales Calculation ---
-    # Convert to numeric, filling missing values with 0
-    df['sales'] = pd.to_numeric(df.get('sales'), errors='coerce').fillna(0)
-    df['add_on_sales'] = pd.to_numeric(df.get('add_on_sales'), errors='coerce').fillna(0)
-    
-    # Rename original 'sales' to 'total_sales' for clarity
-    df.rename(columns={'sales': 'total_sales'}, inplace=True)
-    
-    # Create 'base_sales' which is the target for our trend model
-    df['base_sales'] = df['total_sales'] - df['add_on_sales']
-    # --- END NEW ---
-    
-    numeric_cols = ['customers']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    # --- Schema-Aware Column Processing ---
+    # This block now checks for the existence of columns before processing them.
+    # This allows the function to safely handle both 'historical_data' and 'future_activities'.
+
+    if 'sales' in df.columns:
+        # This logic will only run for the 'historical_data' collection
+        df['add_on_sales'] = pd.to_numeric(df.get('add_on_sales'), errors='coerce').fillna(0)
+        df['sales'] = pd.to_numeric(df.get('sales'), errors='coerce').fillna(0)
+        
+        df.rename(columns={'sales': 'total_sales'}, inplace=True)
+        df['base_sales'] = df['total_sales'] - df['add_on_sales']
+
+    if 'customers' in df.columns:
+        df['customers'] = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
 
     return df.sort_values(by='date').reset_index(drop=True)
 
@@ -64,9 +65,10 @@ def create_features(df, events_df):
             feature_cols_to_drop.append(col)
     df_copy.drop(columns=[col for col in feature_cols_to_drop if col in df_copy.columns], inplace=True, errors='ignore')
 
-    # --- MODIFIED: ATV is now calculated from base_sales ---
-    customers_safe = df_copy['customers'].replace(0, np.nan)
-    df_copy['atv'] = (df_copy['base_sales'] / customers_safe).fillna(method='ffill').fillna(0)
+    # ATV is now calculated from base_sales
+    if 'base_sales' in df_copy.columns and 'customers' in df_copy.columns:
+        customers_safe = df_copy['customers'].replace(0, np.nan)
+        df_copy['atv'] = (df_copy['base_sales'] / customers_safe).fillna(method='ffill').fillna(0)
 
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
