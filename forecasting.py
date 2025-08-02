@@ -1,4 +1,4 @@
-# forecasting.py (Definitive Version with Time-Weighted Learning)
+# forecasting.py (Definitive Version with Dual-Strategy Modeling)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -78,38 +78,40 @@ def build_future_dataframe(future_dates, historical_df, final_features, events_d
     
     return future_df
 
-def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_features, historical_df_full, events_df):
-    """Runs the full two-stage model pipeline with time-weighted learning."""
-    # --- NEW: Time-Weighted Learning ---
-    # Create weights that give more importance to recent data.
-    # The most recent date in the training set gets the highest weight.
-    time_since_last_obs = (df_train['date'].max() - df_train['date']).dt.days
-    decay_factor = 0.995 # This factor can be tuned, but 0.995 is a strong starting point.
-    sample_weights = np.power(decay_factor, time_since_last_obs)
-    # --- END NEW ---
+def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_features, historical_df_full, events_df, use_time_weights=True):
+    """
+    Runs the full two-stage model pipeline.
+    Includes a flag to enable/disable time-weighted learning for different metrics.
+    """
+    sample_weights = None
+    if use_time_weights:
+        time_since_last_obs = (df_train['date'].max() - df_train['date']).dt.days
+        decay_factor = 0.995
+        sample_weights = np.power(decay_factor, time_since_last_obs)
 
     # --- Stage 1: Primary Model ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'})
     df_prophet['y'] = y_train.values
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     
+    # MODIFIED: Moderated changepoint_prior_scale for less aggressive trend chasing
+    prophet_changepoint_scale = 0.15 if use_time_weights else 0.05
+    
     prophet_model = Prophet(
         holidays=prophet_holidays,
         yearly_seasonality=True,
         weekly_seasonality=False,
         daily_seasonality=False,
-        changepoint_prior_scale=0.25
+        changepoint_prior_scale=prophet_changepoint_scale
     )
     prophet_model.fit(df_prophet)
 
     lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'verbose': -1, 'n_jobs': -1, 'seed': 42}
     lgbm = lgb.LGBMRegressor(**lgbm_params)
-    # Pass the sample_weights to the fit method
     lgbm.fit(X_train, y_train, sample_weight=sample_weights)
 
     xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'seed': 42, 'n_jobs': -1}
     xgb_model = xgb.XGBRegressor(**xgb_params)
-    # Pass the sample_weights to the fit method
     xgb_model.fit(X_train, y_train, sample_weight=sample_weights)
 
     prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
@@ -117,7 +119,6 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     xgb_train_preds = xgb_model.predict(X_train)
     X_meta = pd.DataFrame({'prophet': prophet_train_fcst['yhat'].values, 'lgbm': lgbm_train_preds, 'xgb': xgb_train_preds})
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
-    # Pass the sample_weights to the meta-learner as well
     meta_learner.fit(X_meta, y_train, sample_weight=sample_weights)
 
     X_future = build_future_dataframe(future_dates, historical_df_full, final_features, events_df)
@@ -130,7 +131,6 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     xgb_future_preds = xgb_model.predict(X_future)
     
     X_meta_future = pd.DataFrame({'prophet': prophet_future_fcst['yhat'].values, 'lgbm': lgbm_future_preds, 'xgb': xgb_future_preds})
-    
     primary_forecast = meta_learner.predict(X_meta_future)
     
     # --- Stage 2: Residual Model ---
@@ -139,7 +139,7 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     
     residual_lgbm_params = {'objective': 'regression_l1', 'n_estimators': 100, 'learning_rate': 0.05, 'verbose': -1, 'seed': 123}
     residual_model = lgb.LGBMRegressor(**residual_lgbm_params)
-    residual_model.fit(X_train, residuals, sample_weight=sample_weights) # Also weight the residual model
+    residual_model.fit(X_train, residuals, sample_weight=sample_weights)
     predicted_residuals = residual_model.predict(X_future)
 
     final_forecast = primary_forecast + predicted_residuals
@@ -148,14 +148,13 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Main forecasting function with time-weighted learning."""
+    """Main forecasting function with dual-strategy modeling."""
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
     prophet_model_for_insights = None 
     
     last_historical_date = df_featured['date'].max()
-
     day_mapping = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
 
     for day_of_week in range(7):
@@ -175,24 +174,25 @@ def generate_forecast(historical_df, events_df, periods=15):
 
         if future_dates_for_day.empty: continue
 
-        # --- Process Customers ---
+        # --- Process Customers (Agile, Trend-Following Strategy) ---
         target_cust = 'customers'
         df_train_cust = df_day.dropna(subset=final_features + [target_cust])
         if len(df_train_cust) < 20: continue
         X_train_cust, y_train_cust = df_train_cust[final_features], df_train_cust[target_cust]
         
-        cust_fcst, prophet_model_cust = run_day_specific_pipeline(df_train_cust, X_train_cust, y_train_cust, future_dates_for_day, final_features, df_featured, events_df)
+        cust_fcst, prophet_model_cust = run_day_specific_pipeline(df_train_cust, X_train_cust, y_train_cust, future_dates_for_day, final_features, df_featured, events_df, use_time_weights=True)
         if not cust_fcst.empty:
             all_cust_forecasts.append(cust_fcst)
             if prophet_model_cust: prophet_model_for_insights = prophet_model_cust
 
-        # --- Process ATV ---
+        # --- Process ATV (Stable, Conservative Strategy) ---
         target_atv = 'atv'
         df_train_atv = df_day.dropna(subset=final_features + [target_atv])
         if len(df_train_atv) < 20: continue
         X_train_atv, y_train_atv = df_train_atv[final_features], df_train_atv[target_atv]
         
-        atv_fcst, _ = run_day_specific_pipeline(df_train_atv, X_train_atv, y_train_atv, future_dates_for_day, final_features, df_featured, events_df)
+        # Set use_time_weights to False to force a stable, long-term average model for ATV
+        atv_fcst, _ = run_day_specific_pipeline(df_train_atv, X_train_atv, y_train_atv, future_dates_for_day, final_features, df_featured, events_df, use_time_weights=False)
         if not atv_fcst.empty: all_atv_forecasts.append(atv_fcst)
 
     if not all_cust_forecasts or not all_atv_forecasts: return pd.DataFrame(), None 
