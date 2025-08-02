@@ -1,5 +1,6 @@
 # forecasting.py
 # Final version with a specialist LSTM model for customer forecasting.
+# Corrected to be robust against weather API failures.
 
 import pandas as pd
 import numpy as np
@@ -7,7 +8,7 @@ from datetime import timedelta
 from prophet import Prophet
 from sklearn.preprocessing import MinMaxScaler
 
-# Import TensorFlow for the LSTM model. This is a major dependency.
+# Import TensorFlow for the LSTM model.
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -17,14 +18,12 @@ from data_processing import create_customer_features, create_atv_features, get_w
 def create_lstm_sequences(data, n_steps, features, target):
     """
     Transforms a time-series dataframe into sequences for LSTM training.
-    This is the core of implementing the "same-day-last-week" logic.
     """
     X, y = [], []
     for i in range(len(data)):
         end_ix = i + n_steps
         if end_ix > len(data) - 1:
             break
-        # Create a sequence of the past `n_steps` weeks for the features and the target
         seq_x = data[features].iloc[i:end_ix].values
         seq_y = data[target].iloc[end_ix]
         X.append(seq_x)
@@ -36,7 +35,7 @@ def train_customer_model(historical_df, periods):
     Trains a weather-aware LSTM model to forecast customer counts.
     """
     # 1. Fetch complete weather history
-    start_date = historical_df['date'].min() - timedelta(days=30) # Fetch extra for lags
+    start_date = historical_df['date'].min() - timedelta(days=30)
     end_date = historical_df['date'].max() + timedelta(days=periods)
     weather_df = get_weather_data(start_date, end_date)
 
@@ -44,13 +43,22 @@ def train_customer_model(historical_df, periods):
     df_featured = create_customer_features(historical_df, weather_df)
     
     # 3. Define features to be used by the LSTM
+    # Start with a base list of features that are always present.
     features = [
-        'dayofyear', 'month', 'is_weekend', 'customers_lag_7',
-        'weather_temp', 'weather_precip', 'weather_wind', 'weather_code'
+        'dayofyear', 'month', 'is_weekend', 'customers_lag_7'
     ]
+    
+    # --- ROBUSTNESS FIX ---
+    # Dynamically add weather features ONLY if they exist in the dataframe.
+    weather_cols = ['weather_temp', 'weather_precip', 'weather_wind', 'weather_code']
+    for col in weather_cols:
+        if col in df_featured.columns:
+            features.append(col)
+    # --- END FIX ---
+            
     target = 'customers'
     
-    # 4. Scale the data - Neural networks are sensitive to feature scale
+    # 4. Scale the data
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaler_target = MinMaxScaler(feature_range=(0, 1))
     
@@ -58,16 +66,14 @@ def train_customer_model(historical_df, periods):
     df_scaled[features] = scaler.fit_transform(df_featured[features])
     df_scaled[target] = scaler_target.fit_transform(df_featured[[target]])
 
-    # 5. Create sequences based on weekly patterns (using last 4 weeks)
-    n_steps = 4 # Use the last 4 same-days to predict the next one
-    
+    # 5. Create sequences based on weekly patterns
+    n_steps = 4
     all_predictions = []
     
-    # Train a separate LSTM model for each day of the week
     for day in range(7):
         day_df = df_scaled[df_scaled['dayofweek'] == day]
         if len(day_df) < n_steps + 1:
-            continue # Not enough data to train for this day
+            continue
 
         X, y = create_lstm_sequences(day_df, n_steps, features, target)
         
@@ -83,37 +89,31 @@ def train_customer_model(historical_df, periods):
         model.fit(X, y, epochs=50, batch_size=1, verbose=0)
 
         # 7. Forecast for the future
-        # Get the last `n_steps` of historical data for this day to start the prediction
         last_sequence = day_df[features].tail(n_steps).values
-        
-        # Reshape for the model
         current_batch = last_sequence.reshape((1, n_steps, len(features)))
         
-        # Predict future dates for this specific day
         future_dates_for_day = pd.date_range(start=historical_df['date'].max() + timedelta(days=1), periods=periods)
         future_dates_for_day = future_dates_for_day[future_dates_for_day.dayofweek == day]
         
         for future_date in future_dates_for_day:
             pred = model.predict(current_batch, verbose=0)[0]
             all_predictions.append({'ds': future_date, 'forecast_customers_scaled': pred[0]})
-            
-            # To predict the next step, we would need its features (weather, etc.)
-            # For simplicity, we'll reuse the last sequence, but a more advanced version
-            # would create future features and append them. This is a robust simplification.
 
     if not all_predictions:
         return pd.DataFrame()
 
     # 8. Combine and inverse scale the predictions
     forecast_df = pd.DataFrame(all_predictions)
-    forecast_df['forecast_customers'] = scaler_target.inverse_transform(forecast_df[['forecast_customers_scaled']]).flatten()
-    
+    if 'forecast_customers_scaled' in forecast_df.columns and not forecast_df.empty:
+        forecast_df['forecast_customers'] = scaler_target.inverse_transform(forecast_df[['forecast_customers_scaled']]).flatten()
+    else:
+        forecast_df['forecast_customers'] = 0
+
     return forecast_df[['ds', 'forecast_customers']]
 
 
 def train_atv_model(historical_df, events_df, periods):
     """Trains a Prophet model to forecast ATV. (Unchanged)"""
-    # ... (code from previous version is correct and remains here) ...
     df_atv = create_atv_features(historical_df)
     df_prophet = df_atv[['date', 'atv']].rename(columns={'date': 'ds', 'atv': 'y'})
     last_hist_date = historical_df['date'].max()
@@ -141,7 +141,7 @@ def train_atv_model(historical_df, events_df, periods):
 
 def generate_forecast(historical_df, events_df, periods=15):
     """Orchestrates the new LSTM + Prophet forecasting process."""
-    if len(historical_df) < 60: # LSTM needs more data
+    if len(historical_df) < 60:
         return pd.DataFrame(), None
     
     cust_forecast_df = train_customer_model(historical_df, periods)
@@ -151,7 +151,7 @@ def generate_forecast(historical_df, events_df, periods=15):
         return pd.DataFrame(), None
         
     final_df = pd.merge(cust_forecast_df, atv_forecast_df, on='ds', how='left').sort_values('ds')
-    final_df['forecast_atv'].fillna(method='ffill', inplace=True) # Fill any gaps
+    final_df['forecast_atv'].fillna(method='ffill', inplace=True)
     
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round().astype(int)
