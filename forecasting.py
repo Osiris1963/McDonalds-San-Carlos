@@ -7,32 +7,29 @@ from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
 import numpy as np
+# --- ENHANCEMENT: Import 'holidays' library for dynamic holiday generation ---
+import holidays
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from data_processing import create_features
 
+# --- ENHANCEMENT: Dynamic Holiday Generation ---
+# This function is now future-proof. It generates holidays for any given year range automatically.
 def generate_ph_holidays(start_date, end_date, events_df):
-    holidays_list = [
-        {'holiday': 'New Year\'s Day', 'ds': '2025-01-01'},
-        {'holiday': 'Maundy Thursday', 'ds': '2025-04-17'},
-        {'holiday': 'Good Friday', 'ds': '2025-04-18'},
-        {'holiday': 'Araw ng Kagitingan', 'ds': '2025-04-09'},
-        {'holiday': 'Labor Day', 'ds': '2025-05-01'},
-        {'holiday': 'Independence Day', 'ds': '2025-06-12'},
-        {'holiday': 'Ninoy Aquino Day', 'ds': '2025-08-21'},
-        {'holiday': 'National Heroes Day', 'ds': '2025-08-25'},
-        {'holiday': 'All Saints\' Day', 'ds': '2025-11-01'},
-        {'holiday': 'Bonifacio Day', 'ds': '2025-11-30'},
-        {'holiday': 'Feast of the Immaculate Conception', 'ds': '2025-12-08'},
-        {'holiday': 'Christmas Day', 'ds': '2025-12-25'},
-        {'holiday': 'Rizal Day', 'ds': '2025-12-30'},
-    ]
-    ph_holidays = pd.DataFrame(holidays_list)
+    """Generates a DataFrame of Philippine holidays, payday windows, and custom events."""
+    # Generate statutory holidays for the entire required range of years
+    years_to_generate = np.arange(start_date.year, end_date.year + 2)
+    ph_holidays_list = []
+    for date, name in sorted(holidays.PH(years=years_to_generate).items()):
+        ph_holidays_list.append({'holiday': name, 'ds': date})
+    
+    ph_holidays = pd.DataFrame(ph_holidays_list)
     ph_holidays['ds'] = pd.to_datetime(ph_holidays['ds'])
 
+    # Generate payday window events programmatically
     payday_events = []
-    current_date = start_date
+    current_date = start_date - timedelta(days=30) # Start from a month before to be safe
     while current_date <= end_date:
         if current_date.day in [14, 15, 16, 29, 30, 31, 1, 2]:
             payday_events.append({'holiday': 'Payday Window', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
@@ -40,6 +37,7 @@ def generate_ph_holidays(start_date, end_date, events_df):
     
     all_holidays = pd.concat([ph_holidays, pd.DataFrame(payday_events)])
 
+    # Add user-defined future activities
     if events_df is not None and not events_df.empty:
         user_events = events_df[['date', 'activity_name']].copy()
         user_events.rename(columns={'date': 'ds', 'activity_name': 'holiday'}, inplace=True)
@@ -47,6 +45,8 @@ def generate_ph_holidays(start_date, end_date, events_df):
         all_holidays = pd.concat([all_holidays, user_events])
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
+# --- END ENHANCEMENT ---
+
 
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
     if len(df_day_featured) < 20: 
