@@ -1,6 +1,6 @@
 # forecasting.py
 # Implements a Hybrid Ensemble model: Prophet for trend, LightGBM for residuals.
-# Final robust version with decoupled feature sets for training and prediction.
+# Final robust version with consistent feature structure for training and prediction.
 
 import pandas as pd
 from datetime import timedelta
@@ -43,34 +43,32 @@ def train_customer_model(historical_df, events_df, periods):
     weather_df = get_weather_data(start_date, end_date)
     df_featured_train = create_hybrid_features(df_residuals, weather_df)
     
-    # --- ROBUSTNESS FIX: Create separate feature lists for training and prediction ---
-    
-    # Features for TRAINING (can use historical customer data)
-    features_for_training = [
+    # Define the full set of features. This list will be used for both training and prediction.
+    features = [
         'dayofweek', 'dayofyear', 'month', 'is_weekend',
         'customers_lag_7', 'customers_rolling_mean_4_weeks_same_day',
         'weather_temp', 'weather_precip', 'weather_wind'
     ]
-    
-    # Features for PREDICTION (can ONLY use data we know about the future)
-    features_for_prediction = [
-        'dayofweek', 'dayofyear', 'month', 'is_weekend',
-        'weather_temp', 'weather_precip', 'weather_wind'
-    ]
-    # --- END FIX ---
-
     target = 'residuals'
     
     residual_model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=500, random_state=42)
-    # Train the model using the richer historical feature set
-    residual_model.fit(df_featured_train[features_for_training], df_featured_train[target])
+    # Train the model using the full feature set
+    residual_model.fit(df_featured_train[features], df_featured_train[target])
     
     # Create features for the future dataframe
     trend_forecast.rename(columns={'ds': 'date'}, inplace=True)
     future_feature_df = create_hybrid_features(trend_forecast, weather_df)
     
-    # Predict future residuals using ONLY the features available for the future
-    future_residuals = residual_model.predict(future_feature_df[features_for_prediction])
+    # --- ROBUSTNESS FIX: Ensure prediction dataframe has the exact same columns as training ---
+    # The `create_hybrid_features` function won't create lag features for the future
+    # because there's no 'customers' column. We must add them manually and fill with 0.
+    for col in features:
+        if col not in future_feature_df.columns:
+            future_feature_df[col] = 0
+    # --- END FIX ---
+    
+    # Predict future residuals using the full, consistent feature set
+    future_residuals = residual_model.predict(future_feature_df[features])
     
     # --- Part 3: Combine the Forecasts ---
     final_forecast = trend_forecast.copy()
@@ -126,4 +124,5 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     
+    # We pass back the ATV model for visualization, as the customer model is now a hybrid
     return final_df.head(periods), prophet_model_for_ui
