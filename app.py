@@ -12,7 +12,7 @@ from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v3.0",
+    page_title="Sales Forecaster v4.0 (Elite)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -76,11 +76,7 @@ def init_firestore():
         return None
 
 def save_forecast_to_log(db_client, forecast_df):
-    """
-    Saves the generated forecast to the 'forecast_log' collection in Firestore.
-    This version uses the forecast date (YYYY-MM-DD) as the document ID to ensure
-    the collection is always stored in chronological order.
-    """
+    """Saves the generated forecast to the 'forecast_log' collection in Firestore."""
     if db_client is None or forecast_df.empty:
         st.warning("Database client not available or forecast is empty. Skipping log.")
         return False
@@ -115,31 +111,15 @@ def render_historical_record(row, db_client):
         return
 
     date_str = row['date'].strftime('%B %d, %Y')
-    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    expander_title = f"__{date_str}__ - Total Sales: ₱{row.get('total_sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
     
     with st.expander(expander_title):
-        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
+        st.write(f"**Base Sales (Regular):** ₱{row.get('base_sales', 0):,.2f}")
+        st.write(f"**Add-on Sales (Events):** ₱{row.get('add_on_sales', 0):,.2f}")
         day_type = row.get('day_type', 'Normal Day')
         st.write(f"**Day Type:** {day_type}")
         if day_type == 'Not Normal Day':
             st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
-
-        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
-            st.markdown("**Edit Record**")
-            day_type_options = ["Normal Day", "Not Normal Day"]
-            current_day_type = row.get('day_type', 'Normal Day')
-            if current_day_type not in day_type_options:
-                current_day_type = day_type_options[0] 
-            current_index = day_type_options.index(current_day_type)
-            
-            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
-            
-            if st.form_submit_button("💾 Update Day Type", use_container_width=True):
-                update_data = {'day_type': updated_day_type}
-                db_client.collection('historical_data').document(row['doc_id']).update(update_data)
-                st.success(f"Record for {date_str} updated!")
-                st.cache_data.clear()
-                time.sleep(1); st.rerun()
 
 # --- Main Application ---
 apply_custom_styling()
@@ -153,8 +133,8 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v3.0")
-        st.info("Anti-Fragile Production Build")
+        st.title("AI Forecaster v4.0")
+        st.info("Residual Stacking Architecture")
 
         if st.button("🔄 Refresh Data from Firestore"):
             st.cache_data.clear()
@@ -166,20 +146,20 @@ if db:
             events_df = load_from_firestore(db, 'future_activities')
 
             if len(historical_df) < 50:
-                st.error("Need at least 50 days of data for a reliable forecast.")
+                st.error("Need at least 50 days of data for reliable forecasting.")
             else:
                 forecast_df = pd.DataFrame() 
-                with st.spinner("🧠 Running Day-Specific Specialist Models..."):
+                with st.spinner("🧠 Running Elite Forecasting Models... (This may take a moment)"):
                     forecast_df, prophet_model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
                     st.session_state.prophet_model = prophet_model
                 
                 if not forecast_df.empty:
-                    with st.spinner("📡 Logging forecast to database for performance tracking..."):
+                    with st.spinner("📡 Logging forecast to database..."):
                         save_successful = save_forecast_to_log(db, forecast_df)
                     
                     if save_successful:
-                        st.success("Forecast Generated and Logged Successfully!")
+                        st.success("Elite Forecast Generated & Logged!")
                     else:
                         st.warning("Forecast was generated but failed to log to the database.")
                 else:
@@ -193,18 +173,17 @@ if db:
         if not st.session_state.forecast_df.empty:
             df_to_show = st.session_state.forecast_df.rename(columns={
                 'ds': 'Date', 'forecast_customers': 'Predicted Customers',
-                'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)'
+                'forecast_atv': 'Predicted Regular ATV (₱)', 'forecast_sales': 'Predicted Total Sales (₱)'
             })
-            st.dataframe(df_to_show.set_index('Date'), use_container_width=True, height=560)
+            st.dataframe(df_to_show[['Date', 'Predicted Customers', 'Predicted Regular ATV (₱)', 'Predicted Total Sales (₱)']].set_index('Date'), use_container_width=True, height=560)
         else:
             st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
     with tabs[1]:
         st.header("💡 Forecast Insights")
-        st.warning("Component breakdown is derived from the last trained specialist model (typically Sunday) and is for general insight only. The final forecast is a composite of all seven specialist models.")
+        st.warning("Component breakdown is derived from the last trained specialist model (typically Sunday) and is for general insight only. The final forecast is a composite of all seven specialist models and their error-correction counterparts.")
         if st.session_state.prophet_model:
             future = st.session_state.prophet_model.make_future_dataframe(periods=15)
-            # Filter for the specific day of the week of the last model
             last_model_weekday = st.session_state.prophet_model.history['ds'].dt.dayofweek.iloc[-1]
             future = future[future['ds'].dt.dayofweek == last_model_weekday]
             if not future.empty:
@@ -217,8 +196,8 @@ if db:
             st.info("Generate a forecast to see the breakdown of its components.")
 
     with tabs[2]:
-        st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates if an unusual event occurred.")
+        st.header("✍️ View Historical Data")
+        st.info("This view shows the breakdown of Total Sales into Base (Regular) and Add-on (Event) sales.")
         historical_df = load_from_firestore(db, 'historical_data')
         if not historical_df.empty:
             recent_df = historical_df.sort_values(by="date", ascending=False).head(30)
