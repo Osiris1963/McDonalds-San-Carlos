@@ -1,8 +1,8 @@
-# forecasting.py (Definitive Version with Missing Import Restored)
+# forecasting.py (Definitive Version with All Imports and Logic)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
-import xgboost as xgb  # --- DEFINITIVE FIX: Restored the missing XGBoost import ---
+import xgboost as xgb
 from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
