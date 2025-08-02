@@ -1,119 +1,112 @@
 # forecasting.py
-# Final version with a specialist LSTM model for customer forecasting.
-# Corrected to be robust against weather API failures.
+# Implements the state-of-the-art Temporal Fusion Transformer model.
 
 import pandas as pd
-import numpy as np
 from datetime import timedelta
+import numpy as np
 from prophet import Prophet
-from sklearn.preprocessing import MinMaxScaler
 
-# Import TensorFlow for the LSTM model.
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+# --- New Imports for TFT ---
+import torch
+import pytorch_lightning as pl
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import MAE, SMAPE
 
-from data_processing import create_customer_features, create_atv_features, get_weather_data
-
-def create_lstm_sequences(data, n_steps, features, target):
-    """
-    Transforms a time-series dataframe into sequences for LSTM training.
-    """
-    X, y = [], []
-    for i in range(len(data)):
-        end_ix = i + n_steps
-        if end_ix > len(data) - 1:
-            break
-        seq_x = data[features].iloc[i:end_ix].values
-        seq_y = data[target].iloc[end_ix]
-        X.append(seq_x)
-        y.append(seq_y)
-    return np.array(X), np.array(y)
+from data_processing import create_tft_features, create_atv_features, get_weather_data
 
 def train_customer_model(historical_df, periods):
     """
-    Trains a weather-aware LSTM model to forecast customer counts.
+    Trains a Temporal Fusion Transformer model to forecast customer counts.
     """
-    # 1. Fetch complete weather history
-    start_date = historical_df['date'].min() - timedelta(days=30)
+    # 1. Fetch weather data for the entire historical and future period
+    start_date = historical_df['date'].min()
     end_date = historical_df['date'].max() + timedelta(days=periods)
     weather_df = get_weather_data(start_date, end_date)
 
-    # 2. Create base features
-    df_featured = create_customer_features(historical_df, weather_df)
+    # 2. Create features for the TFT model
+    df_featured = create_tft_features(historical_df, weather_df)
     
-    # 3. Define features to be used by the LSTM
-    # Start with a base list of features that are always present.
-    features = [
-        'dayofyear', 'month', 'is_weekend', 'customers_lag_7'
-    ]
+    # 3. Define the TimeSeriesDataSet
+    max_encoder_length = 30  # How many past days the model sees
+    max_prediction_length = periods
+
+    training_cutoff = df_featured["time_idx"].max() - max_prediction_length
+
+    training_data = TimeSeriesDataSet(
+        df_featured[lambda x: x.time_idx <= training_cutoff],
+        time_idx="time_idx",
+        target="customers",
+        group_ids=["series"],
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        static_categoricals=["series"],
+        time_varying_known_categoricals=["month", "dayofweek", "weather_code"],
+        time_varying_known_reals=["time_idx", "weather_temp", "weather_precip", "weather_wind"],
+        time_varying_unknown_categoricals=[],
+        time_varying_unknown_reals=["customers"],
+        target_normalizer=GroupNormalizer(groups=["series"], transformation="softplus"),
+        allow_missing_timesteps=True
+    )
+
+    # 4. Create validation set and dataloaders
+    validation_data = TimeSeriesDataSet.from_dataset(training_data, df_featured, predict=True, stop_randomization=True)
+    batch_size = 16
+    train_dataloader = training_data.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
+    val_dataloader = validation_data.to_dataloader(train=False, batch_size=batch_size * 10, num_workers=0)
+
+    # 5. Configure and Train the TFT Model
+    pl.seed_everything(42)
+    trainer = pl.Trainer(
+        max_epochs=30,
+        accelerator="cpu",
+        gradient_clip_val=0.1,
+        limit_train_batches=30,
+        callbacks=[],
+        logger=False,
+        enable_model_summary=False,
+        enable_progress_bar=False
+    )
     
-    # --- ROBUSTNESS FIX ---
-    # Dynamically add weather features ONLY if they exist in the dataframe.
-    weather_cols = ['weather_temp', 'weather_precip', 'weather_wind', 'weather_code']
-    for col in weather_cols:
-        if col in df_featured.columns:
-            features.append(col)
-    # --- END FIX ---
-            
-    target = 'customers'
+    tft = TemporalFusionTransformer.from_dataset(
+        training_data,
+        learning_rate=0.03,
+        hidden_size=16,
+        attention_head_size=1,
+        dropout=0.1,
+        hidden_continuous_size=8,
+        output_size=7,  # 7 quantiles by default
+        loss=SMAPE(),
+        log_interval=10,
+        reduce_on_plateau_patience=4,
+    )
     
-    # 4. Scale the data
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaler_target = MinMaxScaler(feature_range=(0, 1))
+    trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
+
+    # 6. Predict on the future data
+    best_model_path = trainer.checkpoint_callback.best_model_path
+    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
     
-    df_scaled = df_featured.copy()
-    df_scaled[features] = scaler.fit_transform(df_featured[features])
-    df_scaled[target] = scaler_target.fit_transform(df_featured[[target]])
-
-    # 5. Create sequences based on weekly patterns
-    n_steps = 4
-    all_predictions = []
+    raw_predictions = best_tft.predict(val_dataloader, return_index=True, fast=True)
     
-    for day in range(7):
-        day_df = df_scaled[df_scaled['dayofweek'] == day]
-        if len(day_df) < n_steps + 1:
-            continue
+    # 7. Format the output
+    all_preds = []
+    for i in range(len(raw_predictions.index)):
+        series_id = raw_predictions.index.iloc[i]['series']
+        date = raw_predictions.index.iloc[i]['date']
+        # We take the median prediction (quantile 0.5)
+        prediction = raw_predictions.prediction.iloc[i][3] 
+        all_preds.append({'ds': date, 'forecast_customers': prediction})
 
-        X, y = create_lstm_sequences(day_df, n_steps, features, target)
-        
-        if len(X) == 0: continue
+    forecast_df = pd.DataFrame(all_preds)
+    forecast_df = forecast_df.sort_values('ds').drop_duplicates('ds').reset_index(drop=True)
 
-        # 6. Build and Train the LSTM Model
-        model = Sequential([
-            LSTM(units=50, activation='relu', input_shape=(X.shape[1], X.shape[2])),
-            Dropout(0.2),
-            Dense(units=1)
-        ])
-        model.compile(optimizer='adam', loss='mean_squared_error')
-        model.fit(X, y, epochs=50, batch_size=1, verbose=0)
-
-        # 7. Forecast for the future
-        last_sequence = day_df[features].tail(n_steps).values
-        current_batch = last_sequence.reshape((1, n_steps, len(features)))
-        
-        future_dates_for_day = pd.date_range(start=historical_df['date'].max() + timedelta(days=1), periods=periods)
-        future_dates_for_day = future_dates_for_day[future_dates_for_day.dayofweek == day]
-        
-        for future_date in future_dates_for_day:
-            pred = model.predict(current_batch, verbose=0)[0]
-            all_predictions.append({'ds': future_date, 'forecast_customers_scaled': pred[0]})
-
-    if not all_predictions:
-        return pd.DataFrame()
-
-    # 8. Combine and inverse scale the predictions
-    forecast_df = pd.DataFrame(all_predictions)
-    if 'forecast_customers_scaled' in forecast_df.columns and not forecast_df.empty:
-        forecast_df['forecast_customers'] = scaler_target.inverse_transform(forecast_df[['forecast_customers_scaled']]).flatten()
-    else:
-        forecast_df['forecast_customers'] = 0
-
-    return forecast_df[['ds', 'forecast_customers']]
+    return forecast_df
 
 
 def train_atv_model(historical_df, events_df, periods):
     """Trains a Prophet model to forecast ATV. (Unchanged)"""
+    # ... (code from previous version is correct and remains here) ...
     df_atv = create_atv_features(historical_df)
     df_prophet = df_atv[['date', 'atv']].rename(columns={'date': 'ds', 'atv': 'y'})
     last_hist_date = historical_df['date'].max()
@@ -138,10 +131,10 @@ def train_atv_model(historical_df, events_df, periods):
     forecast_df.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
     return forecast_df, model
 
-
 def generate_forecast(historical_df, events_df, periods=15):
-    """Orchestrates the new LSTM + Prophet forecasting process."""
-    if len(historical_df) < 60:
+    """Orchestrates the new TFT + Prophet forecasting process."""
+    if len(historical_df) < 90: # TFT needs more data
+        print("TFT model requires at least 90 days of data.")
         return pd.DataFrame(), None
     
     cust_forecast_df = train_customer_model(historical_df, periods)
