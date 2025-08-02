@@ -1,4 +1,4 @@
-# forecasting.py (Tuned Models & Stacked Ensemble)
+# forecasting.py (Re-Architected for Base Sales Forecasting)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -7,18 +7,14 @@ from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
 import numpy as np
-# --- ENHANCEMENT: Import 'holidays' library for dynamic holiday generation ---
 import holidays
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 from data_processing import create_features
 
-# --- ENHANCEMENT: Dynamic Holiday Generation ---
-# This function is now future-proof. It generates holidays for any given year range automatically.
 def generate_ph_holidays(start_date, end_date, events_df):
     """Generates a DataFrame of Philippine holidays, payday windows, and custom events."""
-    # Generate statutory holidays for the entire required range of years
     years_to_generate = np.arange(start_date.year, end_date.year + 2)
     ph_holidays_list = []
     for date, name in sorted(holidays.PH(years=years_to_generate).items()):
@@ -27,9 +23,8 @@ def generate_ph_holidays(start_date, end_date, events_df):
     ph_holidays = pd.DataFrame(ph_holidays_list)
     ph_holidays['ds'] = pd.to_datetime(ph_holidays['ds'])
 
-    # Generate payday window events programmatically
     payday_events = []
-    current_date = start_date - timedelta(days=30) # Start from a month before to be safe
+    current_date = start_date - timedelta(days=30) 
     while current_date <= end_date:
         if current_date.day in [14, 15, 16, 29, 30, 31, 1, 2]:
             payday_events.append({'holiday': 'Payday Window', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
@@ -37,7 +32,6 @@ def generate_ph_holidays(start_date, end_date, events_df):
     
     all_holidays = pd.concat([ph_holidays, pd.DataFrame(payday_events)])
 
-    # Add user-defined future activities
     if events_df is not None and not events_df.empty:
         user_events = events_df[['date', 'activity_name']].copy()
         user_events.rename(columns={'date': 'ds', 'activity_name': 'holiday'}, inplace=True)
@@ -45,14 +39,15 @@ def generate_ph_holidays(start_date, end_date, events_df):
         all_holidays = pd.concat([all_holidays, user_events])
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
-# --- END ENHANCEMENT ---
-
 
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
     if len(df_day_featured) < 20: 
         return pd.DataFrame(), None
 
-    all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv', 'date']]
+    # --- RE-ARCHITECTED: Explicitly define columns to exclude from features ---
+    cols_to_exclude = ['sales', 'add_on_sales', 'customers', 'atv', 'date', 'base_sales']
+    all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in cols_to_exclude]
+    
     constant_cols = [col for col in all_features if df_day_featured[col].nunique() < 2]
     final_features = [f for f in all_features if f not in constant_cols]
     
@@ -65,7 +60,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    # --- Base Model Training ---
     df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
@@ -79,7 +73,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     X_train = df_train[final_features]
     y_train = df_train[target]
 
-    # --- Pre-tuned Hyperparameters (Result of Offline Optuna Study) ---
     lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.1, 'lambda_l2': 0.1, 'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt'}
     xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'seed': 42, 'n_jobs': -1}
 
@@ -89,24 +82,19 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     xgb_model = xgb.XGBRegressor(**xgb_params)
     xgb_model.fit(X_train, y_train)
     
-    # --- Stacking Ensemble ---
-    # 1. Get base model predictions on the training data itself to train the meta-learner
     prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
     lgbm_train_preds = lgbm.predict(X_train)
     xgb_train_preds = xgb_model.predict(X_train)
 
-    # 2. Create the meta-feature set
     X_meta = pd.DataFrame({
         'prophet': prophet_train_fcst['yhat'].values,
         'lgbm': lgbm_train_preds,
         'xgb': xgb_train_preds
     })
 
-    # 3. Train the meta-learner (RidgeCV is robust and fast)
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
     meta_learner.fit(X_meta, y_train)
 
-    # 4. Get base model predictions on FUTURE data
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
@@ -120,14 +108,12 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     lgbm_future_preds = lgbm.predict(X_future)
     xgb_future_preds = xgb_model.predict(X_future)
 
-    # 5. Create the future meta-feature set
     X_meta_future = pd.DataFrame({
         'prophet': prophet_future_fcst['yhat'].values,
         'lgbm': lgbm_future_preds,
         'xgb': xgb_future_preds
     })
 
-    # 6. Make the final prediction using the meta-learner
     final_stacked_preds = meta_learner.predict(X_meta_future)
     
     day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_stacked_preds})
@@ -135,6 +121,7 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
+    # This now generates features for 'base_sales'
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
@@ -168,10 +155,15 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
     if final_df.empty:
         return pd.DataFrame(), None
-        
-    final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
-    final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
+    if 'atv' in df_featured.columns:
+        historical_atv_cap = df_featured['atv'][df_featured['atv'] > 0].quantile(0.98)
+        final_df['forecast_atv'] = final_df['forecast_atv'].clip(upper=historical_atv_cap)
+        
+    # --- RE-ARCHITECTED: The final output is now forecasted BASE sales ---
+    final_df['forecast_base_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
+    
+    final_df['forecast_base_sales'] = final_df['forecast_base_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
 
