@@ -1,4 +1,4 @@
-# forecasting.py (Definitive Version with Corrected Date Frequency Logic)
+# forecasting.py (Definitive Version with Time-Weighted Learning)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -79,7 +79,15 @@ def build_future_dataframe(future_dates, historical_df, final_features, events_d
     return future_df
 
 def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_features, historical_df_full, events_df):
-    """Runs the full two-stage model pipeline for a specific day of the week."""
+    """Runs the full two-stage model pipeline with time-weighted learning."""
+    # --- NEW: Time-Weighted Learning ---
+    # Create weights that give more importance to recent data.
+    # The most recent date in the training set gets the highest weight.
+    time_since_last_obs = (df_train['date'].max() - df_train['date']).dt.days
+    decay_factor = 0.995 # This factor can be tuned, but 0.995 is a strong starting point.
+    sample_weights = np.power(decay_factor, time_since_last_obs)
+    # --- END NEW ---
+
     # --- Stage 1: Primary Model ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'})
     df_prophet['y'] = y_train.values
@@ -96,18 +104,21 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
 
     lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'verbose': -1, 'n_jobs': -1, 'seed': 42}
     lgbm = lgb.LGBMRegressor(**lgbm_params)
-    lgbm.fit(X_train, y_train)
+    # Pass the sample_weights to the fit method
+    lgbm.fit(X_train, y_train, sample_weight=sample_weights)
 
     xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'seed': 42, 'n_jobs': -1}
     xgb_model = xgb.XGBRegressor(**xgb_params)
-    xgb_model.fit(X_train, y_train)
+    # Pass the sample_weights to the fit method
+    xgb_model.fit(X_train, y_train, sample_weight=sample_weights)
 
     prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
     lgbm_train_preds = lgbm.predict(X_train)
     xgb_train_preds = xgb_model.predict(X_train)
     X_meta = pd.DataFrame({'prophet': prophet_train_fcst['yhat'].values, 'lgbm': lgbm_train_preds, 'xgb': xgb_train_preds})
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
-    meta_learner.fit(X_meta, y_train)
+    # Pass the sample_weights to the meta-learner as well
+    meta_learner.fit(X_meta, y_train, sample_weight=sample_weights)
 
     X_future = build_future_dataframe(future_dates, historical_df_full, final_features, events_df)
 
@@ -128,7 +139,7 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     
     residual_lgbm_params = {'objective': 'regression_l1', 'n_estimators': 100, 'learning_rate': 0.05, 'verbose': -1, 'seed': 123}
     residual_model = lgb.LGBMRegressor(**residual_lgbm_params)
-    residual_model.fit(X_train, residuals)
+    residual_model.fit(X_train, residuals, sample_weight=sample_weights) # Also weight the residual model
     predicted_residuals = residual_model.predict(X_future)
 
     final_forecast = primary_forecast + predicted_residuals
@@ -137,7 +148,7 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Main forecasting function with corrected date frequency logic."""
+    """Main forecasting function with time-weighted learning."""
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
@@ -145,7 +156,6 @@ def generate_forecast(historical_df, events_df, periods=15):
     
     last_historical_date = df_featured['date'].max()
 
-    # --- DEFINITIVE FIX: Use a day-specific frequency string for date generation ---
     day_mapping = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
 
     for day_of_week in range(7):
@@ -160,10 +170,8 @@ def generate_forecast(historical_df, events_df, periods=15):
         while first_future_day.weekday() != day_of_week:
             first_future_day += timedelta(days=1)
         
-        # Use the correct, day-specific frequency string (e.g., 'W-MON' for Monday)
         freq_str = f'W-{day_mapping[day_of_week]}'
         future_dates_for_day = pd.date_range(start=first_future_day, periods=periods, freq=freq_str)
-        # --- END OF FIX ---
 
         if future_dates_for_day.empty: continue
 
@@ -213,6 +221,4 @@ def generate_forecast(historical_df, events_df, periods=15):
         final_df[col] = final_df[col].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].round()
 
-    # We now forecast more than 15 days in total (e.g., 2-3 of each weekday)
-    # so we sort by date and take the first 15 distinct days for the final output.
     return final_df.sort_values('ds').reset_index(drop=True).head(periods), prophet_model_for_insights
