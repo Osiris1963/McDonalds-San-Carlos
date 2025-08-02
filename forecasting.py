@@ -1,128 +1,178 @@
-# forecasting.py
-# Implements a Hybrid Ensemble model: Prophet for trend, LightGBM for residuals.
-# Final robust version with consistent feature structure for training and prediction.
-
+# forecasting.py (Tuned Models & Stacked Ensemble)
 import pandas as pd
-from datetime import timedelta
-import numpy as np
 from prophet import Prophet
 import lightgbm as lgb
+import xgboost as xgb
+from sklearn.linear_model import RidgeCV
+from datetime import timedelta
+import warnings
+import numpy as np
 
-from data_processing import create_hybrid_features, create_atv_features, get_weather_data
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-def train_customer_model(historical_df, events_df, periods):
-    """
-    Trains a Hybrid Ensemble model to forecast customer counts.
-    """
-    # --- Part 1: Train the Trend Specialist (Prophet) ---
-    df_prophet = historical_df[['date', 'customers']].rename(columns={'date': 'ds', 'customers': 'y'})
-    
-    trend_model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        changepoint_prior_scale=0.5
-    )
-    
-    if events_df is not None and not events_df.empty:
-        holidays = events_df[['date', 'activity_name']].rename(columns={'date': 'ds', 'activity_name': 'holiday'})
-        trend_model.holidays = holidays
-        
-    trend_model.fit(df_prophet)
-    
-    future_dates = trend_model.make_future_dataframe(periods=periods)
-    trend_forecast = trend_model.predict(future_dates)
+from data_processing import create_features
 
-    # --- Part 2: Train the Context Specialist (LightGBM on Residuals) ---
-    
-    df_residuals = pd.merge(historical_df, trend_forecast[['ds', 'yhat']], left_on='date', right_on='ds')
-    df_residuals['residuals'] = df_residuals['customers'] - df_residuals['yhat']
-    
-    start_date = historical_df['date'].min()
-    end_date = historical_df['date'].max() + timedelta(days=periods)
-    weather_df = get_weather_data(start_date, end_date)
-    df_featured_train = create_hybrid_features(df_residuals, weather_df)
-    
-    # Define the full set of features. This list will be used for both training and prediction.
-    features = [
-        'dayofweek', 'dayofyear', 'month', 'is_weekend',
-        'customers_lag_7', 'customers_rolling_mean_4_weeks_same_day',
-        'weather_temp', 'weather_precip', 'weather_wind'
+def generate_ph_holidays(start_date, end_date, events_df):
+    holidays_list = [
+        {'holiday': 'New Year\'s Day', 'ds': '2025-01-01'},
+        {'holiday': 'Maundy Thursday', 'ds': '2025-04-17'},
+        {'holiday': 'Good Friday', 'ds': '2025-04-18'},
+        {'holiday': 'Araw ng Kagitingan', 'ds': '2025-04-09'},
+        {'holiday': 'Labor Day', 'ds': '2025-05-01'},
+        {'holiday': 'Independence Day', 'ds': '2025-06-12'},
+        {'holiday': 'Ninoy Aquino Day', 'ds': '2025-08-21'},
+        {'holiday': 'National Heroes Day', 'ds': '2025-08-25'},
+        {'holiday': 'All Saints\' Day', 'ds': '2025-11-01'},
+        {'holiday': 'Bonifacio Day', 'ds': '2025-11-30'},
+        {'holiday': 'Feast of the Immaculate Conception', 'ds': '2025-12-08'},
+        {'holiday': 'Christmas Day', 'ds': '2025-12-25'},
+        {'holiday': 'Rizal Day', 'ds': '2025-12-30'},
     ]
-    target = 'residuals'
-    
-    residual_model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=500, random_state=42)
-    # Train the model using the full feature set
-    residual_model.fit(df_featured_train[features], df_featured_train[target])
-    
-    # Create features for the future dataframe
-    trend_forecast.rename(columns={'ds': 'date'}, inplace=True)
-    future_feature_df = create_hybrid_features(trend_forecast, weather_df)
-    
-    # --- ROBUSTNESS FIX: Ensure prediction dataframe has the exact same columns as training ---
-    # The `create_hybrid_features` function won't create lag features for the future
-    # because there's no 'customers' column. We must add them manually and fill with 0.
-    for col in features:
-        if col not in future_feature_df.columns:
-            future_feature_df[col] = 0
-    # --- END FIX ---
-    
-    # Predict future residuals using the full, consistent feature set
-    future_residuals = residual_model.predict(future_feature_df[features])
-    
-    # --- Part 3: Combine the Forecasts ---
-    final_forecast = trend_forecast.copy()
-    final_forecast['residual_forecast'] = future_residuals
-    final_forecast['forecast_customers'] = final_forecast['yhat'] + final_forecast['residual_forecast']
-    
-    last_hist_date = historical_df['date'].max()
-    return final_forecast[final_forecast['date'] > last_hist_date][['date', 'forecast_customers']].rename(columns={'date': 'ds'})
+    ph_holidays = pd.DataFrame(holidays_list)
+    ph_holidays['ds'] = pd.to_datetime(ph_holidays['ds'])
 
-
-def train_atv_model(historical_df, events_df, periods):
-    """Trains a Prophet model to forecast ATV. (Unchanged)"""
-    df_atv = create_atv_features(historical_df)
-    df_prophet = df_atv[['date', 'atv']].rename(columns={'date': 'ds', 'atv': 'y'})
-    last_hist_date = historical_df['date'].max()
-    future_end_date = last_hist_date + timedelta(days=periods)
-    payday_dates = []
-    current_date = historical_df['date'].min()
-    while current_date <= future_end_date:
+    payday_events = []
+    current_date = start_date
+    while current_date <= end_date:
         if current_date.day in [14, 15, 16, 29, 30, 31, 1, 2]:
-            payday_dates.append(current_date)
+            payday_events.append({'holiday': 'Payday Window', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
         current_date += timedelta(days=1)
-    paydays = pd.DataFrame({'holiday': 'payday_period', 'ds': pd.to_datetime(payday_dates), 'lower_window': 0, 'upper_window': 1})
-    holidays = paydays
+    
+    all_holidays = pd.concat([ph_holidays, pd.DataFrame(payday_events)])
+
     if events_df is not None and not events_df.empty:
         user_events = events_df[['date', 'activity_name']].copy()
         user_events.rename(columns={'date': 'ds', 'activity_name': 'holiday'}, inplace=True)
-        holidays = pd.concat([paydays, user_events])
-    model = Prophet(holidays=holidays, yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-    model.fit(df_prophet)
-    future = model.make_future_dataframe(periods=periods)
-    forecast = model.predict(future)
-    forecast_df = forecast[forecast['ds'] > last_hist_date][['ds', 'yhat']]
-    forecast_df.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
-    return forecast_df, model 
+        user_events['ds'] = pd.to_datetime(user_events['ds'])
+        all_holidays = pd.concat([all_holidays, user_events])
+
+    return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
+
+def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
+    if len(df_day_featured) < 20: 
+        return pd.DataFrame(), None
+
+    all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv', 'date']]
+    constant_cols = [col for col in all_features if df_day_featured[col].nunique() < 2]
+    final_features = [f for f in all_features if f not in constant_cols]
+    
+    df_train = df_day_featured.dropna(subset=final_features + [target])
+    
+    last_date = df_day_featured['date'].max()
+    future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7) 
+    future_dates = future_date_range[future_date_range.dayofweek == day_of_week][:periods]
+    
+    if len(future_dates) == 0:
+        return pd.DataFrame(), None
+
+    # --- Base Model Training ---
+    df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
+    prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
+    prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+    prophet_model.fit(df_prophet)
+
+    MIN_SAMPLES_FOR_TREE_MODELS = 15
+    if len(df_train) < MIN_SAMPLES_FOR_TREE_MODELS:
+        forecast_prophet = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
+        return forecast_prophet[['ds', 'yhat']], prophet_model
+        
+    X_train = df_train[final_features]
+    y_train = df_train[target]
+
+    # --- Pre-tuned Hyperparameters (Result of Offline Optuna Study) ---
+    lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.1, 'lambda_l2': 0.1, 'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt'}
+    xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'seed': 42, 'n_jobs': -1}
+
+    lgbm = lgb.LGBMRegressor(**lgbm_params)
+    lgbm.fit(X_train, y_train)
+
+    xgb_model = xgb.XGBRegressor(**xgb_params)
+    xgb_model.fit(X_train, y_train)
+    
+    # --- Stacking Ensemble ---
+    # 1. Get base model predictions on the training data itself to train the meta-learner
+    prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
+    lgbm_train_preds = lgbm.predict(X_train)
+    xgb_train_preds = xgb_model.predict(X_train)
+
+    # 2. Create the meta-feature set
+    X_meta = pd.DataFrame({
+        'prophet': prophet_train_fcst['yhat'].values,
+        'lgbm': lgbm_train_preds,
+        'xgb': xgb_train_preds
+    })
+
+    # 3. Train the meta-learner (RidgeCV is robust and fast)
+    meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
+    meta_learner.fit(X_meta, y_train)
+
+    # 4. Get base model predictions on FUTURE data
+    future_placeholder = pd.DataFrame({'date': future_dates})
+    combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
+    combined_df_with_features = create_features(combined_df_for_features, events_df)
+    
+    X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)]
+    X_future = X_future[final_features] 
+    X_future.fillna(method='ffill', inplace=True) 
+    X_future.fillna(0, inplace=True)
+
+    prophet_future_fcst = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
+    lgbm_future_preds = lgbm.predict(X_future)
+    xgb_future_preds = xgb_model.predict(X_future)
+
+    # 5. Create the future meta-feature set
+    X_meta_future = pd.DataFrame({
+        'prophet': prophet_future_fcst['yhat'].values,
+        'lgbm': lgbm_future_preds,
+        'xgb': xgb_future_preds
+    })
+
+    # 6. Make the final prediction using the meta-learner
+    final_stacked_preds = meta_learner.predict(X_meta_future)
+    
+    day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_stacked_preds})
+    
+    return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Orchestrates the new Hybrid Ensemble forecasting process."""
-    if len(historical_df) < 30:
+    df_featured = create_features(historical_df, events_df)
+    
+    all_cust_forecasts, all_atv_forecasts = [], []
+    prophet_model = None 
+    
+    for day_of_week in range(7):
+        df_day = df_featured[df_featured['date'].dt.dayofweek == day_of_week].copy()
+        
+        cust_fcst, prophet_model_cust = run_day_specific_models(df_day, 'customers', day_of_week, periods, events_df)
+        if not cust_fcst.empty:
+            all_cust_forecasts.append(cust_fcst)
+            if prophet_model_cust:
+                prophet_model = prophet_model_cust
+            
+        atv_fcst, _ = run_day_specific_models(df_day, 'atv', day_of_week, periods, events_df)
+        if not atv_fcst.empty:
+            all_atv_forecasts.append(atv_fcst)
+
+    if not all_cust_forecasts or not all_atv_forecasts:
+        return pd.DataFrame(), None 
+
+    cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
+    atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds').reset_index(drop=True)
+    
+    if cust_forecast_final.empty or atv_forecast_final.empty:
         return pd.DataFrame(), None
-    
-    cust_forecast_df = train_customer_model(historical_df, events_df, periods)
-    atv_forecast_df, prophet_model_for_ui = train_atv_model(historical_df, events_df, periods)
-    
-    if cust_forecast_df.empty or atv_forecast_df.empty:
+
+    cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
+    atv_forecast_final.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
+
+    final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
+    if final_df.empty:
         return pd.DataFrame(), None
         
-    final_df = pd.merge(cust_forecast_df, atv_forecast_df, on='ds', how='left').sort_values('ds')
-    final_df['forecast_atv'].fillna(method='ffill', inplace=True)
-    
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
-    final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round().astype(int)
-    final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
-    final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     
-    # We pass back the ATV model for visualization, as the customer model is now a hybrid
-    return final_df.head(periods), prophet_model_for_ui
+    final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
+    final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
+    final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
+
+    return final_df.head(periods), prophet_model
