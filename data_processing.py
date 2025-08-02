@@ -1,5 +1,5 @@
 # data_processing.py
-# This module prepares data by creating specialized feature sets.
+# Prepares data for the Temporal Fusion Transformer model.
 
 import pandas as pd
 import numpy as np
@@ -7,9 +7,7 @@ import requests
 from datetime import timedelta
 
 def get_weather_data(start_date, end_date):
-    """
-    Fetches historical and future weather data from the Open-Meteo API.
-    """
+    """Fetches historical and future weather data from the Open-Meteo API."""
     try:
         latitude = 10.48
         longitude = 123.42
@@ -63,22 +61,38 @@ def load_from_firestore(db_client, collection_name):
             df[col] = 0
     return df.sort_values(by='date').reset_index(drop=True)
 
-def create_customer_features(df, weather_df):
-    """Feature engineering for CUSTOMER COUNT, now with full historical weather data."""
+def create_tft_features(df, weather_df):
+    """
+    Creates the full feature set required for the TFT model.
+    """
     df_copy = df.copy()
+    
+    # Merge weather data
     if weather_df is not None and not weather_df.empty:
         df_copy = pd.merge(df_copy, weather_df, on='date', how='left')
         df_copy.bfill(inplace=True)
 
+    # --- Create TFT-specific columns ---
+    # A continuous time index is required
+    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
+    
+    # A series identifier (we use day of the week)
     df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
-    df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
-    df_copy['month'] = df_copy['date'].dt.month
+    df_copy['series'] = df_copy['dayofweek'].astype(str)
+
+    # --- Other Features ---
+    df_copy['month'] = df_copy['date'].dt.month.astype(str)
     df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
     
-    # Simple lag for reference
-    if 'customers' in df_copy.columns:
-        df_copy['customers_lag_7'] = df_copy['customers'].shift(7)
+    # Ensure all feature columns exist, even if weather failed
+    weather_cols = ['weather_temp', 'weather_precip', 'weather_wind', 'weather_code']
+    for col in weather_cols:
+        if col not in df_copy.columns:
+            df_copy[col] = 0.0
 
+    # Convert categorical features to string type for the model
+    df_copy['weather_code'] = df_copy['weather_code'].astype(str)
+    
     return df_copy.bfill()
 
 def create_atv_features(df):
