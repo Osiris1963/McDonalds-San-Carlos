@@ -1,5 +1,6 @@
 # forecasting.py
 # Implements the state-of-the-art Temporal Fusion Transformer model.
+# Corrected to handle strict data type requirements for categorical features.
 
 import pandas as pd
 from datetime import timedelta
@@ -27,11 +28,21 @@ def train_customer_model(historical_df, periods):
     # 2. Create features for the TFT model
     df_featured = create_tft_features(historical_df, weather_df)
     
+    # --- ROBUSTNESS FIX: Enforce correct data types for categorical features ---
+    categorical_cols = ["series", "month", "dayofweek", "weather_code"]
+    for col in categorical_cols:
+        if col in df_featured.columns:
+            df_featured[col] = df_featured[col].astype(str)
+    # --- END FIX ---
+
     # 3. Define the TimeSeriesDataSet
-    max_encoder_length = 30  # How many past days the model sees
+    max_encoder_length = 30
     max_prediction_length = periods
 
     training_cutoff = df_featured["time_idx"].max() - max_prediction_length
+
+    # Define the list of known categorical features for the model
+    time_varying_known_categoricals = [col for col in ["month", "dayofweek", "weather_code"] if col in df_featured.columns]
 
     training_data = TimeSeriesDataSet(
         df_featured[lambda x: x.time_idx <= training_cutoff],
@@ -41,7 +52,7 @@ def train_customer_model(historical_df, periods):
         max_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
         static_categoricals=["series"],
-        time_varying_known_categoricals=["month", "dayofweek", "weather_code"],
+        time_varying_known_categoricals=time_varying_known_categoricals,
         time_varying_known_reals=["time_idx", "weather_temp", "weather_precip", "weather_wind"],
         time_varying_unknown_categoricals=[],
         time_varying_unknown_reals=["customers"],
@@ -75,7 +86,7 @@ def train_customer_model(historical_df, periods):
         attention_head_size=1,
         dropout=0.1,
         hidden_continuous_size=8,
-        output_size=7,  # 7 quantiles by default
+        output_size=7,
         loss=SMAPE(),
         log_interval=10,
         reduce_on_plateau_patience=4,
@@ -92,9 +103,7 @@ def train_customer_model(historical_df, periods):
     # 7. Format the output
     all_preds = []
     for i in range(len(raw_predictions.index)):
-        series_id = raw_predictions.index.iloc[i]['series']
         date = raw_predictions.index.iloc[i]['date']
-        # We take the median prediction (quantile 0.5)
         prediction = raw_predictions.prediction.iloc[i][3] 
         all_preds.append({'ds': date, 'forecast_customers': prediction})
 
@@ -106,7 +115,6 @@ def train_customer_model(historical_df, periods):
 
 def train_atv_model(historical_df, events_df, periods):
     """Trains a Prophet model to forecast ATV. (Unchanged)"""
-    # ... (code from previous version is correct and remains here) ...
     df_atv = create_atv_features(historical_df)
     df_prophet = df_atv[['date', 'atv']].rename(columns={'date': 'ds', 'atv': 'y'})
     last_hist_date = historical_df['date'].max()
@@ -133,7 +141,7 @@ def train_atv_model(historical_df, events_df, periods):
 
 def generate_forecast(historical_df, events_df, periods=15):
     """Orchestrates the new TFT + Prophet forecasting process."""
-    if len(historical_df) < 90: # TFT needs more data
+    if len(historical_df) < 90:
         print("TFT model requires at least 90 days of data.")
         return pd.DataFrame(), None
     
