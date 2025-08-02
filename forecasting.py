@@ -1,4 +1,4 @@
-# forecasting.py (Re-Architected for Base Sales Forecasting)
+# forecasting.py (Re-Architected with Dual-Pipeline Logic)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -40,11 +40,11 @@ def generate_ph_holidays(start_date, end_date, events_df):
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
 
+# --- This complex model is now ONLY for trend-based variables like 'customers' ---
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
     if len(df_day_featured) < 20: 
         return pd.DataFrame(), None
 
-    # --- RE-ARCHITECTED: Explicitly define columns to exclude from features ---
     cols_to_exclude = ['sales', 'add_on_sales', 'customers', 'atv', 'date', 'base_sales']
     all_features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in cols_to_exclude]
     
@@ -115,56 +115,80 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     })
 
     final_stacked_preds = meta_learner.predict(X_meta_future)
-    
     day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_stacked_preds})
-    
     return day_forecast_df, prophet_model
 
+# --- NEW: Dedicated model for stable variables like ATV ---
+def generate_stable_atv_forecast(df_featured, periods):
+    """
+    Forecasts ATV based on the historical average for each day of the week.
+    This model is simple, robust, and respects the "stable" nature of ATV.
+    """
+    if 'atv' not in df_featured.columns or df_featured.empty:
+        return pd.DataFrame()
+
+    # Calculate the mean ATV for each day of the week from historical data
+    atv_by_day = df_featured.groupby(df_featured['date'].dt.dayofweek)['atv'].mean()
+
+    # Create a future DataFrame
+    last_date = df_featured['date'].max()
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
+    
+    future_df = pd.DataFrame({'ds': future_dates})
+    future_df['dayofweek'] = future_df['ds'].dt.dayofweek
+    
+    # Map the historical average to the future dates
+    future_df['forecast_atv'] = future_df['dayofweek'].map(atv_by_day)
+    
+    # Forward-fill for any day that might not have been in the history (unlikely but safe)
+    future_df['forecast_atv'].fillna(method='ffill', inplace=True)
+    future_df['forecast_atv'].fillna(method='bfill', inplace=True)
+
+    return future_df[['ds', 'forecast_atv']]
+
+
 def generate_forecast(historical_df, events_df, periods=15):
-    # This now generates features for 'base_sales'
+    """
+    Main orchestration function with a DUAL-PIPELINE approach.
+    - Uses a complex, trend-based model for Customers.
+    - Uses a simple, stable model for ATV.
+    """
     df_featured = create_features(historical_df, events_df)
     
-    all_cust_forecasts, all_atv_forecasts = [], []
-    prophet_model = None 
+    # --- PIPELINE 1: Customer Forecasting (Complex Trend Model) ---
+    all_cust_forecasts = []
+    prophet_model_for_insights = None 
     
     for day_of_week in range(7):
         df_day = df_featured[df_featured['date'].dt.dayofweek == day_of_week].copy()
-        
         cust_fcst, prophet_model_cust = run_day_specific_models(df_day, 'customers', day_of_week, periods, events_df)
         if not cust_fcst.empty:
             all_cust_forecasts.append(cust_fcst)
             if prophet_model_cust:
-                prophet_model = prophet_model_cust
-            
-        atv_fcst, _ = run_day_specific_models(df_day, 'atv', day_of_week, periods, events_df)
-        if not atv_fcst.empty:
-            all_atv_forecasts.append(atv_fcst)
-
-    if not all_cust_forecasts or not all_atv_forecasts:
-        return pd.DataFrame(), None 
-
-    cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
-    atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds').reset_index(drop=True)
+                prophet_model_for_insights = prophet_model_cust
     
+    if not all_cust_forecasts:
+        return pd.DataFrame(), None 
+    
+    cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
+    cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
+
+    # --- PIPELINE 2: ATV Forecasting (Simple Stability Model) ---
+    atv_forecast_final = generate_stable_atv_forecast(df_featured, periods=periods)
+
     if cust_forecast_final.empty or atv_forecast_final.empty:
         return pd.DataFrame(), None
 
-    cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
-    atv_forecast_final.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
-
+    # --- Combine the forecasts from the two separate pipelines ---
     final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
     if final_df.empty:
         return pd.DataFrame(), None
-    
-    if 'atv' in df_featured.columns:
-        historical_atv_cap = df_featured['atv'][df_featured['atv'] > 0].quantile(0.98)
-        final_df['forecast_atv'] = final_df['forecast_atv'].clip(upper=historical_atv_cap)
         
-    # --- RE-ARCHITECTED: The final output is now forecasted BASE sales ---
     final_df['forecast_base_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
     final_df['forecast_base_sales'] = final_df['forecast_base_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
 
-    return final_df.head(periods), prophet_model
+    # Note: prophet_model is now only for customer insights
+    return final_df.head(periods), prophet_model_for_insights
