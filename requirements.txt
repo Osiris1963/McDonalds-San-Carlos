@@ -4,5 +4,7 @@ scikit-learn==1.5.0
 firebase-admin==6.5.0
 requests==2.31.0
 prophet==1.1.5
-tensorflow==2.16.1
+pytorch-forecasting==1.0.0
+pytorch-lightning==2.2.5
+torch==2.2.1
 plotly==5.22.0
