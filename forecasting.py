@@ -2,7 +2,7 @@
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
-import xgboost as xgb
+import xgboost as xgb  # Audited: XGBoost import is present.
 from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
