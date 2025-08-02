@@ -1,4 +1,4 @@
-# forecasting.py (Corrected to restore missing function)
+# forecasting.py (Final Version with Trend Flexibility)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -12,9 +12,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from data_processing import create_features
 
-# --- FUNCTION RESTORED: This function was accidentally removed and is now restored. ---
 def generate_ph_holidays(start_date, end_date, events_df):
-    """Generates a DataFrame of PH holidays for Prophet, including user-provided future activities."""
     holidays_list = [
         {'holiday': 'New Year\'s Day', 'ds': '2025-01-01'},
         {'holiday': 'Maundy Thursday', 'ds': '2025-04-17'},
@@ -49,15 +47,21 @@ def generate_ph_holidays(start_date, end_date, events_df):
         all_holidays = pd.concat([all_holidays, user_events])
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
-# --- END OF RESTORED FUNCTION ---
 
 def run_primary_model(df_train, X_train, y_train, future_dates, final_features, events_df):
     """Trains the primary stacked ensemble and returns models and future predictions."""
-    # --- 1. Train Base Models ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'})
-    df_prophet['y'] = y_train.values # Ensure y_train is an array
+    df_prophet['y'] = y_train.values
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
-    prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+    
+    # --- NEW: Increased changepoint_prior_scale to make the trend more flexible ---
+    prophet_model = Prophet(
+        holidays=prophet_holidays,
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        changepoint_prior_scale=0.25 # Default is 0.05, this is much more responsive
+    )
     prophet_model.fit(df_prophet)
 
     lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'verbose': -1, 'n_jobs': -1, 'seed': 42}
@@ -68,7 +72,6 @@ def run_primary_model(df_train, X_train, y_train, future_dates, final_features, 
     xgb_model = xgb.XGBRegressor(**xgb_params)
     xgb_model.fit(X_train, y_train)
 
-    # --- 2. Train Meta-Learner ---
     prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
     lgbm_train_preds = lgbm.predict(X_train)
     xgb_train_preds = xgb_model.predict(X_train)
@@ -76,7 +79,6 @@ def run_primary_model(df_train, X_train, y_train, future_dates, final_features, 
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
     meta_learner.fit(X_meta, y_train)
 
-    # --- 3. Generate Primary Forecast for the Future ---
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_train, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
@@ -95,7 +97,6 @@ def run_primary_model(df_train, X_train, y_train, future_dates, final_features, 
 
 def run_residual_model(df_train, y_train, X_train, models, final_features, future_dates, events_df):
     """Trains a model to predict the errors of the primary model."""
-    # --- 1. Calculate Historical Errors (Residuals) ---
     prophet_train_fcst = models['prophet'].predict(df_train[['date']].rename(columns={'date':'ds'}))
     lgbm_train_preds = models['lgbm'].predict(X_train)
     xgb_train_preds = models['xgb'].predict(X_train)
@@ -104,12 +105,10 @@ def run_residual_model(df_train, y_train, X_train, models, final_features, futur
     
     residuals = y_train - primary_train_preds
 
-    # --- 2. Train a Model on the Errors ---
     residual_lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 100, 'learning_rate': 0.05, 'num_leaves': 20, 'verbose': -1, 'n_jobs': -1, 'seed': 123}
     residual_model = lgb.LGBMRegressor(**residual_lgbm_params)
     residual_model.fit(X_train, residuals)
 
-    # --- 3. Predict the Future Errors ---
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_train, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
