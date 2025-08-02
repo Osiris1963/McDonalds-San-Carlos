@@ -1,4 +1,4 @@
-# forecasting.py (Definitive Version with Unified Date Logic)
+# forecasting.py (Definitive Version with Corrected Date Frequency Logic)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -33,7 +33,6 @@ def generate_ph_holidays(start_date, end_date, events_df):
     ph_holidays['ds'] = pd.to_datetime(ph_holidays['ds'])
 
     payday_events = []
-    # Use a safe start_date if it's NaT
     if pd.notna(start_date):
         current_date = start_date
         while current_date <= end_date:
@@ -58,24 +57,17 @@ def build_future_dataframe(future_dates, historical_df, final_features, events_d
         return pd.DataFrame()
 
     future_df = pd.DataFrame({'date': future_dates})
-    
-    # Create date-based and event features using the main feature creation function
     future_df = create_features(future_df, events_df)
     
-    # Correctly source lag features from the complete historical dataframe
     historical_indexed = historical_df.set_index('date')
     
     for col in final_features:
         if 'lag' in col:
             target_col, _, lag_days_str = col.partition('_lag_')
             lag_days = int(lag_days_str)
-            
-            # Map the value from N days ago from the full historical set
             source_dates = future_df['date'] - timedelta(days=lag_days)
-            # Use reindex for efficient mapping and handle missing dates gracefully
             future_df[col] = historical_indexed.reindex(source_dates)[target_col].values
 
-    # Ensure all columns exist and fill any missing values
     for col in final_features:
         if col not in future_df.columns:
             future_df[col] = 0
@@ -117,7 +109,6 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
     meta_learner.fit(X_meta, y_train)
 
-    # Build the future dataframe with the correct, unified list of future dates
     X_future = build_future_dataframe(future_dates, historical_df_full, final_features, events_df)
 
     if X_future.empty:
@@ -127,7 +118,6 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     lgbm_future_preds = lgbm.predict(X_future)
     xgb_future_preds = xgb_model.predict(X_future)
     
-    # This is the line that was causing the error due to mismatched lengths
     X_meta_future = pd.DataFrame({'prophet': prophet_future_fcst['yhat'].values, 'lgbm': lgbm_future_preds, 'xgb': xgb_future_preds})
     
     primary_forecast = meta_learner.predict(X_meta_future)
@@ -147,13 +137,16 @@ def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_fe
     return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Main forecasting function with corrected feature logic."""
+    """Main forecasting function with corrected date frequency logic."""
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
     prophet_model_for_insights = None 
     
     last_historical_date = df_featured['date'].max()
+
+    # --- DEFINITIVE FIX: Use a day-specific frequency string for date generation ---
+    day_mapping = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
 
     for day_of_week in range(7):
         df_day = df_featured[df_featured['date'].dt.dayofweek == day_of_week].copy()
@@ -163,15 +156,14 @@ def generate_forecast(historical_df, events_df, periods=15):
         constant_cols = [col for col in all_features if df_day[col].nunique() < 2]
         final_features = [f for f in all_features if f not in constant_cols]
         
-        # --- CORRECTED DATE LOGIC: Create a single, unified list of future dates ---
-        # Find the first occurrence of the target day_of_week after the last historical date
         first_future_day = last_historical_date + timedelta(days=1)
         while first_future_day.weekday() != day_of_week:
             first_future_day += timedelta(days=1)
         
-        # Generate the next N occurrences of that weekday
-        future_dates_for_day = pd.date_range(start=first_future_day, periods=periods, freq='W')
-        # --- END OF CORRECTION ---
+        # Use the correct, day-specific frequency string (e.g., 'W-MON' for Monday)
+        freq_str = f'W-{day_mapping[day_of_week]}'
+        future_dates_for_day = pd.date_range(start=first_future_day, periods=periods, freq=freq_str)
+        # --- END OF FIX ---
 
         if future_dates_for_day.empty: continue
 
@@ -221,4 +213,6 @@ def generate_forecast(historical_df, events_df, periods=15):
         final_df[col] = final_df[col].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].round()
 
+    # We now forecast more than 15 days in total (e.g., 2-3 of each weekday)
+    # so we sort by date and take the first 15 distinct days for the final output.
     return final_df.sort_values('ds').reset_index(drop=True).head(periods), prophet_model_for_insights
