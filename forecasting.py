@@ -1,4 +1,4 @@
-# forecasting.py (Definitive Version with Feature Isolation)
+# forecasting.py (Definitive Version with Feature Safeguard)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -41,7 +41,6 @@ def generate_ph_holidays(start_date, end_date, events_df):
 
 def generate_forecast(historical_df, events_df, periods=15):
     """Main forecasting function with strict feature isolation."""
-    # --- Create two distinct, clean feature sets ---
     df_featured_cust = create_features_for_customers(historical_df, events_df)
     df_featured_atv = create_features_for_atv(historical_df, events_df)
     
@@ -55,7 +54,10 @@ def generate_forecast(historical_df, events_df, periods=15):
         df_day_cust = df_featured_cust[df_featured_cust['date'].dt.dayofweek == day_of_week].copy()
         if len(df_day_cust) < 30: continue
         
-        cust_features = [col for col in df_day_cust.columns if col not in ['date', 'customers', 'total_sales', 'base_sales', 'add_on_sales', 'atv']]
+        # --- SAFEGUARD: Explicitly select only numeric features for training ---
+        numeric_types = ['int64', 'int32', 'float64', 'uint8', 'int8']
+        cust_features = [col for col in df_day_cust.columns if df_day_cust[col].dtype in numeric_types and col not in ['total_sales', 'base_sales', 'customers', 'atv', 'add_on_sales']]
+        
         df_train_cust = df_day_cust.dropna(subset=cust_features + ['customers'])
         if len(df_train_cust) < 20: continue
         X_train_cust, y_train_cust = df_train_cust[cust_features], df_train_cust['customers']
@@ -76,7 +78,7 @@ def generate_forecast(historical_df, events_df, periods=15):
         df_day_atv = df_featured_atv[df_featured_atv['date'].dt.dayofweek == day_of_week].copy()
         if len(df_day_atv) < 30: continue
 
-        atv_features = [col for col in df_day_atv.columns if col not in ['date', 'customers', 'total_sales', 'base_sales', 'add_on_sales', 'atv']]
+        atv_features = [col for col in df_day_atv.columns if df_day_atv[col].dtype in numeric_types and col not in ['total_sales', 'base_sales', 'customers', 'atv', 'add_on_sales']]
         df_train_atv = df_day_atv.dropna(subset=atv_features + ['atv'])
         if len(df_train_atv) < 20: continue
         X_train_atv, y_train_atv = df_train_atv[atv_features], df_train_atv['atv']
@@ -86,7 +88,6 @@ def generate_forecast(historical_df, events_df, periods=15):
 
     if not all_cust_forecasts or not all_atv_forecasts: return pd.DataFrame(), None 
     
-    # --- Combine and Finalize ---
     cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds')
     atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds')
     if cust_forecast_final.empty or atv_forecast_final.empty: return pd.DataFrame(), None
@@ -110,16 +111,14 @@ def generate_forecast(historical_df, events_df, periods=15):
 
 def run_model_pipeline(df_train, X_train, y_train, future_dates, final_features, historical_df_full, events_df, is_customer_model):
     """Generic model pipeline for either customer or ATV, with strategy determined by flag."""
-    # --- Define Strategy ---
-    use_time_weights = is_customer_model  # Aggressive trend-following for customers
-    prophet_changepoint_scale = 0.15 if is_customer_model else 0.05 # Agile for customers, stable for ATV
+    use_time_weights = is_customer_model
+    prophet_changepoint_scale = 0.15 if is_customer_model else 0.05
 
     sample_weights = None
     if use_time_weights:
         time_since_last_obs = (df_train['date'].max() - df_train['date']).dt.days
         sample_weights = np.power(0.995, time_since_last_obs)
 
-    # --- Run Models ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'}); df_prophet['y'] = y_train.values
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False, changepoint_prior_scale=prophet_changepoint_scale)
@@ -131,20 +130,17 @@ def run_model_pipeline(df_train, X_train, y_train, future_dates, final_features,
     xgb = xgb.XGBRegressor(objective='reg:squarederror', n_estimators=200, learning_rate=0.05, max_depth=5, seed=42)
     xgb.fit(X_train, y_train, sample_weight=sample_weights)
 
-    # --- Meta-learner (Stacking) ---
     prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
     X_meta = pd.DataFrame({'prophet': prophet_train_fcst['yhat'].values, 'lgbm': lgbm.predict(X_train), 'xgb': xgb.predict(X_train)})
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
     meta_learner.fit(X_meta, y_train, sample_weight=sample_weights)
 
-    # --- Future Prediction ---
     X_future = build_future_dataframe_generic(future_dates, historical_df_full, final_features, events_df, is_customer_model)
     if X_future.empty: return pd.DataFrame(), None
 
     X_meta_future = pd.DataFrame({'prophet': prophet_model.predict(pd.DataFrame({'ds': future_dates}))['yhat'].values, 'lgbm': lgbm.predict(X_future), 'xgb': xgb.predict(X_future)})
     primary_forecast = meta_learner.predict(X_meta_future)
 
-    # --- Residual Model ---
     residuals = y_train - meta_learner.predict(X_meta)
     residual_model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=100, learning_rate=0.05, verbose=-1, seed=123)
     residual_model.fit(X_train, residuals, sample_weight=sample_weights)
@@ -156,15 +152,19 @@ def build_future_dataframe_generic(future_dates, historical_df, final_features, 
     """Generic future dataframe builder."""
     if future_dates.empty: return pd.DataFrame()
     
+    # Create a base dataframe with the future dates
+    future_df_base = pd.DataFrame({'date': future_dates})
+
     if is_customer_model:
-        future_df = create_features_for_customers(pd.DataFrame({'date': future_dates}), events_df)
+        # For customers, we only need the pure, non-financial features
+        future_df = create_features_for_customers(future_df_base, events_df)
     else:
-        # For ATV, we need customer lags, which requires the full historical df
-        placeholder_df = pd.concat([historical_df, pd.DataFrame({'date': future_dates})], ignore_index=True)
+        # For ATV, we need customer lags, which requires the full historical df for context
+        # We concat to allow lag calculation across the boundary of history and future
+        placeholder_df = pd.concat([historical_df, future_df_base], ignore_index=True)
         all_features_df = create_features_for_atv(placeholder_df, events_df)
         future_df = all_features_df[all_features_df['date'].isin(future_dates)].copy()
 
-    # Ensure all columns exist and fill NaNs
     for col in final_features:
         if col not in future_df.columns: future_df[col] = 0
             
