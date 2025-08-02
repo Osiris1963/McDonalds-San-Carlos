@@ -1,6 +1,6 @@
 # forecasting.py
 # Implements the state-of-the-art Temporal Fusion Transformer model.
-# Corrected to build a robust, continuous time index to prevent AssertionErrors.
+# Final robust version with aggressive data sanitization to prevent TypeErrors.
 
 import pandas as pd
 from datetime import timedelta
@@ -28,37 +28,27 @@ def train_customer_model(historical_df, periods):
     # 2. Create features for the TFT model
     df_featured = create_tft_features(historical_df, weather_df)
     
-    # Enforce correct data types for categorical features
-    categorical_cols = ["series", "month", "dayofweek", "weather_code"]
-    for col in categorical_cols:
-        if col in df_featured.columns:
-            df_featured[col] = df_featured[col].astype(str)
-
-    # --- ROBUSTNESS FIX: Create a complete and continuous time index ---
     # Create a master calendar dataframe from the first date to the last forecast date
     full_date_range = pd.date_range(start=df_featured['date'].min(), end=end_date, freq='D')
     scaffold_df = pd.DataFrame({'date': full_date_range})
     
-    # Re-create time_idx and series identifiers on the complete scaffold
-    scaffold_df['time_idx'] = (scaffold_df['date'] - scaffold_df['date'].min()).dt.days
-    scaffold_df['dayofweek'] = scaffold_df['date'].dt.dayofweek.astype(str)
-    scaffold_df['series'] = scaffold_df['dayofweek']
-    
     # Merge the actual data onto the scaffold. This creates a perfect sequence.
-    # We select only the necessary columns from df_featured to avoid duplicates.
-    cols_to_merge = [
-        'date', 'customers', 'month', 'is_weekend',
-        'weather_temp', 'weather_precip', 'weather_wind', 'weather_code'
-    ]
-    # Ensure all columns exist before merging
-    for col in cols_to_merge:
-        if col not in df_featured.columns:
-            df_featured[col] = np.nan
-
-    merged_df = pd.merge(scaffold_df, df_featured[cols_to_merge], on='date', how='left')
+    merged_df = pd.merge(scaffold_df, df_featured, on='date', how='left')
+    
+    # --- FINAL ROBUSTNESS FIX: Sanitize all categorical columns ---
+    categorical_cols = ["series", "month", "dayofweek", "weather_code"]
+    for col in categorical_cols:
+        if col in merged_df.columns:
+            # Fill any NaN values created by the merge with a placeholder string
+            merged_df[col].fillna("missing", inplace=True)
+            # Enforce string type one last time to prevent any mixed types
+            merged_df[col] = merged_df[col].astype(str)
     # --- END FIX ---
 
-    # 3. Define the TimeSeriesDataSet using the new, complete dataframe
+    # Re-create time_idx on the final merged dataframe to ensure it's perfectly sequential
+    merged_df['time_idx'] = (merged_df['date'] - merged_df['date'].min()).dt.days
+
+    # 3. Define the TimeSeriesDataSet using the new, complete, and sanitized dataframe
     max_encoder_length = 30
     max_prediction_length = periods
 
@@ -77,7 +67,7 @@ def train_customer_model(historical_df, periods):
         time_varying_unknown_categoricals=[],
         time_varying_unknown_reals=["customers"],
         target_normalizer=GroupNormalizer(groups=["series"], transformation="softplus"),
-        allow_missing_timesteps=True # Still good practice to keep this
+        allow_missing_timesteps=True
     )
 
     # 4. Create validation set and dataloaders
