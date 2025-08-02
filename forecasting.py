@@ -1,4 +1,4 @@
-# forecasting.py (Final Version with Residual Stacking)
+# forecasting.py (Corrected to restore missing function)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -12,11 +12,50 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from data_processing import create_features
 
+# --- FUNCTION RESTORED: This function was accidentally removed and is now restored. ---
+def generate_ph_holidays(start_date, end_date, events_df):
+    """Generates a DataFrame of PH holidays for Prophet, including user-provided future activities."""
+    holidays_list = [
+        {'holiday': 'New Year\'s Day', 'ds': '2025-01-01'},
+        {'holiday': 'Maundy Thursday', 'ds': '2025-04-17'},
+        {'holiday': 'Good Friday', 'ds': '2025-04-18'},
+        {'holiday': 'Araw ng Kagitingan', 'ds': '2025-04-09'},
+        {'holiday': 'Labor Day', 'ds': '2025-05-01'},
+        {'holiday': 'Independence Day', 'ds': '2025-06-12'},
+        {'holiday': 'Ninoy Aquino Day', 'ds': '2025-08-21'},
+        {'holiday': 'National Heroes Day', 'ds': '2025-08-25'},
+        {'holiday': 'All Saints\' Day', 'ds': '2025-11-01'},
+        {'holiday': 'Bonifacio Day', 'ds': '2025-11-30'},
+        {'holiday': 'Feast of the Immaculate Conception', 'ds': '2025-12-08'},
+        {'holiday': 'Christmas Day', 'ds': '2025-12-25'},
+        {'holiday': 'Rizal Day', 'ds': '2025-12-30'},
+    ]
+    ph_holidays = pd.DataFrame(holidays_list)
+    ph_holidays['ds'] = pd.to_datetime(ph_holidays['ds'])
+
+    payday_events = []
+    current_date = start_date
+    while current_date <= end_date:
+        if current_date.day in [14, 15, 16, 29, 30, 31, 1, 2]:
+            payday_events.append({'holiday': 'Payday Window', 'ds': current_date, 'lower_window': 0, 'upper_window': 1})
+        current_date += timedelta(days=1)
+    
+    all_holidays = pd.concat([ph_holidays, pd.DataFrame(payday_events)])
+
+    if events_df is not None and not events_df.empty:
+        user_events = events_df[['date', 'activity_name']].copy()
+        user_events.rename(columns={'date': 'ds', 'activity_name': 'holiday'}, inplace=True)
+        user_events['ds'] = pd.to_datetime(user_events['ds'])
+        all_holidays = pd.concat([all_holidays, user_events])
+
+    return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
+# --- END OF RESTORED FUNCTION ---
+
 def run_primary_model(df_train, X_train, y_train, future_dates, final_features, events_df):
     """Trains the primary stacked ensemble and returns models and future predictions."""
     # --- 1. Train Base Models ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'})
-    df_prophet['y'] = y_train
+    df_prophet['y'] = y_train.values # Ensure y_train is an array
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
     prophet_model.fit(df_prophet)
@@ -66,7 +105,6 @@ def run_residual_model(df_train, y_train, X_train, models, final_features, futur
     residuals = y_train - primary_train_preds
 
     # --- 2. Train a Model on the Errors ---
-    # Use a simpler, faster model for residuals
     residual_lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 100, 'learning_rate': 0.05, 'num_leaves': 20, 'verbose': -1, 'n_jobs': -1, 'seed': 123}
     residual_model = lgb.LGBMRegressor(**residual_lgbm_params)
     residual_model.fit(X_train, residuals)
@@ -90,7 +128,7 @@ def generate_forecast(historical_df, events_df, periods=15):
     
     for day_of_week in range(7):
         df_day = df_featured[df_featured['date'].dt.dayofweek == day_of_week].copy()
-        if len(df_day) < 30: continue # Need more data for stable residual modeling
+        if len(df_day) < 30: continue
 
         all_features = [col for col in df_day.columns if df_day[col].dtype in ['int64', 'float64', 'int32'] and col not in ['total_sales', 'base_sales', 'customers', 'atv', 'date', 'add_on_sales']]
         constant_cols = [col for col in all_features if df_day[col].nunique() < 2]
@@ -141,7 +179,6 @@ def generate_forecast(historical_df, events_df, periods=15):
         
     final_df['forecast_base_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
-    # --- Add back historical average of add-on sales ---
     historical_df['dayofweek'] = historical_df['date'].dt.dayofweek
     avg_addons_by_day = historical_df.groupby('dayofweek')['add_on_sales'].mean().reset_index()
     final_df['dayofweek'] = final_df['ds'].dt.dayofweek
@@ -149,7 +186,6 @@ def generate_forecast(historical_df, events_df, periods=15):
     
     final_df['forecast_sales'] = final_df['forecast_base_sales'] + final_df['add_on_sales']
     
-    # Clip to logical values
     for col in ['forecast_sales', 'forecast_customers', 'forecast_atv']:
         final_df[col] = final_df[col].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].round()
