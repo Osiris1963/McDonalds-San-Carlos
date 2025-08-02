@@ -1,9 +1,12 @@
-# data_processing.py (Final Version with Enhanced Lags)
+# data_processing.py (Final Version with Robust, Schema-Aware Loading)
 import pandas as pd
 import numpy as np
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data, creating a clean 'base_sales' column for modeling."""
+    """
+    Loads and preprocesses data from a Firestore collection.
+    This version is robust and handles different collection schemas gracefully.
+    """
     if db_client is None:
         return pd.DataFrame()
     
@@ -19,31 +22,38 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
+    # All our collections should have a date, so this check is essential.
     if 'date' not in df.columns:
-        return df
+        return df # Return as-is if no date column
 
+    # --- Generic Date Handling ---
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
-    
     df.sort_values(by='date', inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
     if pd.api.types.is_datetime64_any_dtype(df['date']):
         df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
-    
-    df['sales'] = pd.to_numeric(df.get('sales'), errors='coerce').fillna(0)
-    df['add_on_sales'] = pd.to_numeric(df.get('add_on_sales'), errors='coerce').fillna(0)
-    
-    df.rename(columns={'sales': 'total_sales'}, inplace=True)
-    df['base_sales'] = df['total_sales'] - df['add_on_sales']
-    
+
+    # --- ROBUST FIX: Schema-Aware Column Processing ---
+    # This block now checks for the existence of columns before processing them.
+    # This allows the function to safely handle both 'historical_data' and 'future_activities'.
+
+    if 'sales' in df.columns:
+        # This logic will only run for the 'historical_data' collection
+        df['add_on_sales'] = pd.to_numeric(df.get('add_on_sales'), errors='coerce').fillna(0)
+        df['sales'] = pd.to_numeric(df.get('sales'), errors='coerce').fillna(0)
+        
+        df.rename(columns={'sales': 'total_sales'}, inplace=True)
+        df['base_sales'] = df['total_sales'] - df['add_on_sales']
+
     if 'customers' in df.columns:
+        # This logic will also only run for 'historical_data'
         df['customers'] = pd.to_numeric(df['customers'], errors='coerce').fillna(0)
 
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df, events_df):
-    """Creates features including an enhanced set of lags."""
+    """Creates features including a special flag for days with significant add-on sales."""
     df_copy = df.copy()
 
     feature_cols_to_drop = [
@@ -97,12 +107,11 @@ def create_features(df, events_df):
     else:
         df_copy['is_not_normal_day'] = 0
 
-    # --- NEW: Added lag_21 for better short-term trend detection ---
     for target in ['base_sales', 'customers', 'atv']:
         if target in df_copy.columns:
             df_copy[f'{target}_lag_7'] = df_copy[target].shift(7)
             df_copy[f'{target}_lag_14'] = df_copy[target].shift(14)
-            df_copy[f'{target}_lag_21'] = df_copy[target].shift(21) # New feature
+            df_copy[f'{target}_lag_21'] = df_copy[target].shift(21)
 
     for col in df_copy.columns:
         if df_copy[col].dtype == 'bool' or df_copy[col].dtype == 'uint8':
