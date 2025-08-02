@@ -1,10 +1,9 @@
-# data_processing.py (Enhanced with Interaction Features)
+# data_processing.py (Final Version with Base Sales Logic)
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
+    """Loads and preprocesses data, creating a clean 'base_sales' column for modeling."""
     if db_client is None:
         return pd.DataFrame()
     
@@ -32,7 +31,19 @@ def load_from_firestore(db_client, collection_name):
     if pd.api.types.is_datetime64_any_dtype(df['date']):
         df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
     
-    numeric_cols = ['sales', 'customers', 'add_on_sales']
+    # --- NEW: Base Sales Calculation ---
+    # Convert to numeric, filling missing values with 0
+    df['sales'] = pd.to_numeric(df.get('sales'), errors='coerce').fillna(0)
+    df['add_on_sales'] = pd.to_numeric(df.get('add_on_sales'), errors='coerce').fillna(0)
+    
+    # Rename original 'sales' to 'total_sales' for clarity
+    df.rename(columns={'sales': 'total_sales'}, inplace=True)
+    
+    # Create 'base_sales' which is the target for our trend model
+    df['base_sales'] = df['total_sales'] - df['add_on_sales']
+    # --- END NEW ---
+    
+    numeric_cols = ['customers']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
@@ -40,7 +51,7 @@ def load_from_firestore(db_client, collection_name):
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df, events_df):
-    """Creates time-based, event-based, and advanced interaction features."""
+    """Creates features. NOTE: The target variable for sales modeling is 'base_sales'."""
     df_copy = df.copy()
 
     feature_cols_to_drop = [
@@ -53,9 +64,9 @@ def create_features(df, events_df):
             feature_cols_to_drop.append(col)
     df_copy.drop(columns=[col for col in feature_cols_to_drop if col in df_copy.columns], inplace=True, errors='ignore')
 
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    # --- MODIFIED: ATV is now calculated from base_sales ---
     customers_safe = df_copy['customers'].replace(0, np.nan)
-    df_copy['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
+    df_copy['atv'] = (df_copy['base_sales'] / customers_safe).fillna(method='ffill').fillna(0)
 
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
@@ -71,10 +82,8 @@ def create_features(df, events_df):
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
     
-    # --- NEW: Interaction Features ---
-    df_copy['is_weekend'] = (df_copy['date'].dt.dayofweek >= 5).astype(int) # Saturday=5, Sunday=6
+    df_copy['is_weekend'] = (df_copy['date'].dt.dayofweek >= 5).astype(int)
     df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
-    # --- END NEW ---
 
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
@@ -90,11 +99,11 @@ def create_features(df, events_df):
     else:
         df_copy['is_not_normal_day'] = 0
 
-    shift_val = 1 
-    for target in ['sales', 'customers', 'atv']:
+    # Lag features now use 'base_sales'
+    for target in ['base_sales', 'customers', 'atv']:
         if target in df_copy.columns:
-            df_copy[f'{target}_lag_7'] = df_copy[target].shift(shift_val + 6)
-            df_copy[f'{target}_lag_14'] = df_copy[target].shift(shift_val + 13)
+            df_copy[f'{target}_lag_7'] = df_copy[target].shift(7)
+            df_copy[f'{target}_lag_14'] = df_copy[target].shift(14)
 
     for col in df_copy.columns:
         if df_copy[col].dtype == 'bool' or df_copy[col].dtype == 'uint8':
