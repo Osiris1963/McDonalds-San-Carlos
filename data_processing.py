@@ -37,14 +37,19 @@ def create_features_for_customers(df, events_df):
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
     
-    # --- DEFINITIVE FIX: Cast weekofyear to a standard int after filling potential NaNs ---
     week_series = df_copy['date'].dt.isocalendar().week
     df_copy['weekofyear'] = week_series.fillna(0).astype(int)
-    # --- END OF FIX ---
 
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['dayofweek_num'] = df_copy['date'].dt.dayofweek
     df_copy['is_weekend'] = (df_copy['dayofweek_num'] >= 5).astype(int)
+    
+    # --- RESTORED: One-hot encoding for day of week ---
+    df_copy['dayofweek'] = df_copy['date'].dt.day_name()
+    day_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='day', drop_first=False)
+    df_copy = pd.concat([df_copy, day_dummies], axis=1)
+    df_copy.drop(columns=['dayofweek'], inplace=True) # Drop original text column
+    # --- END RESTORED ---
     
     df_copy['is_payday_period'] = df_copy['date'].apply(lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0).astype(int)
     
