@@ -1,6 +1,6 @@
 # forecasting.py
 # Implements a Hybrid Ensemble model: Prophet for trend, LightGBM for residuals.
-# Corrected to handle column name mismatches between model stages.
+# Final robust version with decoupled feature sets for training and prediction.
 
 import pandas as pd
 from datetime import timedelta
@@ -41,25 +41,36 @@ def train_customer_model(historical_df, events_df, periods):
     start_date = historical_df['date'].min()
     end_date = historical_df['date'].max() + timedelta(days=periods)
     weather_df = get_weather_data(start_date, end_date)
-    df_featured = create_hybrid_features(df_residuals, weather_df)
+    df_featured_train = create_hybrid_features(df_residuals, weather_df)
     
-    features = [
+    # --- ROBUSTNESS FIX: Create separate feature lists for training and prediction ---
+    
+    # Features for TRAINING (can use historical customer data)
+    features_for_training = [
         'dayofweek', 'dayofyear', 'month', 'is_weekend',
         'customers_lag_7', 'customers_rolling_mean_4_weeks_same_day',
         'weather_temp', 'weather_precip', 'weather_wind'
     ]
+    
+    # Features for PREDICTION (can ONLY use data we know about the future)
+    features_for_prediction = [
+        'dayofweek', 'dayofyear', 'month', 'is_weekend',
+        'weather_temp', 'weather_precip', 'weather_wind'
+    ]
+    # --- END FIX ---
+
     target = 'residuals'
     
     residual_model = lgb.LGBMRegressor(objective='regression_l1', n_estimators=500, random_state=42)
-    residual_model.fit(df_featured[features], df_featured[target])
+    # Train the model using the richer historical feature set
+    residual_model.fit(df_featured_train[features_for_training], df_featured_train[target])
     
-    # --- ROBUSTNESS FIX: Standardize column name before creating features ---
-    # Rename Prophet's 'ds' column to 'date' to match what create_hybrid_features expects.
+    # Create features for the future dataframe
     trend_forecast.rename(columns={'ds': 'date'}, inplace=True)
-    # --- END FIX ---
-    
     future_feature_df = create_hybrid_features(trend_forecast, weather_df)
-    future_residuals = residual_model.predict(future_feature_df[features])
+    
+    # Predict future residuals using ONLY the features available for the future
+    future_residuals = residual_model.predict(future_feature_df[features_for_prediction])
     
     # --- Part 3: Combine the Forecasts ---
     final_forecast = trend_forecast.copy()
@@ -67,7 +78,6 @@ def train_customer_model(historical_df, events_df, periods):
     final_forecast['forecast_customers'] = final_forecast['yhat'] + final_forecast['residual_forecast']
     
     last_hist_date = historical_df['date'].max()
-    # Use the original 'date' column (renamed from 'ds') for filtering
     return final_forecast[final_forecast['date'] > last_hist_date][['date', 'forecast_customers']].rename(columns={'date': 'ds'})
 
 
@@ -95,7 +105,6 @@ def train_atv_model(historical_df, events_df, periods):
     forecast = model.predict(future)
     forecast_df = forecast[forecast['ds'] > last_hist_date][['ds', 'yhat']]
     forecast_df.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
-    # This function needs to return two values to match the call in generate_forecast
     return forecast_df, model 
 
 def generate_forecast(historical_df, events_df, periods=15):
@@ -103,7 +112,6 @@ def generate_forecast(historical_df, events_df, periods=15):
     if len(historical_df) < 30:
         return pd.DataFrame(), None
     
-    # train_customer_model now only returns one dataframe
     cust_forecast_df = train_customer_model(historical_df, events_df, periods)
     atv_forecast_df, prophet_model_for_ui = train_atv_model(historical_df, events_df, periods)
     
@@ -118,5 +126,4 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     
-    # We pass back the ATV model for visualization, as the customer model is now a hybrid
     return final_df.head(periods), prophet_model_for_ui
