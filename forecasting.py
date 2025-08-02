@@ -1,6 +1,6 @@
 # forecasting.py
 # Implements the state-of-the-art Temporal Fusion Transformer model.
-# Corrected to handle strict data type requirements for categorical features.
+# Corrected to build a robust, continuous time index to prevent AssertionErrors.
 
 import pandas as pd
 from datetime import timedelta
@@ -28,40 +28,60 @@ def train_customer_model(historical_df, periods):
     # 2. Create features for the TFT model
     df_featured = create_tft_features(historical_df, weather_df)
     
-    # --- ROBUSTNESS FIX: Enforce correct data types for categorical features ---
+    # Enforce correct data types for categorical features
     categorical_cols = ["series", "month", "dayofweek", "weather_code"]
     for col in categorical_cols:
         if col in df_featured.columns:
             df_featured[col] = df_featured[col].astype(str)
+
+    # --- ROBUSTNESS FIX: Create a complete and continuous time index ---
+    # Create a master calendar dataframe from the first date to the last forecast date
+    full_date_range = pd.date_range(start=df_featured['date'].min(), end=end_date, freq='D')
+    scaffold_df = pd.DataFrame({'date': full_date_range})
+    
+    # Re-create time_idx and series identifiers on the complete scaffold
+    scaffold_df['time_idx'] = (scaffold_df['date'] - scaffold_df['date'].min()).dt.days
+    scaffold_df['dayofweek'] = scaffold_df['date'].dt.dayofweek.astype(str)
+    scaffold_df['series'] = scaffold_df['dayofweek']
+    
+    # Merge the actual data onto the scaffold. This creates a perfect sequence.
+    # We select only the necessary columns from df_featured to avoid duplicates.
+    cols_to_merge = [
+        'date', 'customers', 'month', 'is_weekend',
+        'weather_temp', 'weather_precip', 'weather_wind', 'weather_code'
+    ]
+    # Ensure all columns exist before merging
+    for col in cols_to_merge:
+        if col not in df_featured.columns:
+            df_featured[col] = np.nan
+
+    merged_df = pd.merge(scaffold_df, df_featured[cols_to_merge], on='date', how='left')
     # --- END FIX ---
 
-    # 3. Define the TimeSeriesDataSet
+    # 3. Define the TimeSeriesDataSet using the new, complete dataframe
     max_encoder_length = 30
     max_prediction_length = periods
 
-    training_cutoff = df_featured["time_idx"].max() - max_prediction_length
-
-    # Define the list of known categorical features for the model
-    time_varying_known_categoricals = [col for col in ["month", "dayofweek", "weather_code"] if col in df_featured.columns]
+    training_cutoff = merged_df["time_idx"].max() - max_prediction_length
 
     training_data = TimeSeriesDataSet(
-        df_featured[lambda x: x.time_idx <= training_cutoff],
+        merged_df[lambda x: x.time_idx <= training_cutoff],
         time_idx="time_idx",
         target="customers",
         group_ids=["series"],
         max_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
         static_categoricals=["series"],
-        time_varying_known_categoricals=time_varying_known_categoricals,
+        time_varying_known_categoricals=["month", "dayofweek", "weather_code"],
         time_varying_known_reals=["time_idx", "weather_temp", "weather_precip", "weather_wind"],
         time_varying_unknown_categoricals=[],
         time_varying_unknown_reals=["customers"],
         target_normalizer=GroupNormalizer(groups=["series"], transformation="softplus"),
-        allow_missing_timesteps=True
+        allow_missing_timesteps=True # Still good practice to keep this
     )
 
     # 4. Create validation set and dataloaders
-    validation_data = TimeSeriesDataSet.from_dataset(training_data, df_featured, predict=True, stop_randomization=True)
+    validation_data = TimeSeriesDataSet.from_dataset(training_data, merged_df, predict=True, stop_randomization=True)
     batch_size = 16
     train_dataloader = training_data.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
     val_dataloader = validation_data.to_dataloader(train=False, batch_size=batch_size * 10, num_workers=0)
@@ -69,27 +89,15 @@ def train_customer_model(historical_df, periods):
     # 5. Configure and Train the TFT Model
     pl.seed_everything(42)
     trainer = pl.Trainer(
-        max_epochs=30,
-        accelerator="cpu",
-        gradient_clip_val=0.1,
-        limit_train_batches=30,
-        callbacks=[],
-        logger=False,
-        enable_model_summary=False,
-        enable_progress_bar=False
+        max_epochs=30, accelerator="cpu", gradient_clip_val=0.1,
+        limit_train_batches=30, callbacks=[], logger=False,
+        enable_model_summary=False, enable_progress_bar=False
     )
     
     tft = TemporalFusionTransformer.from_dataset(
-        training_data,
-        learning_rate=0.03,
-        hidden_size=16,
-        attention_head_size=1,
-        dropout=0.1,
-        hidden_continuous_size=8,
-        output_size=7,
-        loss=SMAPE(),
-        log_interval=10,
-        reduce_on_plateau_patience=4,
+        training_data, learning_rate=0.03, hidden_size=16, attention_head_size=1,
+        dropout=0.1, hidden_continuous_size=8, output_size=7, loss=SMAPE(),
+        log_interval=10, reduce_on_plateau_patience=4,
     )
     
     trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=val_dataloader)
