@@ -1,10 +1,11 @@
-# Proposed replacement for data_processing.py
+# Revised data_processing.py
 
 import pandas as pd
 import numpy as np
 
 def load_from_firestore(db_client, collection_name):
     """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
+    # This function is fine as-is, no changes needed from the previous version.
     if db_client is None:
         return pd.DataFrame()
     
@@ -40,44 +41,43 @@ def load_from_firestore(db_client, collection_name):
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df, events_df):
-    """Creates a rich feature set for a single, unified forecasting model."""
+    """
+    Creates a rich feature set for a single, unified forecasting model,
+    with a strong emphasis on weekly patterns and same-day historical performance.
+    """
     df_copy = df.copy()
     df_copy.sort_values(by='date', inplace=True)
 
     # --- Core Value Calculation ---
     base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     customers_safe = df_copy['customers'].replace(0, np.nan)
-    df_copy['atv'] = (base_sales / customers_safe)
-    
-    # Forward-fill ATV for days with zero customers before back-filling with 0
-    df_copy['atv'] = df_copy['atv'].fillna(method='ffill').fillna(0)
+    df_copy['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
 
     # --- Time-Based Features ---
+    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek # Monday=0, Sunday=6
     df_copy['month'] = df_copy['date'].dt.month
-    df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
     df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('Int64')
     df_copy['year'] = df_copy['date'].dt.year
-    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek # Monday=0, Sunday=6
-    df_copy['quarter'] = df_copy['date'].dt.quarter
-    df_copy['dayofmonth'] = df_copy['date'].dt.day
 
-    # --- Lag Features (Critical for momentum) ---
+    # --- PRIMARY FEATURES: Weekly Lags & Same-Day Rolling Averages ---
     for target in ['sales', 'customers', 'atv']:
         if target in df_copy.columns:
-            # Short-term momentum
-            df_copy[f'{target}_lag_1'] = df_copy[target].shift(1)
-            df_copy[f'{target}_lag_2'] = df_copy[target].shift(2)
-            # Weekly seasonality
+            # Simple weekly lags
             df_copy[f'{target}_lag_7'] = df_copy[target].shift(7)
+            df_copy[f'{target}_lag_14'] = df_copy[target].shift(14)
             
-    # --- Rolling Window Features (Captures trends) ---
-    for target in ['sales', 'customers', 'atv']:
-        if target in df_copy.columns:
-            df_copy[f'{target}_rolling_mean_3'] = df_copy[target].shift(1).rolling(window=3, min_periods=1).mean()
-            df_copy[f'{target}_rolling_mean_7'] = df_copy[target].shift(1).rolling(window=7, min_periods=1).mean()
-            df_copy[f'{target}_rolling_std_7'] = df_copy[target].shift(1).rolling(window=7, min_periods=1).std()
+            # --- NEW: Same-Day Rolling Averages ---
+            # This calculates the average of the last 4 weeks for that specific day of the week.
+            # It is the direct implementation of your business logic.
+            grouped = df_copy.groupby('dayofweek')[target]
+            df_copy[f'{target}_rolling_mean_4_weeks_same_day'] = grouped.transform(
+                lambda x: x.shift(1).rolling(window=4, min_periods=1).mean()
+            )
+            df_copy[f'{target}_rolling_std_4_weeks_same_day'] = grouped.transform(
+                lambda x: x.shift(1).rolling(window=4, min_periods=1).std()
+            )
 
-    # --- Event & Interaction Features ---
+    # --- SECONDARY FEATURES: Global Event & Interaction Features ---
     df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
@@ -98,4 +98,6 @@ def create_features(df, events_df):
     else:
         df_copy['is_not_normal_day'] = 0
 
-    return df_copy.fillna(0)
+    # We use .bfill() (backfill) here to handle the initial NaNs created by lagging and rolling features.
+    # This is a reasonable strategy to avoid losing the first few weeks of data for training.
+    return df_copy.bfill()
