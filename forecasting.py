@@ -1,4 +1,4 @@
-# forecasting.py (Corrected to restore missing function)
+# forecasting.py (Definitive Version with Corrected Time Logic)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -12,7 +12,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 from data_processing import create_features
 
-# --- FUNCTION RESTORED: This function was accidentally removed and is now restored. ---
 def generate_ph_holidays(start_date, end_date, events_df):
     """Generates a DataFrame of PH holidays for Prophet, including user-provided future activities."""
     holidays_list = [
@@ -43,7 +42,6 @@ def generate_ph_holidays(start_date, end_date, events_df):
     all_holidays = pd.concat([ph_holidays, pd.DataFrame(payday_events)])
 
     if events_df is not None and not events_df.empty:
-        # Ensure 'date' column exists and handle potential errors
         if 'date' in events_df.columns:
             user_events = events_df[['date', 'activity_name']].copy()
             user_events.rename(columns={'date': 'ds', 'activity_name': 'holiday'}, inplace=True)
@@ -51,10 +49,47 @@ def generate_ph_holidays(start_date, end_date, events_df):
             all_holidays = pd.concat([all_holidays, user_events])
 
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
-# --- END OF RESTORED FUNCTION ---
 
-def run_primary_model(df_train, X_train, y_train, future_dates, final_features, events_df):
-    """Trains the primary stacked ensemble and returns models and future predictions."""
+def build_future_dataframe(last_date, periods, day_of_week, df_featured, final_features, events_df):
+    """Builds a dataframe with all necessary features for future dates."""
+    future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7)
+    future_dates = future_date_range[future_date_range.dayofweek == day_of_week][:periods]
+    
+    if len(future_dates) == 0:
+        return pd.DataFrame()
+
+    future_df = pd.DataFrame({'date': future_dates})
+
+    # Create date-based and event features from scratch for the future
+    future_df = create_features(future_df, events_df)
+    
+    # --- Correctly source lag features from the historical dataframe ---
+    # Combine historical and future to easily map lags
+    df_featured_indexed = df_featured.set_index('date')
+    
+    for col in final_features:
+        if 'lag' in col:
+            target_col, _, lag_days = col.partition('_lag_')
+            lag_days = int(lag_days)
+            # Map the value from N days ago in the full historical set
+            future_df[col] = future_df['date'].apply(lambda d: df_featured_indexed.loc[d - timedelta(days=lag_days), target_col] if (d - timedelta(days=lag_days)) in df_featured_indexed.index else np.nan)
+
+    # Ensure all columns exist and fill any missing values
+    for col in final_features:
+        if col not in future_df.columns:
+            future_df[col] = 0
+            
+    future_df = future_df[final_features]
+    future_df.fillna(method='ffill', inplace=True)
+    future_df.fillna(0, inplace=True)
+    
+    return future_df
+
+def run_day_specific_pipeline(df_train, X_train, y_train, future_dates, final_features, events_df):
+    """
+    This function now takes pre-calculated features and runs the entire two-stage modeling pipeline.
+    """
+    # --- Stage 1: Primary Model ---
     df_prophet = df_train[['date']].rename(columns={'date': 'ds'})
     df_prophet['y'] = y_train.values
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
@@ -83,11 +118,11 @@ def run_primary_model(df_train, X_train, y_train, future_dates, final_features, 
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
     meta_learner.fit(X_meta, y_train)
 
-    future_placeholder = pd.DataFrame({'date': future_dates})
-    combined_df_for_features = pd.concat([df_train, future_placeholder], ignore_index=True)
-    combined_df_with_features = create_features(combined_df_for_features, events_df)
-    X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)][final_features]
-    X_future.fillna(method='ffill', inplace=True); X_future.fillna(0, inplace=True)
+    # --- Build future dataframe with corrected logic ---
+    X_future = build_future_dataframe(df_train['date'].max(), 15, df_train['date'].iloc[0].dayofweek, df_train, final_features, events_df)
+
+    if X_future.empty:
+        return pd.DataFrame(), None
 
     prophet_future_fcst = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
     lgbm_future_preds = lgbm.predict(X_future)
@@ -96,34 +131,25 @@ def run_primary_model(df_train, X_train, y_train, future_dates, final_features, 
     
     primary_forecast = meta_learner.predict(X_meta_future)
     
-    models = {'prophet': prophet_model, 'lgbm': lgbm, 'xgb': xgb_model, 'meta_learner': meta_learner}
-    return primary_forecast, models
-
-def run_residual_model(df_train, y_train, X_train, models, final_features, future_dates, events_df):
-    """Trains a model to predict the errors of the primary model."""
-    prophet_train_fcst = models['prophet'].predict(df_train[['date']].rename(columns={'date':'ds'}))
-    lgbm_train_preds = models['lgbm'].predict(X_train)
-    xgb_train_preds = models['xgb'].predict(X_train)
-    X_meta_train = pd.DataFrame({'prophet': prophet_train_fcst['yhat'].values, 'lgbm': lgbm_train_preds, 'xgb': xgb_train_preds})
-    primary_train_preds = models['meta_learner'].predict(X_meta_train)
-    
+    # --- Stage 2: Residual Model ---
+    primary_train_preds = meta_learner.predict(X_meta)
     residuals = y_train - primary_train_preds
-
-    residual_lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 100, 'learning_rate': 0.05, 'num_leaves': 20, 'verbose': -1, 'n_jobs': -1, 'seed': 123}
+    
+    residual_lgbm_params = {'objective': 'regression_l1', 'n_estimators': 100, 'learning_rate': 0.05, 'verbose': -1, 'seed': 123}
     residual_model = lgb.LGBMRegressor(**residual_lgbm_params)
     residual_model.fit(X_train, residuals)
-
-    future_placeholder = pd.DataFrame({'date': future_dates})
-    combined_df_for_features = pd.concat([df_train, future_placeholder], ignore_index=True)
-    combined_df_with_features = create_features(combined_df_for_features, events_df)
-    X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)][final_features]
-    X_future.fillna(method='ffill', inplace=True); X_future.fillna(0, inplace=True)
-
     predicted_residuals = residual_model.predict(X_future)
-    return predicted_residuals
+
+    # --- Final Forecast ---
+    final_forecast = primary_forecast + predicted_residuals
+    
+    day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_forecast})
+    
+    return day_forecast_df, prophet_model
 
 def generate_forecast(historical_df, events_df, periods=15):
-    """Main forecasting function using a two-stage Residual Stacking architecture."""
+    """Main forecasting function with corrected feature logic."""
+    # --- Features are calculated ONCE on the full, continuous timeline ---
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
@@ -137,10 +163,9 @@ def generate_forecast(historical_df, events_df, periods=15):
         constant_cols = [col for col in all_features if df_day[col].nunique() < 2]
         final_features = [f for f in all_features if f not in constant_cols]
         
-        last_date = df_day['date'].max()
-        future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7) 
-        future_dates = future_date_range[future_date_range.dayofweek == day_of_week][:periods]
-        if len(future_dates) == 0: continue
+        last_date = historical_df['date'].max() # Use last date of ALL data for continuous range
+        future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods)
+        future_dates_for_day = future_date_range[future_date_range.dayofweek == day_of_week]
 
         # --- Process Customers ---
         target_cust = 'customers'
@@ -148,27 +173,22 @@ def generate_forecast(historical_df, events_df, periods=15):
         if len(df_train_cust) < 20: continue
         X_train_cust, y_train_cust = df_train_cust[final_features], df_train_cust[target_cust]
         
-        primary_cust_fcst, cust_models = run_primary_model(df_train_cust, X_train_cust, y_train_cust, future_dates, final_features, events_df)
-        predicted_cust_residuals = run_residual_model(df_train_cust, y_train_cust, X_train_cust, cust_models, final_features, future_dates, events_df)
-        final_cust_fcst = primary_cust_fcst + predicted_cust_residuals
-        all_cust_forecasts.append(pd.DataFrame({'ds': future_dates, 'yhat': final_cust_fcst}))
-        
-        if cust_models.get('prophet'): prophet_model_for_insights = cust_models['prophet']
+        cust_fcst, prophet_model_cust = run_day_specific_pipeline(df_train_cust, X_train_cust, y_train_cust, future_dates_for_day, final_features, events_df)
+        if not cust_fcst.empty:
+            all_cust_forecasts.append(cust_fcst)
+            if prophet_model_cust: prophet_model_for_insights = prophet_model_cust
 
         # --- Process ATV ---
         target_atv = 'atv'
         df_train_atv = df_day.dropna(subset=final_features + [target_atv])
         if len(df_train_atv) < 20: continue
         X_train_atv, y_train_atv = df_train_atv[final_features], df_train_atv[target_atv]
-
-        primary_atv_fcst, atv_models = run_primary_model(df_train_atv, X_train_atv, y_train_atv, future_dates, final_features, events_df)
-        predicted_atv_residuals = run_residual_model(df_train_atv, y_train_atv, X_train_atv, atv_models, final_features, future_dates, events_df)
-        final_atv_fcst = primary_atv_fcst + predicted_atv_residuals
-        all_atv_forecasts.append(pd.DataFrame({'ds': future_dates, 'yhat': final_atv_fcst}))
+        
+        atv_fcst, _ = run_day_specific_pipeline(df_train_atv, X_train_atv, y_train_atv, future_dates_for_day, final_features, events_df)
+        if not atv_fcst.empty: all_atv_forecasts.append(atv_fcst)
 
     if not all_cust_forecasts or not all_atv_forecasts: return pd.DataFrame(), None 
 
-    # --- Combine and Finalize ---
     cust_forecast_final = pd.concat(all_cust_forecasts).sort_values('ds').reset_index(drop=True)
     atv_forecast_final = pd.concat(all_atv_forecasts).sort_values('ds').reset_index(drop=True)
     
