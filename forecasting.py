@@ -1,8 +1,8 @@
-# forecasting.py (Definitive Version with Feature Safeguard)
+# forecasting.py (Definitive Version with Missing Import Restored)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
-import xgboost as xgb
+import xgboost as xgb  # --- DEFINITIVE FIX: Restored the missing XGBoost import ---
 from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
@@ -54,7 +54,6 @@ def generate_forecast(historical_df, events_df, periods=15):
         df_day_cust = df_featured_cust[df_featured_cust['date'].dt.dayofweek == day_of_week].copy()
         if len(df_day_cust) < 30: continue
         
-        # --- SAFEGUARD: Explicitly select only numeric features for training ---
         numeric_types = ['int64', 'int32', 'float64', 'uint8', 'int8']
         cust_features = [col for col in df_day_cust.columns if df_day_cust[col].dtype in numeric_types and col not in ['total_sales', 'base_sales', 'customers', 'atv', 'add_on_sales']]
         
@@ -152,15 +151,11 @@ def build_future_dataframe_generic(future_dates, historical_df, final_features, 
     """Generic future dataframe builder."""
     if future_dates.empty: return pd.DataFrame()
     
-    # Create a base dataframe with the future dates
     future_df_base = pd.DataFrame({'date': future_dates})
 
     if is_customer_model:
-        # For customers, we only need the pure, non-financial features
         future_df = create_features_for_customers(future_df_base, events_df)
     else:
-        # For ATV, we need customer lags, which requires the full historical df for context
-        # We concat to allow lag calculation across the boundary of history and future
         placeholder_df = pd.concat([historical_df, future_df_base], ignore_index=True)
         all_features_df = create_features_for_atv(placeholder_df, events_df)
         future_df = all_features_df[all_features_df['date'].isin(future_dates)].copy()
