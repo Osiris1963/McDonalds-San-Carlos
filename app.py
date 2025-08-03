@@ -1,4 +1,4 @@
-# app.py (Updated with a more robust init_firestore function)
+# app.py (Functionality Restored)
 import streamlit as st
 import pandas as pd
 import time
@@ -6,7 +6,7 @@ from datetime import date, timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# --- Import from our new, separated modules ---
+# --- Import from our modules ---
 from data_processing import load_from_firestore
 from forecasting import generate_forecast
 
@@ -42,23 +42,26 @@ def apply_custom_styling():
             padding: 8px 14px; font-weight: 600; font-size: 0.9rem;
         }
         .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: #ffffff; }
+        .st-expander {
+            border: 1px solid #444 !important; box-shadow: none; border-radius: 10px;
+            background-color: #252525; margin-bottom: 0.5rem;
+        }
+        .st-expander header { font-size: 0.9rem; font-weight: 600; color: #d3d3d3; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Firestore Initialization (More Robust Version) ---
+# --- Firestore Initialization ---
 @st.cache_resource
 def init_firestore():
     """Initializes a connection to Firestore using Streamlit Secrets with better error handling."""
     try:
-        # Check if the secrets are loaded and have the required keys
         if "firebase_credentials" in st.secrets and "type" in st.secrets.firebase_credentials:
             if not firebase_admin._apps:
-                # Use st.secrets directly which handles the dictionary conversion
                 cred = credentials.Certificate(st.secrets.firebase_credentials.to_dict())
                 firebase_admin.initialize_app(cred)
             return firestore.client()
         else:
-            st.error("Firestore credentials are not configured correctly in Streamlit Secrets. Please check your [firebase_credentials] section.")
+            st.error("Firestore credentials are not configured correctly in Streamlit Secrets.")
             return None
     except Exception as e:
         st.error(f"Firestore Connection Error: Failed to initialize. Details: {e}")
@@ -86,6 +89,36 @@ def save_forecast_to_log(db_client, forecast_df):
     except Exception as e:
         st.error(f"Error logging forecast: {e}")
         return False
+
+# --- NEW: Restored function to display and edit historical data ---
+def render_historical_record(row, db_client):
+    """Renders an editable historical data record inside an expander."""
+    if 'doc_id' not in row or pd.isna(row['doc_id']):
+        return
+
+    date_str = row['date'].strftime('%B %d, %Y')
+    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    
+    with st.expander(expander_title):
+        day_type = row.get('day_type', 'Normal Day')
+        st.write(f"**Day Type:** {day_type}")
+        if day_type == 'Not Normal Day':
+            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
+
+        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+            st.markdown("**Edit Record**")
+            day_type_options = ["Normal Day", "Not Normal Day"]
+            current_day_type_index = day_type_options.index(day_type) if day_type in day_type_options else 0
+            
+            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_day_type_index, key=f"day_type_{row['doc_id']}")
+            
+            if st.form_submit_button("💾 Update Day Type", use_container_width=True):
+                update_data = {'day_type': updated_day_type}
+                db_client.collection('historical_data').document(row['doc_id']).update(update_data)
+                st.success(f"Record for {date_str} updated!")
+                st.cache_data.clear()
+                time.sleep(1); st.rerun()
+
 
 # --- Main Application ---
 apply_custom_styling()
@@ -135,9 +168,17 @@ if db:
             st.info("Click 'Generate Forecast' in the sidebar.")
 
     with tabs[1]:
-        st.header("✍️ Edit Data")
-        # Placeholder for data editing UI
-        st.info("Data editing functionality to be implemented.")
+        st.header("✍️ Edit Historical Data")
+        st.info("Here you can correct the 'Day Type' for past dates if an unusual event occurred.")
+        historical_df = load_from_firestore(db, 'historical_data')
+        
+        # --- NEW: The restored loop to display the records ---
+        if historical_df is not None and not historical_df.empty:
+            recent_df = historical_df.sort_values(by="date", ascending=False).head(30)
+            for _, row in recent_df.iterrows():
+                render_historical_record(row, db)
+        else:
+            st.info("No historical data found.")
 
 else:
     st.error("Could not connect to Firestore. Please check your configuration and network.")
