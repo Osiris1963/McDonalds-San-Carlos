@@ -1,4 +1,4 @@
-# forecasting.py (Hybrid Prophet-XGBoost with Optuna Tuning)
+# forecasting.py (Corrected with modern XGBoost callbacks)
 import pandas as pd
 from prophet import Prophet
 import xgboost as xgb
@@ -8,6 +8,8 @@ import warnings
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
 import numpy as np
+# --- NEW: Import the modern EarlyStopping callback ---
+from xgboost.callback import EarlyStopping
 
 # Suppress Optuna's trial logs and other warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -48,7 +50,7 @@ def generate_ph_holidays(start_date, end_date, events_df):
     return all_holidays.drop_duplicates(subset=['ds']).reset_index(drop=True)
 
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
-    if len(df_day_featured) < 30: # Need more data for this advanced model
+    if len(df_day_featured) < 30:
         return pd.DataFrame(), None
 
     future_date_range = pd.date_range(start=df_day_featured['date'].max() + timedelta(days=1), periods=periods * 7)
@@ -56,7 +58,6 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    # --- STRATEGY 1: CONSERVATIVE ATV FORECAST (Prophet Only) ---
     if target == 'atv':
         df_prophet = df_day_featured[['date', 'atv']].rename(columns={'date': 'ds', 'atv': 'y'})
         model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
@@ -65,53 +66,45 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
         forecast = model.predict(future_df_prophet)
         return forecast[['ds', 'yhat']], model
 
-    # --- STRATEGY 2: HYBRID PROPHET-XGBOOST FOR CUSTOMERS ---
     elif target == 'customers':
-        # 1. Train Prophet to get the baseline and components
         df_prophet = df_day_featured[['date', 'customers']].rename(columns={'date': 'ds', 'customers': 'y'})
         prophet_model = Prophet(yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
         prophet_model.fit(df_prophet)
         
-        # 2. Merge Prophet components back into the main dataframe
         df_forecast_on_hist = prophet_model.predict(df_prophet[['ds']])
         df_day_featured = pd.merge(df_day_featured, df_forecast_on_hist[['ds', 'yhat', 'trend', 'yearly']], left_on='date', right_on='ds', how='left')
         
-        # 3. Calculate the residual (Prophet's error) - this is our new target for XGBoost
         df_day_featured['residual'] = df_day_featured['customers'] - df_day_featured['yhat']
         
-        # 4. Define features for XGBoost
         features = [col for col in df_day_featured.columns if df_day_featured[col].dtype in ['int64', 'float64', 'int32'] and col not in ['sales', 'customers', 'atv', 'date', 'yhat', 'residual', 'ds']]
         df_train = df_day_featured.dropna(subset=features + ['residual'])
         X = df_train[features]
         y = df_train['residual']
         
-        # 5. Tune XGBoost with Optuna
         def objective(trial):
             params = {
                 'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 1000,
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-                'max_depth': trial.suggest_int('max_depth', 3, 7),
-                'subsample': trial.suggest_float('subsample', 0.6, 0.9),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
-                'gamma': trial.suggest_float('gamma', 0, 0.1),
-                'lambda': trial.suggest_float('lambda', 0.1, 1.0),
-                'alpha': trial.suggest_float('alpha', 0.1, 1.0),
-                'seed': 42, 'n_jobs': -1
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1), 'max_depth': trial.suggest_int('max_depth', 3, 7),
+                'subsample': trial.suggest_float('subsample', 0.6, 0.9), 'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
+                'gamma': trial.suggest_float('gamma', 0, 0.1), 'lambda': trial.suggest_float('lambda', 0.1, 1.0),
+                'alpha': trial.suggest_float('alpha', 0.1, 1.0), 'seed': 42, 'n_jobs': -1
             }
             X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
             model = xgb.XGBRegressor(**params)
-            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=50, verbose=False)
+
+            # --- FIX: Use the modern callbacks API for early stopping ---
+            early_stopping_callback = EarlyStopping(rounds=50, save_best=True)
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[early_stopping_callback], verbose=False)
+            
             return np.sqrt(mean_squared_error(y_val, model.predict(X_val)))
 
         study = optuna.create_study(direction='minimize')
         study.optimize(objective, n_trials=50)
         best_params = study.best_params
         
-        # 6. Train final XGBoost model on all data with the best parameters
         final_xgb = xgb.XGBRegressor(objective='reg:squarederror', seed=42, n_jobs=-1, **best_params)
         final_xgb.fit(X, y)
         
-        # 7. Make the final forecast
         future_df_prophet = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
         
         future_df_xgb = pd.DataFrame({'date': future_dates})
