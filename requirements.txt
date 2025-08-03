@@ -10,4 +10,5 @@ requests==2.31.0
 PyYAML==6.0.1
 torch==2.1.2
 pytorch-lightning==2.0.9
-pytorch-forecasting==0.10.3
+pytorch-forecasting==1.0.0
+
