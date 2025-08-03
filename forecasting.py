@@ -1,14 +1,17 @@
-# forecasting.py (Re-architected with "Analog Week" Model)
+# forecasting.py (Corrected with modern scikit-learn Pipeline)
 import pandas as pd
 from prophet import Prophet
-from sklearn.linear_model import Ridge
 from datetime import timedelta
 import warnings
 import numpy as np
 
+# --- NEW: Import Pipeline and StandardScaler for the modern approach ---
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# We still need create_features to generate our high-quality inputs
 from data_processing import create_features
 
 def generate_ph_holidays(start_date, end_date, events_df):
@@ -50,7 +53,7 @@ def generate_ph_holidays(start_date, end_date, events_df):
 def run_day_specific_models(df_day_featured, target, day_of_week, periods, events_df):
     """
     Runs a specific forecasting model based on the target variable.
-    - For 'customers', it uses the "Analog Week" model with Ridge regression.
+    - For 'customers', it uses the "Analog Week" model with a Scaler + Ridge pipeline.
     - For 'atv', it uses a conservative Prophet-only model.
     """
     if len(df_day_featured) < 20: 
@@ -61,7 +64,7 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    model = None # Initialize model variable
+    model = None 
 
     # --- STRATEGY 1: CONSERVATIVE ATV FORECAST ---
     if target == 'atv':
@@ -75,48 +78,43 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
 
     # --- STRATEGY 2: "ANALOG WEEK" CUSTOMER FORECAST ---
     elif target == 'customers':
-        # Define the lean, powerful feature set for this model
         features = [
-            'customers_lag_7',             # The Anchor: Last week's performance
-            'customers_rolling_mean_7',    # The Momentum: Recent 7-day trend
-            'is_payday_period',            # The Money Factor
-            'is_event'                     # The Holiday Factor
+            'customers_lag_7', 'customers_rolling_mean_7',
+            'is_payday_period', 'is_event'
         ]
         
-        # Prepare training data - drop rows where lags/rolling features are NaN
         df_train = df_day_featured.dropna(subset=features + [target]).copy()
 
-        if len(df_train) < 10: # Need at least a few samples to train
+        if len(df_train) < 10: 
             return pd.DataFrame(), None
             
         X_train = df_train[features]
         y_train = df_train[target]
         
-        # We use a simple, robust Ridge regression model.
-        model = Ridge(alpha=1.0, normalize=True)
+        # --- FIX: Use a Pipeline to combine scaling and regression ---
+        # This replaces the old `Ridge(normalize=True)`
+        model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('ridge', Ridge(alpha=1.0))
+        ])
         model.fit(X_train, y_train)
         
-        # Create future features for prediction
         future_placeholder = pd.DataFrame({'date': future_dates})
         combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
-        # We still need the full feature creation to get our inputs right
         combined_df_with_features = create_features(combined_df_for_features, events_df)
     
         X_future = combined_df_with_features[combined_df_with_features['date'].isin(future_dates)][features]
         
-        # Predict
         predictions = model.predict(X_future)
         final_preds_df = pd.DataFrame({'ds': future_dates, 'yhat': predictions})
         
     else:
-        # Fallback for any other target
         return pd.DataFrame(), None
 
     return final_preds_df, model
 
 
 def generate_forecast(historical_df, events_df, periods=15):
-    # The 'fuel' - our comprehensive feature set
     df_featured = create_features(historical_df, events_df)
     
     all_cust_forecasts, all_atv_forecasts = [], []
@@ -154,5 +152,4 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
 
-    # Returning None for the prophet model as we now have two different models
     return final_df.head(periods), None
