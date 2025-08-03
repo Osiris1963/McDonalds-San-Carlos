@@ -1,4 +1,4 @@
-# forecasting.py (Tuned Models & Stacked Ensemble)
+# forecasting.py (Upgraded with Trend Weighting)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
@@ -58,6 +58,26 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     
     df_train = df_day_featured.dropna(subset=final_features + [target])
     
+    # --- NEW: Check if this is the customer model and create sample weights ---
+    sample_weights = None
+    if target == 'customers' and not df_train.empty:
+        # 1. Calculate the age of each data point in days from the most recent record
+        most_recent_date = df_train['date'].max()
+        df_train['days_old'] = (most_recent_date - df_train['date']).dt.days
+        
+        # 2. Define a decay rate. This is a key hyperparameter.
+        # A smaller value (e.g., 0.001) gives more weight to older data.
+        # A larger value (e.g., 0.01) makes the model focus very heavily on the most recent data.
+        # 0.005 is a balanced starting point, giving a half-life of ~138 days.
+        decay_rate = 0.005 
+        
+        # 3. Apply exponential decay to create the weights
+        sample_weights = np.exp(-decay_rate * df_train['days_old'])
+        
+        # We no longer need this column for training features
+        df_train = df_train.drop(columns=['days_old'])
+    # --- END NEW ---
+
     last_date = df_day_featured['date'].max()
     future_date_range = pd.date_range(start=last_date + timedelta(days=1), periods=periods * 7) 
     future_dates = future_date_range[future_date_range.dayofweek == day_of_week][:periods]
@@ -84,10 +104,12 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'seed': 42, 'n_jobs': -1}
 
     lgbm = lgb.LGBMRegressor(**lgbm_params)
-    lgbm.fit(X_train, y_train)
+    # --- NEW: Pass weights to the fit method ---
+    lgbm.fit(X_train, y_train, sample_weight=sample_weights)
 
     xgb_model = xgb.XGBRegressor(**xgb_params)
-    xgb_model.fit(X_train, y_train)
+    # --- NEW: Pass weights to the fit method ---
+    xgb_model.fit(X_train, y_train, sample_weight=sample_weights)
     
     # --- Stacking Ensemble ---
     # 1. Get base model predictions on the training data itself to train the meta-learner
@@ -104,7 +126,8 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
 
     # 3. Train the meta-learner (RidgeCV is robust and fast)
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
-    meta_learner.fit(X_meta, y_train)
+    # --- NEW: Pass weights to the meta-learner's fit method ---
+    meta_learner.fit(X_meta, y_train, sample_weight=sample_weights)
 
     # 4. Get base model predictions on FUTURE data
     future_placeholder = pd.DataFrame({'date': future_dates})
