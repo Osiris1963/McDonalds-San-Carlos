@@ -43,10 +43,28 @@ def load_from_firestore(db_client, collection_name):
 def prepare_data_for_nbeats(df, events_df):
     """
     Prepares the DataFrame for N-BEATS.
-    This is much simpler than the previous feature engineering. We only need to add
-    features that are known in the future (exogenous variables).
+    This version now handles missing dates by creating a regular time series.
     """
+    if df.empty:
+        return pd.DataFrame()
+        
     df_copy = df.copy()
+
+    # --- THIS IS THE FIX: Regularize the date range ---
+    # Create a complete date range from the first to the last date in the data.
+    full_date_range = pd.date_range(start=df_copy['date'].min(), end=df_copy['date'].max(), freq='D')
+    regular_df = pd.DataFrame(full_date_range, columns=['date'])
+
+    # Merge the original data onto the complete date range.
+    # Missing dates will now have NaN values for sales, customers, etc.
+    df_copy = pd.merge(regular_df, df_copy, on='date', how='left')
+
+    # Fill missing values with 0. This assumes a missing day had 0 sales/customers.
+    fill_cols = ['sales', 'customers', 'add_on_sales']
+    for col in fill_cols:
+        if col in df_copy.columns:
+            df_copy[col] = df_copy[col].fillna(0)
+    # ---------------------------------------------------
 
     # Calculate ATV (Average Transaction Value)
     customers_safe = df_copy['customers'].replace(0, 1) # Avoid division by zero
@@ -73,6 +91,7 @@ def prepare_data_for_nbeats(df, events_df):
         df_copy['is_event'] = 0
 
     # The model also requires a 'time_idx' and a 'group' identifier.
+    # This now creates a guaranteed continuous index.
     df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
     df_copy['group'] = 'main_store' # A dummy group for our single time series
 
