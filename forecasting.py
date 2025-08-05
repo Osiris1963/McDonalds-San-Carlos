@@ -25,7 +25,8 @@ def generate_forecast(historical_df, events_df, periods=15):
     TARGET_CUST = 'customers'
     TARGET_ATV = 'atv'
 
-    # Define model parameters (a good starting point)
+    # --- THIS IS THE CORRECTED SECTION ---
+    # Define model parameters with scikit-learn compatible keys
     lgbm_params = {
         'objective': 'regression_l1',
         'metric': 'rmse',
@@ -34,8 +35,8 @@ def generate_forecast(historical_df, events_df, periods=15):
         'feature_fraction': 0.8,
         'bagging_fraction': 0.8,
         'bagging_freq': 1,
-        'lambda_l1': 0.1,
-        'lambda_l2': 0.1,
+        'reg_alpha': 0.1,      # Corrected from 'lambda_l1'
+        'reg_lambda': 0.1,     # Corrected from 'lambda_l2'
         'num_leaves': 31,
         'verbose': -1,
         'n_jobs': -1,
