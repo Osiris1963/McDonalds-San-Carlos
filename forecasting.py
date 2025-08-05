@@ -74,11 +74,8 @@ def generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain
         model_cust = _train_model(dataset_cust, CUST_MODEL_PATH)
     else:
         print("Loading existing customer model...")
-        model_cust = NBeats.load_from_checkpoint(CUST_MODEL_PATH) # Incorrect way, need to load state dict
-        # Correct loading:
         model_cust = NBeats.from_dataset(dataset_cust)
         model_cust.load_state_dict(torch.load(CUST_MODEL_PATH))
-
 
     # --- 3. Train or Load ATV Model ---
     dataset_atv = _create_ts_dataset(df_prepared, 'atv', periods)
@@ -89,7 +86,6 @@ def generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain
         print("Loading existing ATV model...")
         model_atv = NBeats.from_dataset(dataset_atv)
         model_atv.load_state_dict(torch.load(ATV_MODEL_PATH))
-
 
     # --- 4. Generate Future Predictions ---
     # Create a future dataframe with known features for the forecast period
@@ -120,8 +116,11 @@ def generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain
     prediction_data = pd.concat([encoder_data, future_df], ignore_index=True)
     
     # Generate predictions (direct, multi-step forecast)
-    pred_cust = model_cust.predict(prediction_data).numpy().flatten()
-    pred_atv = model_atv.predict(prediction_data).numpy().flatten()
+    pred_cust_raw, _ = model_cust.predict(prediction_data, return_x=True)
+    pred_atv_raw, _ = model_atv.predict(prediction_data, return_x=True)
+    
+    pred_cust = pred_cust_raw.numpy().flatten()
+    pred_atv = pred_atv_raw.numpy().flatten()
     
     # --- 5. Finalize and Return ---
     final_forecast = pd.DataFrame({
