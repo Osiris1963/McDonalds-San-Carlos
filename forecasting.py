@@ -10,6 +10,7 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
     This trains a separate model for each day in the forecast horizon.
     """
     # --- 1. Feature Engineering ---
+    # Note: events_df is not used in this model but is kept for API consistency
     df_featured = create_features(historical_df)
     
     # --- 2. Target Engineering ---
@@ -18,10 +19,10 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
         df_featured[f'cust_target_d{i}'] = df_featured['customers'].shift(-i)
         df_featured[f'atv_target_d{i}'] = df_featured['atv'].shift(-i)
     
-    # Drop rows where targets are NaN (the last `periods` rows)
+    # Drop rows where targets are NaN (the last `periods` rows) and initial rows with NaN from feature creation
     df_train = df_featured.dropna()
     
-    FEATURES = [col for col in df_train.columns if col.startswith(('month', 'day', 'week', 'is_', 'sales_', 'customers_'))]
+    FEATURES = [col for col in df_train.columns if col not in ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv'] and 'target' not in col]
     
     # --- 3. Train Models ---
     models_cust = {}
@@ -33,7 +34,7 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
         'bagging_freq': 1, 'verbose': -1, 'n_jobs': -1, 'seed': 42
     }
 
-    print("Training multi-model engine...")
+    print("Training robust multi-model engine...")
     for i in range(1, periods + 1):
         target_cust = f'cust_target_d{i}'
         target_atv = f'atv_target_d{i}'
