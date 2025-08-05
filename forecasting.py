@@ -15,10 +15,9 @@ def generate_forecast(historical_df, events_df, periods=15):
     
     dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
 
-    # Configure the trainer for the older, stable version of PyTorch Lightning
     trainer = pl.Trainer(
-        max_epochs=40,  # A few more epochs for better convergence
-        gpus=0,  # Explicitly use CPU. Set to 1 if GPU is available.
+        max_epochs=40,
+        gpus=0,
         weights_summary=None,
         gradient_clip_val=0.1,
         limit_train_batches=50,
@@ -40,10 +39,8 @@ def generate_forecast(historical_df, events_df, periods=15):
 
     trainer.fit(tft, train_dataloaders=dataloader)
 
-    # Generate predictions on the new data
     new_raw_predictions, x = tft.predict(dataset.to_dataloader(train=False), mode="raw", return_x=True)
     
-    # The output is a sequence for all predictable data points. We only want the last one.
     last_prediction_point = new_raw_predictions['prediction'][0]
 
     pred_customers = last_prediction_point[:, 0].numpy()
