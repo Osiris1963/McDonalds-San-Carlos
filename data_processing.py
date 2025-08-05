@@ -25,7 +25,6 @@ def load_from_firestore(db_client, collection_name):
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
     
-    # Standardize timezone-aware to timezone-naive UTC and normalize to midnight
     if pd.api.types.is_datetime64_any_dtype(df['date']):
         if df['date'].dt.tz is not None:
             df['date'] = df['date'].dt.tz_convert(None)
@@ -48,7 +47,6 @@ def create_advanced_features(df, events_df):
     df_copy = df.copy()
 
     # --- Foundational Metrics ---
-    # Calculate ATV more safely before creating features
     base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     customers_safe = df_copy['customers'].replace(0, np.nan)
     df_copy['atv'] = (base_sales / customers_safe)
@@ -56,7 +54,7 @@ def create_advanced_features(df, events_df):
     # --- Time-Based Features ---
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['day'] = df_copy['date'].dt.day
-    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek # Monday=0, Sunday=6
+    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
     df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('int')
     df_copy['year'] = df_copy['date'].dt.year
@@ -69,25 +67,33 @@ def create_advanced_features(df, events_df):
     df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
     df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
 
+    # --- NEW: Handle Categorical Weather Data ---
+    if 'weather' in df_copy.columns:
+        # Fill any missing weather data with a placeholder
+        df_copy['weather'] = df_copy['weather'].fillna('Unknown')
+        # Perform one-hot encoding
+        weather_dummies = pd.get_dummies(df_copy['weather'], prefix='weather', dtype=int)
+        # Join the new numerical columns to the dataframe
+        df_copy = pd.concat([df_copy, weather_dummies], axis=1)
+        # Drop the original text-based weather column
+        df_copy.drop('weather', axis=1, inplace=True)
+    # --- END NEW ---
+
     # --- Advanced Time Series Features ---
     target_vars = ['sales', 'customers', 'atv']
     
-    # 1. Lag Features (Recent History)
     lag_days = [1, 2, 7, 14] 
     for var in target_vars:
         for lag in lag_days:
             df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
-    # 2. Rolling Window Features (Momentum)
     windows = [7, 14]
     for var in target_vars:
         for w in windows:
-            # Shift by 1 to ensure we only use past data for the rolling window
             series_shifted = df_copy[var].shift(1)
             df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
             df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
-    # 3. Fourier Terms (Complex Seasonality)
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
