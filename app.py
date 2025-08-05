@@ -2,10 +2,9 @@
 import streamlit as st
 import pandas as pd
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
-import plotly.graph_objs as go
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -50,7 +49,6 @@ def apply_custom_styling():
             background-color: #252525; margin-bottom: 0.5rem;
         }
         .st-expander header { font-size: 0.9rem; font-weight: 600; color: #d3d3d3; }
-        /* Matplotlib dark theme for plots */
         .stPlotlyChart { border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
@@ -61,7 +59,6 @@ def init_firestore():
     """Initializes a connection to Firestore using Streamlit Secrets."""
     try:
         if not firebase_admin._apps:
-            # Use st.secrets for deployment
             creds_dict = {
               "type": st.secrets.firebase_credentials.type,
               "project_id": st.secrets.firebase_credentials.project_id,
@@ -154,16 +151,17 @@ if db:
         st.title("AI Forecaster v4.0")
         st.info("Unified Engine - Production Build")
 
-        if st.button("🔄 Refresh Data from Firestore"):
+        if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear()
-            st.success("Data cache cleared. Rerunning...")
+            st.cache_resource.clear()
+            st.success("Caches cleared. Rerunning...")
             time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
             historical_df = load_from_firestore(db, 'historical_data')
             events_df = load_from_firestore(db, 'future_activities')
 
-            if len(historical_df) < 30: # Need at least ~2 weeks of data after accounting for lag/rolling features
+            if len(historical_df) < 30: 
                 st.error("Need at least 30 days of data for a reliable forecast.")
             else:
                 with st.spinner("🧠 Training Unified Forecasting Engine..."):
@@ -194,7 +192,6 @@ if db:
                 'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)'
             }).set_index('Date')
             
-            # Format columns for better display
             df_to_show['Predicted Sales (₱)'] = df_to_show['Predicted Sales (₱)'].apply(lambda x: f"₱{x:,.2f}")
             df_to_show['Predicted Avg Sale (₱)'] = df_to_show['Predicted Avg Sale (₱)'].apply(lambda x: f"₱{x:,.2f}")
             
@@ -214,7 +211,6 @@ if db:
                 'importance': model.feature_importances_
             }).sort_values('importance', ascending=False).head(20)
 
-            # Use a dark theme for the plot
             plt.style.use('dark_background')
             fig, ax = plt.subplots(figsize=(12, 10))
             
@@ -223,7 +219,6 @@ if db:
             ax.set_xlabel('Importance', fontsize=12)
             ax.set_ylabel('Feature', fontsize=12)
             
-            # Make text more readable on dark background
             ax.tick_params(axis='x', colors='white')
             ax.tick_params(axis='y', colors='white')
             ax.xaxis.label.set_color('white')
@@ -238,17 +233,24 @@ if db:
     # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates if an unusual event occurred. This will improve future forecasts.")
+        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts.")
         
-        # Use a cached function for loading data to improve responsiveness
         @st.cache_data
-        def get_historical_data(db_client):
+        def get_historical_data():
+            """
+            This function now takes no arguments. It gets the cached DB connection
+            from within itself. Streamlit can now safely cache the data (the DataFrame)
+            this function returns.
+            """
+            db_client = init_firestore()
             return load_from_firestore(db_client, 'historical_data')
 
-        historical_df_edit = get_historical_data(db)
+        historical_df_edit = get_historical_data()
+        
         if not historical_df_edit.empty:
             recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
             for _, row in recent_df.iterrows():
+                # Pass the main 'db' connection for the update logic inside the form
                 render_historical_record(row, db)
         else:
             st.info("No historical data found.")
