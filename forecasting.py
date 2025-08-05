@@ -8,6 +8,10 @@ from pytorch_forecasting.data import GroupNormalizer
 from datetime import timedelta
 import os
 
+# --- THIS IS THE FIX ---
+from data_processing import prepare_data_for_nbeats
+# ----------------------
+
 # --- Constants ---
 ENCODER_LENGTH = 60  # How many days of history the model sees to make a prediction
 BATCH_SIZE = 32
@@ -92,6 +96,8 @@ def generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain
     last_date = df_prepared['date'].max()
     future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
     future_df = pd.DataFrame({'date': future_dates})
+    future_df['group'] = 'main_store'
+    future_df['time_idx'] = df_prepared['time_idx'].max() + 1 + future_df.index
 
     # Add the same known features to the future_df
     future_df['dayofweek'] = future_df['date'].dt.dayofweek
