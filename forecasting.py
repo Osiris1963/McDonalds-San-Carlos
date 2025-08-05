@@ -4,33 +4,29 @@ import pandas as pd
 import torch
 import pytorch_lightning as pl
 from pytorch_forecasting import TemporalFusionTransformer, MultiLoss
-from pytorch_forecasting.metrics import MAE, SMAPE
+from pytorch_forecasting.metrics import MAE
 from data_processing import prepare_data_for_tft
 
 def generate_forecast(historical_df, events_df, periods=15):
     """
-    Orchestrates the entire deep learning forecast process.
+    Orchestrates the entire deep learning forecast process using a stable stack.
     """
-    # 1. Prepare data in the required format
-    # The dataset object is the single source of truth for the model
     dataset = prepare_data_for_tft(historical_df, events_df, periods_to_forecast=periods)
     
-    # 2. Create dataloaders for training
     dataloader = dataset.to_dataloader(train=True, batch_size=32, num_workers=0)
 
-    # 3. Configure and train the model
-    # We use a PyTorch Lightning Trainer for robust training
+    # Configure the trainer for the older, stable version of PyTorch Lightning
     trainer = pl.Trainer(
-        max_epochs=25,  # Increased epochs for deep learning
-        accelerator="auto", # Automatically uses GPU if available
+        max_epochs=40,  # A few more epochs for better convergence
+        gpus=0,  # Explicitly use CPU. Set to 1 if GPU is available.
+        weights_summary=None,
         gradient_clip_val=0.1,
         limit_train_batches=50,
         enable_checkpointing=False,
+        enable_progress_bar=False,
         logger=False,
-        enable_progress_bar=False, # Disable in Streamlit to avoid clutter
     )
 
-    # Define the TFT model architecture
     tft = TemporalFusionTransformer.from_dataset(
         dataset,
         learning_rate=0.01,
@@ -38,35 +34,26 @@ def generate_forecast(historical_df, events_df, periods=15):
         attention_head_size=4,
         dropout=0.1,
         hidden_continuous_size=16,
-        # As requested, we use a simple loss for point forecasts (not probabilistic)
         loss=MultiLoss([MAE(), MAE()]),
         optimizer="AdamW"
     )
 
-    # Train the model
     trainer.fit(tft, train_dataloaders=dataloader)
 
-    # 4. Generate predictions
-    # We need the last `encoder_length` of data to predict the future
-    encoder_data = dataset.filter(lambda x: x.time_idx > x.time_idx.max() - tft.hparams.max_encoder_length)
+    # Generate predictions on the new data
+    new_raw_predictions, x = tft.predict(dataset.to_dataloader(train=False), mode="raw", return_x=True)
     
-    # Create a dataloader for the prediction input
-    pred_dataloader = encoder_data.to_dataloader(train=False, batch_size=1, num_workers=0)
+    # The output is a sequence for all predictable data points. We only want the last one.
+    last_prediction_point = new_raw_predictions['prediction'][0]
 
-    # Get raw predictions
-    raw_predictions = tft.predict(pred_dataloader, mode="prediction", return_index=True)
-    
-    # The model predicts both 'customers' and 'atv'
-    pred_customers = raw_predictions.output[0][:, 0].numpy()
-    pred_atv = raw_predictions.output[0][:, 1].numpy()
+    pred_customers = last_prediction_point[:, 0].numpy()
+    pred_atv = last_prediction_point[:, 1].numpy()
 
-    # Get the dates for the forecast
     forecast_dates = [
         historical_df['date'].max() + pd.DateOffset(days=x) 
         for x in range(1, periods + 1)
     ]
 
-    # Assemble the final forecast DataFrame
     final_df = pd.DataFrame({
         'ds': forecast_dates,
         'forecast_customers': pred_customers,
@@ -75,10 +62,8 @@ def generate_forecast(historical_df, events_df, periods=15):
     
     final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
     
-    # Clip values to ensure they are non-negative
     final_df['forecast_sales'] = final_df['forecast_sales'].clip(lower=0)
     final_df['forecast_customers'] = final_df['forecast_customers'].clip(lower=0).round()
     final_df['forecast_atv'] = final_df['forecast_atv'].clip(lower=0)
     
-    # Return both the forecast and the model for later inspection
     return final_df, tft, dataset
