@@ -42,13 +42,24 @@ def load_from_firestore(db_client, collection_name):
     if not df.empty:
         full_date_range = pd.date_range(start=df['date'].min(), end=df['date'].max(), freq='D')
         regular_df = pd.DataFrame(full_date_range, columns=['date'])
-        df = pd.merge(regular_df, df, on='date', how='left').fillna(0)
-
+        df = pd.merge(regular_df, df, on='date', how='left') # Keep original NaNs for now
+        
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df):
     """Creates time-series features from a dataframe for tree-based models."""
     df = df.copy()
+    
+    # --- THIS IS THE FIX: Convert categorical text data to numbers ---
+    # One-hot encode the 'day_type' column if it exists
+    if 'day_type' in df.columns:
+        # Fill any NaN values that may have come from date regularization
+        df['day_type'] = df['day_type'].fillna('Normal Day')
+        dummies = pd.get_dummies(df['day_type'], prefix='day_type', dtype=int)
+        df = pd.concat([df, dummies], axis=1)
+        df.drop('day_type', axis=1, inplace=True)
+    # -------------------------------------------------------------
+
     df['atv'] = (df['sales'] / df['customers'].replace(0, 1)).fillna(0)
     
     df['month'] = df['date'].dt.month
@@ -73,4 +84,5 @@ def create_features(df):
         df[f'sales_roll_mean_{window}'] = df['sales'].shift(15).rolling(window=window).mean()
         df[f'customers_roll_mean_{window}'] = df['customers'].shift(15).rolling(window=window).mean()
         
+    # Fill all remaining NaN values with 0
     return df.fillna(0)
