@@ -38,61 +38,37 @@ def load_from_firestore(db_client, collection_name):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+    # --- Ensure data is regular ---
+    if not df.empty:
+        full_date_range = pd.date_range(start=df['date'].min(), end=df['date'].max(), freq='D')
+        regular_df = pd.DataFrame(full_date_range, columns=['date'])
+        df = pd.merge(regular_df, df, on='date', how='left').fillna(0)
+
     return df.sort_values(by='date').reset_index(drop=True)
 
-def prepare_data_for_nbeats(df, events_df):
-    """
-    Prepares the DataFrame for N-BEATS.
-    This version now handles missing dates by creating a regular time series.
-    """
-    if df.empty:
-        return pd.DataFrame()
-        
-    df_copy = df.copy()
-
-    # --- THIS IS THE FIX: Regularize the date range ---
-    # Create a complete date range from the first to the last date in the data.
-    full_date_range = pd.date_range(start=df_copy['date'].min(), end=df_copy['date'].max(), freq='D')
-    regular_df = pd.DataFrame(full_date_range, columns=['date'])
-
-    # Merge the original data onto the complete date range.
-    # Missing dates will now have NaN values for sales, customers, etc.
-    df_copy = pd.merge(regular_df, df_copy, on='date', how='left')
-
-    # Fill missing values with 0. This assumes a missing day had 0 sales/customers.
-    fill_cols = ['sales', 'customers', 'add_on_sales']
-    for col in fill_cols:
-        if col in df_copy.columns:
-            df_copy[col] = df_copy[col].fillna(0)
-    # ---------------------------------------------------
-
-    # Calculate ATV (Average Transaction Value)
-    customers_safe = df_copy['customers'].replace(0, 1) # Avoid division by zero
-    df_copy['atv'] = df_copy['sales'] / customers_safe
-
-    # --- Time-Based Features (Known in the future) ---
-    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
-    df_copy['month'] = df_copy['date'].dt.month
-    df_copy['day'] = df_copy['date'].dt.day
-
-    # --- Event & Payday Features (Known in the future) ---
-    df_copy['is_payday_period'] = df_copy['date'].apply(
+def create_features(df):
+    """Creates time-series features from a dataframe."""
+    df = df.copy()
+    df['atv'] = (df['sales'] / df['customers'].replace(0, 1)).fillna(0)
+    
+    df['month'] = df['date'].dt.month
+    df['day'] = df['date'].dt.day
+    df['dayofweek'] = df['date'].dt.dayofweek
+    df['dayofyear'] = df['date'].dt.dayofyear
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    
+    df['is_payday_period'] = df['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     )
+    
+    # Lag features - crucial for tree models
+    for lag in [15, 16, 30]: # Lags must be >= forecast horizon
+        df[f'sales_lag_{lag}'] = df['sales'].shift(lag)
+        df[f'customers_lag_{lag}'] = df['customers'].shift(lag)
 
-    # Merge external events data
-    if events_df is not None and not events_df.empty:
-        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
-        events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
-        df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event_temp')
-        df_copy['is_event'] = (df_copy['is_event_temp'] == 'both').astype(int)
-        df_copy.drop('is_event_temp', axis=1, inplace=True)
-    else:
-        df_copy['is_event'] = 0
-
-    # The model also requires a 'time_idx' and a 'group' identifier.
-    # This now creates a guaranteed continuous index.
-    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
-    df_copy['group'] = 'main_store' # A dummy group for our single time series
-
-    return df_copy.fillna(0)
+    # Rolling window features
+    for window in [7, 14, 30]:
+        df[f'sales_roll_mean_{window}'] = df['sales'].shift(15).rolling(window=window).mean()
+        df[f'customers_roll_mean_{window}'] = df['customers'].shift(15).rolling(window=window).mean()
+        
+    return df.fillna(0)
