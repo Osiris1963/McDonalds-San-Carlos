@@ -1,82 +1,108 @@
-# forecasting.py
+# forecasting.py (Re-architected for Temporal Fusion Transformer)
 import pandas as pd
-from pytorch_forecasting import TemporalFusionTransformer
-from pytorch_forecasting import TimeSeriesDataSet
 import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
+from pytorch_forecasting.data import GroupNormalizer
+from pytorch_forecasting.metrics import QuantileLoss
+from datetime import timedelta
 import warnings
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
 
-def load_tft_model(model_path="best_model.ckpt"):
-    """Loads a pre-trained TFT model from a checkpoint file."""
-    try:
-        model = TemporalFusionTransformer.load_from_checkpoint(model_path)
-        return model
-    except FileNotFoundError:
-        return None
+from data_processing import prepare_data_for_tft
 
-def generate_forecast(model, historical_df, events_df, periods=15):
+def generate_tft_forecast(historical_df, events_df, periods=15):
     """
-    Generates a forecast using the pre-trained TFT model.
+    Generates a multi-target forecast using the Temporal Fusion Transformer model.
     """
-    from data_processing import create_features_for_tft # Local import to avoid circular dependency
-    
-    if model is None:
-        return pd.DataFrame(), None
+    if len(historical_df) < 60: # TFT needs a reasonable amount of history
+        return pd.DataFrame(), None, None
 
-    # Prepare data for prediction
-    data_for_features = create_features_for_tft(historical_df, events_df)
-    
-    # Create the prediction dataset
-    # The model will use the last `max_encoder_length` days from the data to predict the future
-    encoder_data = data_for_features[lambda x: x.time_idx > data_for_features["time_idx"].max() - model.hparams.max_encoder_length]
-    
-    # Create the decoder data (future dates with known features)
-    last_date = data_for_features["date"].max()
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods)
-    
-    # This is a placeholder for future known features
-    decoder_data = pd.DataFrame({
-        "date": future_dates,
-        "time_idx": (future_dates - data_for_features["date"].min()).days,
-        "group": "store_1"
-    })
-    
-    # Add future known features (e.g., payday, events)
-    # This part must be robust to ensure all needed columns are present
-    future_features = create_features_for_tft(decoder_data, events_df)
-    new_prediction_data = pd.concat([encoder_data, future_features], ignore_index=True)
-    
-    # Make predictions
-    raw_predictions = model.predict(
-        new_prediction_data,
-        mode="prediction", # "prediction" gives point forecast, "quantiles" gives ranges
-        return_x=True
+    # --- 1. Prepare Data ---
+    full_df = prepare_data_for_tft(historical_df, events_df)
+
+    # --- 2. Define TimeSeriesDataSet ---
+    # TFT requires a validation set that is right after the training set.
+    max_date = full_df['date'].max()
+    training_cutoff_date = max_date - timedelta(days=periods)
+    training_cutoff_idx = full_df[full_df['date'] == training_cutoff_date]['time_idx'].iloc[0]
+
+    # Define the dataset
+    training_dataset = TimeSeriesDataSet(
+        full_df[lambda x: x.time_idx <= training_cutoff_idx],
+        time_idx="time_idx",
+        target=["sales", "customers", "atv"],
+        group_ids=["group_id"],
+        max_encoder_length=45,  # How many days of history to use for prediction
+        max_prediction_length=periods,
+        static_categoricals=["group_id"],
+        time_varying_known_categoricals=["month", "dayofweek", "weekofyear"],
+        time_varying_known_reals=["time_idx", "day", "dayofyear", "year", "is_payday_period", "is_weekend", "is_event", "is_not_normal_day"],
+        time_varying_unknown_reals=["sales", "customers", "atv"],
+        target_normalizer=GroupNormalizer(groups=["group_id"], transformation="softplus"),
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        add_encoder_length=True,
     )
-    
-    # Extract predictions for the future dates
-    pred_df = pd.DataFrame()
-    pred_df['ds'] = future_dates
-    # The output is a tuple (predictions, x_values). We take the predictions for each target.
-    # We take the median prediction (index 3 of the 7 quantiles)
-    pred_df['forecast_customers'] = raw_predictions.output[0].numpy()[:, :, 3].flatten()
-    pred_df['forecast_atv'] = raw_predictions.output[1].numpy()[:, :, 3].flatten()
-    
-    # Post-process the forecast
-    pred_df['forecast_sales'] = pred_df['forecast_customers'] * pred_df['forecast_atv']
-    pred_df['forecast_customers'] = pred_df['forecast_customers'].clip(lower=0).round()
-    pred_df['forecast_atv'] = pred_df['forecast_atv'].clip(lower=0)
-    pred_df['forecast_sales'] = pred_df['forecast_sales'].clip(lower=0)
 
-    return pred_df.head(periods), raw_predictions
-
-def get_interpretation_plot(model, raw_predictions):
-    """
-    Generates the interpretation plot from the model's prediction output.
-    """
-    if model is None or raw_predictions is None:
-        return None
+    # --- 3. Create Model ---
+    # Create validation and full dataloaders
+    validation_dataset = TimeSeriesDataSet.from_dataset(training_dataset, full_df, predict=True, stop_randomization=True)
+    train_dataloader = training_dataset.to_dataloader(train=True, batch_size=16, num_workers=0)
+    validation_dataloader = validation_dataset.to_dataloader(train=False, batch_size=16, num_workers=0)
     
-    interpretation = model.interpret_output(raw_predictions.output, reduction="sum")
-    fig = model.plot_interpretation(interpretation)
-    return fig
+    # Define the TFT model with QuantileLoss for probabilistic forecasting
+    tft = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        learning_rate=0.03,
+        hidden_size=32,
+        attention_head_size=2,
+        dropout=0.1,
+        hidden_continuous_size=16,
+        output_size=7,  # Number of quantiles to predict
+        loss=QuantileLoss(),
+        log_interval=10,
+        reduce_on_plateau_patience=4,
+    )
+
+    # --- 4. Train Model ---
+    # Using PyTorch Lightning Trainer
+    trainer = pl.Trainer(
+        max_epochs=30,
+        accelerator="cpu", # or "gpu" if available
+        gradient_clip_val=0.1,
+        limit_train_batches=30,
+        callbacks=[EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=5, verbose=False, mode="min")],
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False
+    )
+    trainer.fit(tft, train_dataloader=train_dataloader, val_dataloaders=validation_dataloader)
+
+    # --- 5. Generate Forecast ---
+    # Predict on the validation set to get future forecasts
+    raw_predictions, x = tft.predict(validation_dataloader, mode="raw", return_x=True)
+
+    # Format the output
+    dates = full_df['date'][training_cutoff_idx + 1 : training_cutoff_idx + 1 + periods]
+    
+    forecast_df = pd.DataFrame({'ds': dates})
+    
+    # Extract quantiles for each target
+    targets = ["sales", "customers", "atv"]
+    for i, target in enumerate(targets):
+        # Quantiles are at indices 0, 3, 6 (p10, p50, p90)
+        forecast_df[f'forecast_{target}_p10'] = raw_predictions['prediction'][:, :, 0][:, i].numpy()
+        forecast_df[f'forecast_{target}_p50'] = raw_predictions['prediction'][:, :, 3][:, i].numpy()
+        forecast_df[f'forecast_{target}_p90'] = raw_predictions['prediction'][:, :, 6][:, i].numpy()
+
+    # Clip predictions to be non-negative
+    for col in forecast_df.columns:
+        if 'forecast' in col:
+            forecast_df[col] = forecast_df[col].clip(lower=0)
+            if 'customers' in col:
+                forecast_df[col] = forecast_df[col].round()
+
+    return forecast_df, tft, x, raw_predictions
