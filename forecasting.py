@@ -1,88 +1,165 @@
-# forecasting.py
+# forecasting.py (Re-engineered with GluonTS and DeepAR)
 import pandas as pd
-import lightgbm as lgb
-from datetime import timedelta
+import numpy as np
+import torch
+from gluonts.dataset.common import ListDataset
+from gluonts.dataset.field_names import FieldName
+from gluonts.torch.model.deepar import DeepAREstimator
+from gluonts.torch.distributions import NormalOutput
+from pytorch_lightning import Trainer
+
+# Import our enhanced feature engineering function
 from data_processing import create_features
 
-def generate_direct_forecast(historical_df, events_df, periods=15):
+def prepare_gluon_dataset(df, target_cols, feature_cols, prediction_length):
     """
-    Generates a forecast using a direct multi-model strategy.
-    This trains a separate model for each day in the forecast horizon.
+    Converts a pandas DataFrame into the ListDataset format required by GluonTS.
+    
+    Args:
+        df (pd.DataFrame): The DataFrame with all historical data and features.
+        target_cols (list): List of column names to be predicted (e.g., ['customers', 'atv']).
+        feature_cols (list): List of feature column names to be used by the model.
+        prediction_length (int): The number of future time steps to predict.
+
+    Returns:
+        A tuple of (ListDataset for training, future features DataFrame).
     """
-    # Note: events_df is not used in this model but is kept for API consistency
-    df_featured = create_features(historical_df)
+    # Features that change over time are 'dynamic' features in GluonTS
+    feat_dynamic_real = df[feature_cols].values.T
     
-    # Create target columns for each day we want to predict
-    for i in range(1, periods + 1):
-        df_featured[f'cust_target_d{i}'] = df_featured['customers'].shift(-i)
-        df_featured[f'atv_target_d{i}'] = df_featured['atv'].shift(-i)
+    # The main time series targets we want to predict
+    target_values = df[target_cols].values.T
     
-    df_train = df_featured.dropna()
+    # We create a GluonTS dataset object. We need to provide the target values,
+    # the start date, and the time-varying features.
+    train_ds = ListDataset(
+        [{
+            FieldName.TARGET: target,
+            FieldName.START: df['date'].min(),
+            FieldName.FEAT_DYNAMIC_REAL: feat_dynamic_real
+        }],
+        freq="D"  # Daily frequency
+    )
     
-    # --- THIS IS THE ROBUST FIX ---
-    # Instead of blacklisting columns by name, we whitelist them by their data type.
-    # This automatically and permanently prevents any non-numeric column from being passed to the model.
+    # We also need the features for the future period we want to predict.
+    # We'll create a placeholder for future dates and generate features for them.
+    future_date_range = pd.date_range(
+        start=df['date'].max() + pd.Timedelta(days=1),
+        periods=prediction_length
+    )
+    future_df_template = pd.DataFrame({'date': future_date_range})
     
-    # 1. Start with all columns as potential features
-    potential_features = df_train.columns.tolist()
+    # To create features for the future, we need to append this to the historical data
+    # so that rolling features can be calculated correctly.
+    combined_df = pd.concat([df, future_df_template], ignore_index=True)
+    
+    # We pass a dummy events_df because future events are already in the main df
+    # up to the historical point. The feature creator will handle the rest.
+    combined_df_featured = create_features(combined_df, pd.DataFrame())
+    
+    future_features_df = combined_df_featured.tail(prediction_length)
+    
+    return train_ds, future_features_df[feature_cols]
 
-    # 2. Define all columns that should NEVER be features
-    cols_to_exclude = ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv']
-    
-    # 3. Add all target columns to the exclusion list
-    target_cols = [col for col in df_train.columns if 'target' in col]
-    cols_to_exclude.extend(target_cols)
 
-    # 4. Create the final feature list by removing excluded columns
-    feature_candidates = [col for col in potential_features if col not in cols_to_exclude]
+def generate_forecast(historical_df, events_df, periods=15):
+    """
+    Generates a multivariate, point forecast using a DeepAR model from GluonTS.
+    This is a unified model that learns from the entire dataset at once.
     
-    # 5. Final, most important step: Select only columns that are numeric.
-    FEATURES = [col for col in feature_candidates if pd.api.types.is_numeric_dtype(df_train[col])]
-    # -----------------------------------------------------------------------------------------
-    
-    models_cust = {}
-    models_atv = {}
+    Args:
+        historical_df (pd.DataFrame): The complete historical sales data.
+        events_df (pd.DataFrame): Data on future activities and events.
+        periods (int): The number of days to forecast into the future.
 
-    lgbm_params = {
-        'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 500,
-        'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
-        'bagging_freq': 1, 'verbose': -1, 'n_jobs': -1, 'seed': 42
-    }
-
-    print("Training robust multi-model engine...")
-    for i in range(1, periods + 1):
-        target_cust = f'cust_target_d{i}'
-        target_atv = f'atv_target_d{i}'
+    Returns:
+        pd.DataFrame: A DataFrame containing the future forecast, or an empty DataFrame on error.
+    """
+    try:
+        # --- 1. Feature Engineering ---
+        # Create a rich feature set from the historical data
+        df_featured = create_features(historical_df, events_df)
         
-        model_c = lgb.LGBMRegressor(**lgbm_params)
-        model_c.fit(df_train[FEATURES], df_train[target_cust])
-        models_cust[i] = model_c
+        target_cols = ['customers', 'atv']
         
-        model_a = lgb.LGBMRegressor(**lgbm_params)
-        model_a.fit(df_train[FEATURES], df_train[target_atv])
-        models_atv[i] = model_a
+        # Define the feature set for the model. Exclude non-numeric/ID columns.
+        feature_cols = [
+            col for col in df_featured.columns if col not in 
+            ['date', 'doc_id', 'sales', 'customers', 'atv', 'add_on_sales', 'day_type', 'day_type_notes']
+        ]
 
-    # Generate Forecast
-    last_known_data = create_features(historical_df.tail(60)).iloc[-1:][FEATURES]
-    
-    future_predictions = []
-    last_date = historical_df['date'].max()
+        # --- 2. Data Preparation for GluonTS ---
+        gluon_ds, future_features = prepare_gluon_dataset(
+            df_featured,
+            target_cols,
+            feature_cols,
+            prediction_length=periods
+        )
 
-    for i in range(1, periods + 1):
-        pred_cust = models_cust[i].predict(last_known_data)[0]
-        pred_atv = models_atv[i].predict(last_known_data)[0]
+        # --- 3. Model Definition (DeepAR) ---
+        # DeepAR is an autoregressive RNN model, well-suited for this task.
+        # We configure it for speed and compatibility with Streamlit's environment.
+        # Using NormalOutput for a point forecast (it will predict the mean).
+        estimator = DeepAREstimator(
+            freq="D",
+            prediction_length=periods,
+            num_layers=2,
+            num_cells=40,
+            distr_output=NormalOutput(), # Predicts mean and std, we will use the mean.
+            trainer_kwargs={
+                "max_epochs": 50,
+                "accelerator": "cpu",  # Ensures it runs on Streamlit hosting without a GPU
+                "enable_progress_bar": False, # Cleaner logs for production
+                "logger": False # Disable verbose logging
+            }
+        )
+
+        # --- 4. Model Training ---
+        # This trains the model on the entire historical dataset.
+        # The trained object is called a 'Predictor'.
+        print("Starting model training...")
+        predictor = estimator.train(training_data=gluon_ds)
+        print("Model training complete.")
+
+        # --- 5. Prediction ---
+        # Use the trained predictor to forecast the future.
+        # We must provide the known future features we prepared earlier.
+        forecast_it = predictor.predict(
+            dataset=gluon_ds,
+            future_features=future_features.values.T
+        )
         
-        new_row = {
-            'ds': last_date + timedelta(days=i),
-            'forecast_customers': pred_cust,
-            'forecast_atv': pred_atv,
-            'forecast_sales': pred_cust * pred_atv
-        }
-        future_predictions.append(new_row)
+        # The result is an iterator, get the first (and only) forecast object
+        forecast = next(iter(forecast_it))
 
-    final_forecast = pd.DataFrame(future_predictions)
-    final_forecast['forecast_sales'] = final_forecast['forecast_sales'].clip(lower=0)
-    final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
-    final_forecast['forecast_atv'] = final_forecast['forecast_atv'].clip(lower=0)
-    
-    return final_forecast
+        # --- 6. Process Forecast Output ---
+        # We get the mean of the predicted distribution for our point forecast.
+        mean_preds = forecast.mean
+
+        future_dates = pd.date_range(
+            start=historical_df['date'].max() + pd.Timedelta(days=1),
+            periods=periods
+        )
+        
+        forecast_df = pd.DataFrame({
+            'ds': future_dates,
+            'forecast_customers': mean_preds[:, 0], # First target column
+            'forecast_atv': mean_preds[:, 1],       # Second target column
+        })
+
+        # --- 7. Final Calculations & Cleanup ---
+        forecast_df['forecast_sales'] = forecast_df['forecast_customers'] * forecast_df['forecast_atv']
+        
+        # Ensure forecasts are non-negative and customers are integers
+        forecast_df['forecast_sales'] = forecast_df['forecast_sales'].clip(lower=0)
+        forecast_df['forecast_customers'] = forecast_df['forecast_customers'].clip(lower=0).round().astype(int)
+        forecast_df['forecast_atv'] = forecast_df['forecast_atv'].clip(lower=0)
+
+        return forecast_df.round(2)
+
+    except Exception as e:
+        print(f"An error occurred during forecast generation: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
