@@ -19,15 +19,26 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
     
     df_train = df_featured.dropna()
     
-    # --- THIS IS THE FIX: More robust feature selection ---
-    # Explicitly select feature columns to avoid passing unwanted columns like 'doc_id'.
-    excluded_cols = ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv']
-    # Also exclude any column that is a target variable
-    target_cols = [col for col in df_train.columns if 'target' in col]
-    excluded_cols.extend(target_cols)
+    # --- THIS IS THE ROBUST FIX ---
+    # Instead of blacklisting columns by name, we whitelist them by their data type.
+    # This automatically and permanently prevents any non-numeric column from being passed to the model.
     
-    FEATURES = [col for col in df_train.columns if col not in excluded_cols]
-    # --------------------------------------------------------
+    # 1. Start with all columns as potential features
+    potential_features = df_train.columns.tolist()
+
+    # 2. Define all columns that should NEVER be features
+    cols_to_exclude = ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv']
+    
+    # 3. Add all target columns to the exclusion list
+    target_cols = [col for col in df_train.columns if 'target' in col]
+    cols_to_exclude.extend(target_cols)
+
+    # 4. Create the final feature list by removing excluded columns
+    feature_candidates = [col for col in potential_features if col not in cols_to_exclude]
+    
+    # 5. Final, most important step: Select only columns that are numeric.
+    FEATURES = [col for col in feature_candidates if pd.api.types.is_numeric_dtype(df_train[col])]
+    # -----------------------------------------------------------------------------------------
     
     models_cust = {}
     models_atv = {}
