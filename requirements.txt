@@ -1,7 +1,7 @@
 streamlit==1.35.0
 pandas==2.2.2
-firebase-admin==6.5.0
-matplotlib==3.9.0
-seaborn==0.13.2
-lightgbm==4.4.0
 scikit-learn==1.5.0
+firebase-admin==6.5.0
+plotly==5.22.0
+gluonts[torch]==0.14.3
+pytorch-lightning==2.2.5
