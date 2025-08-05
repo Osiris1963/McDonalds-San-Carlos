@@ -9,22 +9,26 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
     Generates a forecast using a direct multi-model strategy.
     This trains a separate model for each day in the forecast horizon.
     """
-    # --- 1. Feature Engineering ---
     # Note: events_df is not used in this model but is kept for API consistency
     df_featured = create_features(historical_df)
     
-    # --- 2. Target Engineering ---
     # Create target columns for each day we want to predict
     for i in range(1, periods + 1):
         df_featured[f'cust_target_d{i}'] = df_featured['customers'].shift(-i)
         df_featured[f'atv_target_d{i}'] = df_featured['atv'].shift(-i)
     
-    # Drop rows where targets are NaN (the last `periods` rows) and initial rows with NaN from feature creation
     df_train = df_featured.dropna()
     
-    FEATURES = [col for col in df_train.columns if col not in ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv'] and 'target' not in col]
+    # --- THIS IS THE FIX: More robust feature selection ---
+    # Explicitly select feature columns to avoid passing unwanted columns like 'doc_id'.
+    excluded_cols = ['date', 'doc_id', 'add_on_sales', 'sales', 'customers', 'atv']
+    # Also exclude any column that is a target variable
+    target_cols = [col for col in df_train.columns if 'target' in col]
+    excluded_cols.extend(target_cols)
     
-    # --- 3. Train Models ---
+    FEATURES = [col for col in df_train.columns if col not in excluded_cols]
+    # --------------------------------------------------------
+    
     models_cust = {}
     models_atv = {}
 
@@ -39,18 +43,15 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
         target_cust = f'cust_target_d{i}'
         target_atv = f'atv_target_d{i}'
         
-        # Train customer model for day i
         model_c = lgb.LGBMRegressor(**lgbm_params)
         model_c.fit(df_train[FEATURES], df_train[target_cust])
         models_cust[i] = model_c
         
-        # Train ATV model for day i
         model_a = lgb.LGBMRegressor(**lgbm_params)
         model_a.fit(df_train[FEATURES], df_train[target_atv])
         models_atv[i] = model_a
 
-    # --- 4. Generate Forecast ---
-    # Get the very last row of featured data, which has the most recent info
+    # Generate Forecast
     last_known_data = create_features(historical_df.tail(60)).iloc[-1:][FEATURES]
     
     future_predictions = []
@@ -68,7 +69,6 @@ def generate_direct_forecast(historical_df, events_df, periods=15):
         }
         future_predictions.append(new_row)
 
-    # --- 5. Finalize ---
     final_forecast = pd.DataFrame(future_predictions)
     final_forecast['forecast_sales'] = final_forecast['forecast_sales'].clip(lower=0)
     final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
