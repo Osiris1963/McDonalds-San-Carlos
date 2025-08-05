@@ -11,7 +11,7 @@ from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Unified AI Forecaster v4.0",
+    page_title="Unified AI Forecaster v4.1",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -56,12 +56,27 @@ def init_firestore():
     """Initializes a connection to Firestore using Streamlit Secrets."""
     try:
         if not firebase_admin._apps:
-            # Fallback for local development if secrets aren't set
-            if 'firebase_credentials' not in st.secrets:
-                 st.error("Firebase credentials not found in Streamlit Secrets.")
-                 return None
+            if "firebase_credentials" not in st.secrets:
+                st.error("Firebase credentials not found in Streamlit Secrets.")
+                return None
             
-            creds_dict = st.secrets.firebase_credentials.to_dict()
+            # --- CORRECTED LOGIC ---
+            # Build the credentials dictionary manually for robustness.
+            # This avoids issues with the Streamlit Secrets object format.
+            creds_dict = {
+                "type": st.secrets.firebase_credentials.type,
+                "project_id": st.secrets.firebase_credentials.project_id,
+                "private_key_id": st.secrets.firebase_credentials.private_key_id,
+                "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
+                "client_email": st.secrets.firebase_credentials.client_email,
+                "client_id": st.secrets.firebase_credentials.client_id,
+                "auth_uri": st.secrets.firebase_credentials.auth_uri,
+                "token_uri": st.secrets.firebase_credentials.token_uri,
+                "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
+                "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url
+            }
+            # --- END CORRECTION ---
+
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
@@ -128,7 +143,7 @@ if db:
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
         st.title("Unified AI Forecaster")
-        st.info("Deep Learning Production Build v4.0")
+        st.info("Deep Learning Production Build v4.1")
 
         if st.button("🔄 Refresh Data"):
             st.cache_data.clear()
@@ -206,4 +221,3 @@ if db:
             st.info("No historical data found in the database.")
 else:
     st.error("Fatal Error: Could not connect to Firestore. Please check your Streamlit Secrets configuration and network.")
-
