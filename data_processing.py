@@ -46,9 +46,11 @@ def create_advanced_features(df, events_df):
     """
     df_copy = df.copy()
 
-    # --- Foundational Metrics ---
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    # --- Foundational Metrics (Cleansed) ---
     customers_safe = df_copy['customers'].replace(0, np.nan)
+    
+    # Calculate ATV based ONLY on base sales to remove outlier impact.
+    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
     df_copy['atv'] = (base_sales / customers_safe)
 
     # --- Time-Based Features ---
@@ -67,19 +69,15 @@ def create_advanced_features(df, events_df):
     df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
     df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
 
-    # --- NEW: Handle Categorical Weather Data ---
+    # --- Handle Categorical Weather Data ---
     if 'weather' in df_copy.columns:
-        # Fill any missing weather data with a placeholder
         df_copy['weather'] = df_copy['weather'].fillna('Unknown')
-        # Perform one-hot encoding
         weather_dummies = pd.get_dummies(df_copy['weather'], prefix='weather', dtype=int)
-        # Join the new numerical columns to the dataframe
         df_copy = pd.concat([df_copy, weather_dummies], axis=1)
-        # Drop the original text-based weather column
         df_copy.drop('weather', axis=1, inplace=True)
-    # --- END NEW ---
 
     # --- Advanced Time Series Features ---
+    # Using a focused list of variables for lag/rolling features
     target_vars = ['sales', 'customers', 'atv']
     
     lag_days = [1, 2, 7, 14] 
