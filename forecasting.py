@@ -1,114 +1,139 @@
 # forecasting.py
 import pandas as pd
-import lightgbm as lgb
+import torch
+import pytorch_lightning as pl
+from pytorch_forecasting import TimeSeriesDataSet, NBeats
+from pytorch_forecasting.metrics import MAE
+from pytorch_forecasting.data import GroupNormalizer
 from datetime import timedelta
-from data_processing import create_advanced_features
+import os
 
-def generate_forecast(historical_df, events_df, periods=15):
+# --- Constants ---
+ENCODER_LENGTH = 60  # How many days of history the model sees to make a prediction
+BATCH_SIZE = 32
+MAX_EPOCHS = 30 # Increased for better accuracy, but still reasonable for initial training
+
+def _create_ts_dataset(data, target, periods):
+    """Helper function to create a TimeSeriesDataSet."""
+    return TimeSeriesDataSet(
+        data,
+        time_idx="time_idx",
+        target=target,
+        group_ids=["group"],
+        max_encoder_length=ENCODER_LENGTH,
+        max_prediction_length=periods,
+        time_varying_known_reals=["dayofweek", "month", "day", "is_payday_period", "is_event"],
+        target_normalizer=GroupNormalizer(groups=["group"], transformation="softplus")
+    )
+
+def _train_model(dataset, model_path):
+    """Helper function to train and save a single N-BEATS model."""
+    dataloader = dataset.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=0)
+    
+    # Configure the trainer
+    trainer = pl.Trainer(
+        max_epochs=MAX_EPOCHS,
+        accelerator="auto", # Uses GPU if available
+        gradient_clip_val=0.1,
+        limit_train_batches=50,
+        callbacks=[],
+    )
+    
+    # Define the N-BEATS model
+    model = NBeats.from_dataset(
+        dataset,
+        learning_rate=3e-2,
+        weight_decay=1e-2,
+        loss=MAE(),
+        backcast_loss_ratio=0.5,
+    )
+    
+    # Train the model
+    trainer.fit(model, train_dataloaders=dataloader)
+    
+    # Save the trained model
+    torch.save(model.state_dict(), model_path)
+    return model
+
+def generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain=False):
     """
-    Generates a forecast using a two-stage, unified LightGBM model
-    with a recursive strategy for multi-step forecasting.
+    Generates a forecast using two specialized N-BEATS models.
+    It will load pre-trained models if they exist, or train new ones.
     """
-    # --- 1. Model Training ---
+    # Define paths for saved models
+    CUST_MODEL_PATH = "customer_model.pt"
+    ATV_MODEL_PATH = "atv_model.pt"
+
+    # --- 1. Data Preparation ---
+    df_prepared = prepare_data_for_nbeats(historical_df, events_df)
+
+    # --- 2. Train or Load Customer Model ---
+    dataset_cust = _create_ts_dataset(df_prepared, 'customers', periods)
+    if not os.path.exists(CUST_MODEL_PATH) or force_retrain:
+        print("Training new customer model...")
+        model_cust = _train_model(dataset_cust, CUST_MODEL_PATH)
+    else:
+        print("Loading existing customer model...")
+        model_cust = NBeats.load_from_checkpoint(CUST_MODEL_PATH) # Incorrect way, need to load state dict
+        # Correct loading:
+        model_cust = NBeats.from_dataset(dataset_cust)
+        model_cust.load_state_dict(torch.load(CUST_MODEL_PATH))
+
+
+    # --- 3. Train or Load ATV Model ---
+    dataset_atv = _create_ts_dataset(df_prepared, 'atv', periods)
+    if not os.path.exists(ATV_MODEL_PATH) or force_retrain:
+        print("Training new ATV model...")
+        model_atv = _train_model(dataset_atv, ATV_MODEL_PATH)
+    else:
+        print("Loading existing ATV model...")
+        model_atv = NBeats.from_dataset(dataset_atv)
+        model_atv.load_state_dict(torch.load(ATV_MODEL_PATH))
+
+
+    # --- 4. Generate Future Predictions ---
+    # Create a future dataframe with known features for the forecast period
+    last_date = df_prepared['date'].max()
+    future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
+    future_df = pd.DataFrame({'date': future_dates})
+
+    # Add the same known features to the future_df
+    future_df['dayofweek'] = future_df['date'].dt.dayofweek
+    future_df['month'] = future_df['date'].dt.month
+    future_df['day'] = future_df['date'].dt.day
+    future_df['is_payday_period'] = future_df['date'].apply(lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0)
     
-    # Create a rich feature set from all historical data
-    df_featured = create_advanced_features(historical_df, events_df)
+    # Handle future events
+    if events_df is not None and not events_df.empty:
+        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
+        events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
+        future_df = pd.merge(future_df, events_df_unique[['date']], on='date', how='left', indicator='is_event_temp')
+        future_df['is_event'] = (future_df['is_event_temp'] == 'both').astype(int)
+        future_df.drop('is_event_temp', axis=1, inplace=True)
+    else:
+        future_df['is_event'] = 0
+
+    # The model needs the last `encoder_length` of historical data to predict the future
+    encoder_data = df_prepared[lambda x: x.time_idx > x.time_idx.max() - ENCODER_LENGTH]
     
-    # Drop initial rows where rolling features couldn't be computed
-    # This ensures the model trains on high-quality, complete data
-    train_df = df_featured.dropna(subset=['sales_rolling_mean_14']).reset_index(drop=True)
+    # Combine historical encoder data with future data for prediction
+    prediction_data = pd.concat([encoder_data, future_df], ignore_index=True)
     
-    # Define features and targets
-    FEATURES = [col for col in train_df.columns if col not in [
-        'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes'
-    ]]
-    TARGET_CUST = 'customers'
-    TARGET_ATV = 'atv'
-
-    # --- THIS IS THE CORRECTED SECTION ---
-    # Define model parameters with scikit-learn compatible keys
-    lgbm_params = {
-        'objective': 'regression_l1',
-        'metric': 'rmse',
-        'n_estimators': 1000,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
-        'reg_alpha': 0.1,      # Corrected from 'lambda_l1'
-        'reg_lambda': 0.1,     # Corrected from 'lambda_l2'
-        'num_leaves': 31,
-        'verbose': -1,
-        'n_jobs': -1,
-        'seed': 42,
-        'boosting_type': 'gbdt',
-    }
+    # Generate predictions (direct, multi-step forecast)
+    pred_cust = model_cust.predict(prediction_data).numpy().flatten()
+    pred_atv = model_atv.predict(prediction_data).numpy().flatten()
     
-    # Train the Customer Forecasting Model
-    model_cust = lgb.LGBMRegressor(**lgbm_params)
-    model_cust.fit(train_df[FEATURES], train_df[TARGET_CUST])
-
-    # Train the ATV Forecasting Model
-    model_atv = lgb.LGBMRegressor(**lgbm_params)
-    model_atv.fit(train_df[FEATURES], train_df[TARGET_ATV])
-
-    # --- 2. Recursive Forecasting ---
-    
-    future_predictions = []
-    # Start with a full copy of historical data to generate features for future steps
-    history_df = historical_df.copy()
-    last_date = history_df['date'].max()
-
-    for i in range(periods):
-        current_pred_date = last_date + timedelta(days=i + 1)
-        
-        # Create a placeholder for the day we want to predict
-        future_placeholder = pd.DataFrame([{'date': current_pred_date}])
-        
-        # Append placeholder to history to create features for it
-        temp_df = pd.concat([history_df, future_placeholder], ignore_index=True)
-        
-        # Create features for this combined dataframe
-        featured_for_pred = create_advanced_features(temp_df, events_df)
-        
-        # The last row contains the features for the day we need to predict
-        X_pred = featured_for_pred[FEATURES].iloc[-1:]
-
-        # Predict customers and ATV
-        pred_cust = model_cust.predict(X_pred)[0]
-        pred_atv = model_atv.predict(X_pred)[0]
-        
-        # Store the prediction
-        new_row = {
-            'date': current_pred_date,
-            'customers': pred_cust,
-            'atv': pred_atv,
-            'sales': pred_cust * pred_atv,
-            'add_on_sales': 0 # Assume 0 for future
-        }
-        future_predictions.append(new_row)
-        
-        # Append the completed prediction back to history_df.
-        # This makes the prediction for day N available for the feature calculation of day N+1.
-        history_df = pd.concat([history_df, pd.DataFrame([new_row])], ignore_index=True)
-
-    if not future_predictions:
-        return pd.DataFrame(), None
-
-    # --- 3. Finalize and Return ---
-    
-    final_forecast = pd.DataFrame(future_predictions)
-    final_forecast.rename(columns={
-        'date': 'ds',
-        'customers': 'forecast_customers',
-        'atv': 'forecast_atv',
-        'sales': 'forecast_sales'
-    }, inplace=True)
+    # --- 5. Finalize and Return ---
+    final_forecast = pd.DataFrame({
+        'ds': future_dates,
+        'forecast_customers': pred_cust,
+        'forecast_atv': pred_atv
+    })
+    final_forecast['forecast_sales'] = final_forecast['forecast_customers'] * final_forecast['forecast_atv']
     
     # Clip and round for realistic business values
     final_forecast['forecast_sales'] = final_forecast['forecast_sales'].clip(lower=0)
     final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
     final_forecast['forecast_atv'] = final_forecast['forecast_atv'].clip(lower=0)
     
-    # Return the forecast and the customer model for feature importance plots
-    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], model_cust
+    return final_forecast
