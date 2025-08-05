@@ -8,13 +8,12 @@ from firebase_admin import credentials, firestore
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-# --- Import from our new, separated modules ---
 from data_processing import load_from_firestore
-from forecasting import generate_nbeats_forecast
+from forecasting import generate_direct_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v5.0 (N-BEATS Engine)",
+    page_title="Sales Forecaster v6.0 (Robust)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -52,7 +51,7 @@ def apply_custom_styling():
     </style>
     """, unsafe_allow_html=True)
 
-# --- Firestore Initialization (Corrected Version) ---
+# --- Firestore Initialization ---
 @st.cache_resource
 def init_firestore():
     """Initializes a connection to Firestore using structured Streamlit Secrets."""
@@ -79,7 +78,7 @@ def init_firestore():
         return None
 
 # --- Data Caching ---
-@st.cache_data(ttl=1800) # Cache data for 30 minutes
+@st.cache_data(ttl=1800)
 def get_data(_db_client):
     historical_df = load_from_firestore(_db_client, 'historical_data')
     events_df = load_from_firestore(_db_client, 'future_activities')
@@ -119,26 +118,22 @@ apply_custom_styling()
 db = init_firestore()
 
 if db:
-    # Initialize session state
     if 'forecast_df' not in st.session_state:
         st.session_state.forecast_df = pd.DataFrame()
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.0")
-        st.info("N-BEATS Engine - Production Build")
-
-        force_retrain = st.checkbox("Force model re-training", value=False)
+        st.title("AI Forecaster v6.0")
+        st.info("Direct Multi-Model Engine - Robust Build")
         
         if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
             historical_df, events_df = get_data(db)
 
-            if len(historical_df) < 75: # N-BEATS needs more data, especially with a 60-day lookback
-                st.error("Need at least 75 days of data for a reliable forecast with this model.")
+            if len(historical_df) < 60:
+                st.error("Need at least 60 days of historical data for a reliable forecast.")
             else:
-                spinner_text = "🧠 Training Deep Learning Engine..." if force_retrain or not os.path.exists("customer_model.pt") else "🚀 Loading models and generating forecast..."
-                with st.spinner(spinner_text):
-                    forecast_df = generate_nbeats_forecast(historical_df, events_df, periods=15, force_retrain=force_retrain)
+                with st.spinner("🧠 Training Robust Multi-Model Engine..."):
+                    forecast_df = generate_direct_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
                 
                 if not forecast_df.empty:
@@ -170,7 +165,7 @@ if db:
         else:
             st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
-    # --- Forecast Insights Tab ---
+    # --- Forecast Charts Tab ---
     with tabs[1]:
         st.header("📊 Forecast Charts")
         st.info("Visualizing the predicted trends for the next 15 days.")
@@ -182,27 +177,17 @@ if db:
             plt.style.use('dark_background')
             fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 18), sharex=True)
             
-            # Sales Plot
-            ax1.plot(df_chart['ds'], df_chart['forecast_sales'], color='#c8102e', marker='o', linestyle='-', label='Predicted Sales')
+            ax1.plot(df_chart['ds'], df_chart['forecast_sales'], color='#c8102e', marker='o', linestyle='-')
             ax1.set_title('Predicted Sales (₱)', fontsize=16, color='white')
-            ax1.set_ylabel('Sales (₱)', color='white')
-            ax1.grid(True, linestyle='--', alpha=0.3)
-            ax1.tick_params(axis='y', colors='white')
-            
-            # Customers Plot
-            ax2.plot(df_chart['ds'], df_chart['forecast_customers'], color='#ffc72c', marker='o', linestyle='-', label='Predicted Customers')
+            ax2.plot(df_chart['ds'], df_chart['forecast_customers'], color='#ffc72c', marker='o', linestyle='-')
             ax2.set_title('Predicted Customers', fontsize=16, color='white')
-            ax2.set_ylabel('Number of Customers', color='white')
-            ax2.grid(True, linestyle='--', alpha=0.3)
-            ax2.tick_params(axis='y', colors='white')
-
-            # ATV Plot
-            ax3.plot(df_chart['ds'], df_chart['forecast_atv'], color='#4caf50', marker='o', linestyle='-', label='Predicted ATV')
+            ax3.plot(df_chart['ds'], df_chart['forecast_atv'], color='#4caf50', marker='o', linestyle='-')
             ax3.set_title('Predicted Average Transaction Value (ATV)', fontsize=16, color='white')
-            ax3.set_ylabel('ATV (₱)', color='white')
+
+            for ax in [ax1, ax2, ax3]:
+                ax.grid(True, linestyle='--', alpha=0.3)
+                ax.tick_params(axis='y', colors='white')
             ax3.tick_params(axis='x', colors='white', rotation=45)
-            ax3.tick_params(axis='y', colors='white')
-            ax3.grid(True, linestyle='--', alpha=0.3)
 
             fig.tight_layout(pad=3.0)
             st.pyplot(fig)
@@ -212,22 +197,19 @@ if db:
     # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts by providing the model with better historical context.")
+        st.info("Here you can correct the 'Day Type' for past dates.")
         
-        historical_df_edit, _ = get_data(db) # Use cached data
+        historical_df_edit, _ = get_data(db)
         
         if not historical_df_edit.empty:
             recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
-            st.warning("Note: Editing data will not reflect in forecasts until the models are re-trained. Use the 'Force model re-training' checkbox in the sidebar after making significant changes.")
+            st.warning("Note: Editing data will not reflect in forecasts until the next time you click 'Generate Forecast'.")
             for _, row in recent_df.iterrows():
-                # This part requires the render_historical_record function, which was in your original code
-                # Adding it back here for completeness
-                if 'doc_id' in row and not pd.isna(row['doc_id']):
+                if 'doc_id' in row and row['doc_id'] and not pd.isna(row['doc_id']):
                     date_str = row['date'].strftime('%B %d, %Y')
                     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
                     with st.expander(expander_title):
                         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
-                            st.markdown("**Edit Record**")
                             day_type_options = ["Normal Day", "Not Normal Day"]
                             current_day_type = row.get('day_type', 'Normal Day')
                             current_index = day_type_options.index(current_day_type) if current_day_type in day_type_options else 0
