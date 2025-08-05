@@ -1,14 +1,14 @@
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
 streamlit==1.35.0
 pandas==2.2.2
-scikit-learn==1.4.2
+scikit-learn==1.5.0
 firebase-admin==6.5.0
-plotly==5.22.0
-matplotlib==3.9.0
 requests==2.31.0
 PyYAML==6.0.1
-torch==2.1.2
-pytorch-lightning==2.0.9
-pytorch-forecasting==1.0.0
-
+lightgbm==4.4.0
+xgboost==2.1.0
+optuna==3.6.1
+plotly==5.22.0
+matplotlib==3.9.0
+torch==2.3.0
+pytorch-lightning==2.2.5
+pytorch-forecasting==0.10.3
