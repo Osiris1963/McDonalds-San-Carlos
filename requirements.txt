@@ -1,14 +1,15 @@
+# requirements.txt (Corrected for Cloud Deployment)
 streamlit==1.35.0
 pandas==2.2.2
 scikit-learn==1.5.0
 firebase-admin==6.5.0
 requests==2.31.0
 PyYAML==6.0.1
-lightgbm==4.4.0
-xgboost==2.1.0
-optuna==3.6.1
 plotly==5.22.0
 matplotlib==3.9.0
-torch==2.3.0
+
+# --- Core Dependencies for TFT (CPU-Specific) ---
+# We point to the CPU-specific index for torch to ensure a smaller, compatible installation
+torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
 pytorch-lightning==2.2.5
 pytorch-forecasting==0.10.3
