@@ -1,13 +1,9 @@
 # data_processing.py
-
 import pandas as pd
 import numpy as np
-from pytorch_forecasting import TimeSeriesDataSet
 
 def load_from_firestore(db_client, collection_name):
-    """
-    Loads and preprocesses data from a Firestore collection.
-    """
+    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
     if db_client is None:
         return pd.DataFrame()
     
@@ -29,11 +25,14 @@ def load_from_firestore(db_client, collection_name):
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
     
+    # Standardize timezone-aware to timezone-naive UTC and normalize to midnight
+    if pd.api.types.is_datetime64_any_dtype(df['date']):
+        if df['date'].dt.tz is not None:
+            df['date'] = df['date'].dt.tz_convert(None)
+        df['date'] = df['date'].dt.normalize()
+
     df.sort_values(by='date', inplace=True)
     df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
-    if pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = df['date'].dt.tz_localize(None).dt.normalize()
     
     numeric_cols = ['sales', 'customers', 'add_on_sales']
     for col in numeric_cols:
@@ -42,77 +41,70 @@ def load_from_firestore(db_client, collection_name):
 
     return df.sort_values(by='date').reset_index(drop=True)
 
-def prepare_data_for_tft(historical_df, events_df, periods_to_forecast):
+def create_advanced_features(df, events_df):
     """
-    Transforms raw data into a TimeSeriesDataSet for the Temporal Fusion Transformer.
+    Creates a rich feature set for a unified Gradient Boosting model from the full time series.
     """
-    df = historical_df.copy()
+    df_copy = df.copy()
 
-    df['month'] = df['date'].dt.month.astype(str)
-    df['dayofweek'] = df['date'].dt.dayofweek.astype(str)
-    df['dayofyear'] = df['date'].dt.dayofyear
-    df['year'] = df['date'].dt.year
-    df['is_payday_period'] = df['date'].apply(
+    # --- Foundational Metrics ---
+    # Calculate ATV more safely before creating features
+    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    customers_safe = df_copy['customers'].replace(0, np.nan)
+    df_copy['atv'] = (base_sales / customers_safe)
+
+    # --- Time-Based Features ---
+    df_copy['month'] = df_copy['date'].dt.month
+    df_copy['day'] = df_copy['date'].dt.day
+    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek # Monday=0, Sunday=6
+    df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
+    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('int')
+    df_copy['year'] = df_copy['date'].dt.year
+    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
+
+    # --- Cyclical & Event Features ---
+    df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
-    )
+    ).astype(int)
+    df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
+    df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
 
+    # --- Advanced Time Series Features ---
+    target_vars = ['sales', 'customers', 'atv']
+    
+    # 1. Lag Features (Recent History)
+    lag_days = [1, 2, 7, 14] 
+    for var in target_vars:
+        for lag in lag_days:
+            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+
+    # 2. Rolling Window Features (Momentum)
+    windows = [7, 14]
+    for var in target_vars:
+        for w in windows:
+            # Shift by 1 to ensure we only use past data for the rolling window
+            series_shifted = df_copy[var].shift(1)
+            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+
+    # 3. Fourier Terms (Complex Seasonality)
+    df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
+    df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
+    df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
+    df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
+    
+    # --- External Regressors (Events & Holidays) ---
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
-        df = pd.merge(df, events_df_unique[['date', 'activity_name']], on='date', how='left')
-        df['is_event'] = df['activity_name'].notna().astype(int)
-        df.drop(columns=['activity_name'], inplace=True)
+        df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event')
+        df_copy['is_event'] = (df_copy['is_event'] == 'both').astype(int)
     else:
-        df['is_event'] = 0
+        df_copy['is_event'] = 0
 
-    if 'day_type' in df.columns:
-        df['is_not_normal_day'] = (df['day_type'] == 'Not Normal Day').astype(int)
+    if 'day_type' in df_copy.columns:
+        df_copy['is_not_normal_day'] = (df_copy['day_type'] == 'Not Normal Day').astype(int)
     else:
-        df['is_not_normal_day'] = 0
-
-    base_sales = df['sales'] - df.get('add_on_sales', 0)
-    customers_safe = df['customers'].replace(0, np.nan)
-    df['atv'] = (base_sales / customers_safe).fillna(method='ffill').fillna(0)
-    
-    df['group_id'] = "main_store"
-    df['time_idx'] = (df['date'] - df['date'].min()).dt.days
-
-    last_date = df['date'].max()
-    future_data = pd.DataFrame({
-        'date': pd.to_datetime([last_date + pd.DateOffset(days=x) for x in range(1, periods_to_forecast + 1)]),
-        'group_id': 'main_store',
-    })
-    future_data['time_idx'] = (future_data['date'] - df['date'].min()).dt.days
-    future_data['month'] = future_data['date'].dt.month.astype(str)
-    future_data['dayofweek'] = future_data['date'].dt.dayofweek.astype(str)
-    future_data['year'] = future_data['date'].dt.year
-    future_data['is_payday_period'] = future_data['date'].apply(
-        lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
-    )
-    if events_df is not None and not events_df.empty:
-         future_data = pd.merge(future_data, events_df[['date', 'activity_name']], on='date', how='left')
-         future_data['is_event'] = future_data['activity_name'].notna().astype(int)
-         future_data.drop(columns=['activity_name'], inplace=True)
-    else:
-        future_data['is_event'] = 0
-    
-    df_for_loader = pd.concat([df, future_data], ignore_index=True)
-    df_for_loader.fillna(0, inplace=True)
-
-    max_encoder_length = 60
-    
-    dataset = TimeSeriesDataSet(
-        df_for_loader[lambda x: x.time_idx <= df['time_idx'].max()],
-        time_idx="time_idx",
-        target=["customers", "atv"],
-        group_ids=["group_id"],
-        max_encoder_length=max_encoder_length,
-        max_prediction_length=periods_to_forecast,
-        static_categoricals=["group_id"],
-        time_varying_known_categoricals=["month", "dayofweek"],
-        time_varying_known_reals=["time_idx", "is_payday_period", "is_event"],
-        time_varying_unknown_reals=["customers", "atv", "sales"],
-        allow_missing_timesteps=True,
-    )
-    
-    return dataset
+        df_copy['is_not_normal_day'] = 0
+        
+    return df_copy.fillna(0)
