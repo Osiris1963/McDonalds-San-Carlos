@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # --- Import from our new, separated modules ---
-from data_processing import load_from_firestore, prepare_data_for_nbeats
+from data_processing import load_from_firestore
 from forecasting import generate_nbeats_forecast
 
 # --- Page Configuration and Styling ---
@@ -20,7 +20,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Custom CSS (same as before) ---
+# --- Custom CSS ---
 def apply_custom_styling():
     st.markdown("""
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
@@ -52,13 +52,25 @@ def apply_custom_styling():
     </style>
     """, unsafe_allow_html=True)
 
-# --- Firestore Initialization ---
+# --- Firestore Initialization (Corrected Version) ---
 @st.cache_resource
 def init_firestore():
-    """Initializes a connection to Firestore using Streamlit Secrets."""
+    """Initializes a connection to Firestore using structured Streamlit Secrets."""
     try:
         if not firebase_admin._apps:
-            creds_dict = st.secrets.firebase_credentials
+            creds_dict = {
+              "type": st.secrets.firebase_credentials.type,
+              "project_id": st.secrets.firebase_credentials.project_id,
+              "private_key_id": st.secrets.firebase_credentials.private_key_id,
+              "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
+              "client_email": st.secrets.firebase_credentials.client_email,
+              "client_id": st.secrets.firebase_credentials.client_id,
+              "auth_uri": st.secrets.firebase_credentials.auth_uri,
+              "token_uri": st.secrets.firebase_credentials.token_uri,
+              "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
+              "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url,
+              "universe_domain": st.secrets.firebase_credentials.universe_domain
+            }
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
         return firestore.client()
@@ -200,9 +212,35 @@ if db:
     # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
-        # This section remains the same as it's independent of the forecasting model
+        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts by providing the model with better historical context.")
+        
         historical_df_edit, _ = get_data(db) # Use cached data
-        # ... [The existing render_historical_record logic would go here]
-        st.info("Functionality for editing historical data remains unchanged.")
+        
+        if not historical_df_edit.empty:
+            recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
+            st.warning("Note: Editing data will not reflect in forecasts until the models are re-trained. Use the 'Force model re-training' checkbox in the sidebar after making significant changes.")
+            for _, row in recent_df.iterrows():
+                # This part requires the render_historical_record function, which was in your original code
+                # Adding it back here for completeness
+                if 'doc_id' in row and not pd.isna(row['doc_id']):
+                    date_str = row['date'].strftime('%B %d, %Y')
+                    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+                    with st.expander(expander_title):
+                        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
+                            st.markdown("**Edit Record**")
+                            day_type_options = ["Normal Day", "Not Normal Day"]
+                            current_day_type = row.get('day_type', 'Normal Day')
+                            current_index = day_type_options.index(current_day_type) if current_day_type in day_type_options else 0
+                            
+                            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
+                            
+                            if st.form_submit_button("💾 Update Day Type", use_container_width=True):
+                                update_data = {'day_type': updated_day_type}
+                                db.collection('historical_data').document(row['doc_id']).update(update_data)
+                                st.success(f"Record for {date_str} updated!")
+                                st.cache_data.clear()
+                                time.sleep(1); st.rerun()
+        else:
+            st.info("No historical data found.")
 else:
     st.error("Could not connect to Firestore. Please check your configuration and network.")
