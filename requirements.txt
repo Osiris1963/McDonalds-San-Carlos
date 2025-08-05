@@ -1,7 +1,10 @@
 streamlit==1.35.0
-pandas==2.2.2
+pandas==2.1.4
 scikit-learn==1.5.0
 firebase-admin==6.5.0
 plotly==5.22.0
-gluonts[torch]==0.14.3
+gluonts==0.14.3
 pytorch-lightning==2.2.5
+torch==2.1.2
+torchvision==0.16.2
+torchaudio==2.1.2
