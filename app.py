@@ -11,7 +11,7 @@ from data_processing import load_from_firestore
 from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
-st.set_page_config(page_title="AI Forecaster v5.4 Final", layout="wide")
+st.set_page_config(page_title="AI Forecaster v5.5 Final", layout="wide")
 
 # --- Firestore Initialization (This is now stable and correct) ---
 @st.cache_resource
@@ -61,7 +61,6 @@ def render_historical_record(row, db_client):
                 update_data = {'day_type': updated_day_type}
                 db_client.collection('historical_data').document(row['doc_id']).update(update_data)
                 st.success(f"Record for {date_str} updated successfully!")
-                # Clear caches to force a data refresh on the next run
                 st.cache_data.clear()
                 time.sleep(1)
                 st.rerun()
@@ -78,7 +77,7 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.4")
+        st.title("AI Forecaster v5.5")
         st.info("Robust Engine - Production Build")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
@@ -87,39 +86,73 @@ if db:
             st.success("Caches cleared. Rerunning...")
             time.sleep(1); st.rerun()
 
+        # --- THIS IS THE CORRECTED AND FULLY IMPLEMENTED BUTTON LOGIC ---
         if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
-            # ... Forecast generation logic ...
-            pass # This part is correct and unchanged
+            historical_df = load_from_firestore(db, 'historical_data')
+            events_df = load_from_firestore(db, 'future_activities')
+
+            if len(historical_df) < 90:
+                st.error("Need at least 90 days of data for a reliable forecast.")
+            else:
+                with st.spinner("🧠 AI Engine is generating the forecast... (This may take a few minutes)"):
+                    try:
+                        forecast_df, model = generate_forecast(historical_df, events_df, periods=15)
+                        st.session_state.forecast_df = forecast_df
+                        st.session_state.model = model
+                        st.success("Forecast Generated Successfully!")
+                    except Exception as e:
+                        st.error(f"An error occurred during forecast generation: {e}")
 
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Edit Data"]
     tabs = st.tabs(tab_list)
 
     with tabs[0]:
-        # ... Dashboard tab logic is correct and unchanged ...
-        pass
-    
-    with tabs[1]:
-        # ... Insights tab logic is correct and unchanged ...
-        pass
+        st.header("🔮 Forecast Dashboard")
+        if not st.session_state.forecast_df.empty:
+            df = st.session_state.forecast_df
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=df['ds'], y=df['predicted_customers'], mode='lines+markers',
+                line=dict(color='#c8102e', width=3), name='Predicted Customers'
+            ))
+            fig.update_layout(title="Customer Forecast", yaxis_title="Predicted Customers")
+            st.plotly_chart(fig, use_container_width=True)
+            display_df = df[['ds', 'predicted_customers', 'predicted_atv', 'predicted_sales']].rename(columns={
+                'ds': 'Date', 'predicted_customers': 'Predicted Customers',
+                'predicted_atv': 'Predicted Avg Sale (₱)', 'predicted_sales': 'Predicted Sales (₱)'
+            }).set_index('Date')
+            st.dataframe(display_df, use_container_width=True)
+        else:
+            st.info("Click 'Generate Forecast' in the sidebar to view your sales prediction.")
 
-    # --- THIS IS THE CORRECTED "EDIT DATA" TAB ---
+    with tabs[1]:
+        st.header("💡 Forecast Insights")
+        st.info("This shows the general importance of different features to the model's predictions.")
+        if st.session_state.model:
+            model = st.session_state.model
+            try:
+                val_dataloader = model.val_dataloader()
+                if val_dataloader is not None:
+                    importance = model.evaluate(val_dataloader, verbose=False)
+                    fig = model.plot_variable_importances(importance)
+                    st.pyplot(fig)
+                else:
+                    st.warning("Could not create validation dataloader for insights.")
+            except Exception as e:
+                st.error(f"Could not generate feature importance plot. Details: {e}")
+        else:
+            st.info("Generate a forecast to see the key drivers of customer behavior.")
+
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts by teaching the model about unusual days.")
-        
+        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts.")
         @st.cache_data
         def get_historical_data_for_editing(_db_client):
-            """Cached function to fetch data specifically for the editing tab."""
             return load_from_firestore(_db_client, 'historical_data')
 
-        # Fetch the data using the cached function
         historical_df_edit = get_historical_data_for_editing(db)
-        
         if not historical_df_edit.empty:
-            # Display the most recent 30 days for editing
             recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
-            
-            # Loop through the dataframe and render the editable record for each row
             for _, row in recent_df.iterrows():
                 render_historical_record(row, db)
         else:
