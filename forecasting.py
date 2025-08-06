@@ -9,7 +9,7 @@ from data_processing import prepare_data_for_tft, create_tft_dataset
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 def _parse_tft_predictions(prediction_output, last_date, periods):
-    preds = prediction_output[0].numpy()
+    preds = prediction_output.prediction[0].numpy()
     dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
     forecast_df = pd.DataFrame({'ds': dates, 'predicted_customers': preds})
     forecast_df['predicted_customers'] = forecast_df['predicted_customers'].clip(lower=0).round().astype(int)
@@ -26,15 +26,8 @@ def generate_forecast(historical_df, events_df, periods=15):
 
     pl.seed_everything(42)
 
-    # Define a callback to save the best model based on validation loss
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        filename="best-model"
-    )
+    checkpoint_callback = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename="best-model")
 
-    # Use the syntax for PyTorch Lightning v1.9.5
     trainer = pl.Trainer(
         max_epochs=20,
         enable_model_summary=False,
