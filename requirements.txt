@@ -2,7 +2,8 @@ streamlit==1.35.0
 pandas==2.2.2
 firebase-admin==6.5.0
 torch==2.1.2
-pytorch-lightning==2.1.4
+pytorch-lightning==1.9.5
+torchmetrics==0.11.4 
 pytorch-forecasting==1.0.0
 jsonargparse==4.27.1
 plotly==5.22.0
