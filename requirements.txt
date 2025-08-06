@@ -1,22 +1,16 @@
-# requirements.txt
-# Final, stable configuration for compatibility
-
-# Core App & Data
 streamlit==1.35.0
 pandas==2.2.2
+scikit-learn==1.5.0
 firebase-admin==6.5.0
-
-# AI & Forecasting Engine (Aligned, Compatible Stack)
-# Downgrading lightning to a version compatible with pytorch-forecasting==1.0.0
-torch==2.1.2
-pytorch-lightning==1.9.5
-torchmetrics==0.11.4 
-# pytorch-forecasting requires torchmetrics < 1.0 with older lightning
-
-pytorch-forecasting==1.0.0
-jsonargparse==4.27.1
-
-# Visualization
+requests==2.31.0
+PyYAML==6.0.1
+lightgbm==4.4.0
+xgboost==2.1.0
+optuna==3.6.1
 plotly==5.22.0
 matplotlib==3.9.0
-seaborn==0.13.2
+
+# --- NEW ADDITIONS ---
+u8darts==0.27.0          # Time series forecasting models (PatchTST, Transformer, etc.)
+torch==2.3.0             # Required backend for Darts
+shap==0.45.0             # Model explainability (optional but powerful)
