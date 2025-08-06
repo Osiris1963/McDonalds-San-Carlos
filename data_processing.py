@@ -1,9 +1,11 @@
 # data_processing.py
 import pandas as pd
 import numpy as np
+import torch
+from pytorch_forecasting import TimeSeriesDataSet
 
 def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
+    """Loads and preprocesses data from a Firestore collection. (No changes needed here)"""
     if db_client is None:
         return pd.DataFrame()
     
@@ -40,75 +42,67 @@ def load_from_firestore(db_client, collection_name):
 
     return df.sort_values(by='date').reset_index(drop=True)
 
-def create_advanced_features(df, events_df):
+def prepare_data_for_tft(df, events_df):
     """
-    Creates a rich feature set for a unified Gradient Boosting model from the full time series.
+    Takes raw dataframes and engineers features suitable for the TFT model.
+    This replaces the old 'create_advanced_features' function.
     """
     df_copy = df.copy()
 
-    # --- Foundational Metrics (Cleansed) ---
-    customers_safe = df_copy['customers'].replace(0, np.nan)
-    
-    # Calculate ATV based ONLY on base sales to remove outlier impact.
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-    df_copy['atv'] = (base_sales / customers_safe)
-
-    # --- Time-Based Features ---
-    df_copy['month'] = df_copy['date'].dt.month
-    df_copy['day'] = df_copy['date'].dt.day
-    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
+    # --- Basic Time Features ---
+    df_copy['month'] = df_copy['date'].dt.month.astype(str)
+    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek.astype(str)
     df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
-    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('int')
-    df_copy['year'] = df_copy['date'].dt.year
-    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
+    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype(int)
 
-    # --- Cyclical & Event Features ---
+    # --- Event & Holiday Features (Known in Advance) ---
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
-    ).astype(int)
-    df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
-    df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
+    )
+    df_copy['is_weekend'] = (df_copy['date'].dt.dayofweek >= 5).astype(int)
 
-    # --- Handle Categorical Weather Data ---
-    if 'weather' in df_copy.columns:
-        df_copy['weather'] = df_copy['weather'].fillna('Unknown')
-        weather_dummies = pd.get_dummies(df_copy['weather'], prefix='weather', dtype=int)
-        df_copy = pd.concat([df_copy, weather_dummies], axis=1)
-        df_copy.drop('weather', axis=1, inplace=True)
-
-    # --- Advanced Time Series Features ---
-    # Using a focused list of variables for lag/rolling features
-    target_vars = ['sales', 'customers', 'atv']
-    
-    lag_days = [1, 2, 7, 14] 
-    for var in target_vars:
-        for lag in lag_days:
-            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
-
-    windows = [7, 14]
-    for var in target_vars:
-        for w in windows:
-            series_shifted = df_copy[var].shift(1)
-            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
-
-    df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
-    df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
-    df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
-    df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
-    
-    # --- External Regressors (Events & Holidays) ---
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
-        df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event')
-        df_copy['is_event'] = (df_copy['is_event'] == 'both').astype(int)
+        df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event_merge')
+        df_copy['is_event'] = (df_copy['is_event_merge'] == 'both').astype(int)
+        df_copy.drop('is_event_merge', axis=1, inplace=True)
     else:
         df_copy['is_event'] = 0
 
-    if 'day_type' in df_copy.columns:
-        df_copy['is_not_normal_day'] = (df_copy['day_type'] == 'Not Normal Day').astype(int)
-    else:
-        df_copy['is_not_normal_day'] = 0
-        
-    return df_copy.fillna(0)
+    # --- Mandatory TFT Columns ---
+    # The time_idx is a continuous integer representing time steps
+    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
+    # The group_id identifies the time series. Here, we only have one.
+    df_copy['group_id'] = "Store_1"
+
+    # --- Target Variable ---
+    # We will forecast customers. Sales will be derived from customers * predicted ATV.
+    df_copy['customers'] = df_copy['customers'].astype(float)
+
+    # Impute ATV where customers is 0 to avoid division by zero errors
+    customers_safe = df_copy['customers'].replace(0, np.nan)
+    df_copy['atv'] = (df_copy['sales'] / customers_safe).fillna(method='ffill').fillna(0)
+
+    return df_copy
+
+def create_tft_dataset(data, max_encoder_length, max_prediction_length):
+    """
+    Creates the TimeSeriesDataSet object for PyTorch Forecasting.
+    """
+    return TimeSeriesDataSet(
+        data,
+        time_idx="time_idx",
+        target="customers",
+        group_ids=["group_id"],
+        max_encoder_length=max_encoder_length,  # How much history to use for prediction
+        max_prediction_length=max_prediction_length, # How far to predict
+        static_categoricals=["group_id"],
+        # Features that change over time and are known in the future (e.g., holidays, day of week)
+        time_varying_known_categoricals=["month", "dayofweek"],
+        time_varying_known_reals=["is_payday_period", "is_weekend", "is_event", "dayofyear", "weekofyear"],
+        # Features that change over time but are not known in the future (our targets and related values)
+        time_varying_unknown_reals=["customers", "atv", "sales"],
+        allow_missing_timesteps=True,
+        target_normalizer=None # We will handle normalization manually if needed
+    )
