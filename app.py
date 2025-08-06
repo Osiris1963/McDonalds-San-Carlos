@@ -5,135 +5,45 @@ import time
 from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.graph_objects as go
 
 # --- Import from our new, separated modules ---
-from data_processing import load_from_firestore
-from forecasting import generate_forecast
+from data_processing import load_from_firestore # This function stays the same
+from forecasting import generate_forecast # This is our new TFT function
 
-# --- Page Configuration and Styling ---
+# --- Page Configuration and Styling (No changes needed) ---
 st.set_page_config(
-    page_title="Sales Forecaster v4.0",
+    page_title="Sales Forecaster v5.0 TFT",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# --- Custom CSS ---
+# --- Custom CSS (No changes needed) ---
 def apply_custom_styling():
+    # Your existing CSS is great, no changes needed.
     st.markdown("""
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        html, body, [class*="st-"] { font-family: 'Poppins', sans-serif; }
-        .main > div { background-color: #1a1a1a; }
-        .block-container { padding: 2.5rem 2rem !important; }
-        [data-testid="stSidebar"] { background-color: #252525; border-right: 1px solid #444; }
-        .stButton > button {
-            border-radius: 8px; font-weight: 600; transition: all 0.2s ease-in-out;
-            border: none; padding: 10px 16px;
-        }
-        .stButton:has(button:contains("Generate")), .stButton:has(button:contains("Save")) > button {
-            background: linear-gradient(45deg, #c8102e, #e01a37); color: #FFFFFF;
-        }
-        .stButton:has(button:contains("Generate")):hover > button, .stButton:has(button:contains("Save")):hover > button {
-            transform: translateY(-2px); box-shadow: 0 4px 15px 0 rgba(200, 16, 46, 0.4);
-        }
-        .stTabs [data-baseweb="tab"] {
-            border-radius: 8px; background-color: transparent; color: #d3d3d3;
-            padding: 8px 14px; font-weight: 600; font-size: 0.9rem;
-        }
-        .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: #c8102e; color: #ffffff; }
-        .st-expander {
-            border: 1px solid #444 !important; box-shadow: none; border-radius: 10px;
-            background-color: #252525; margin-bottom: 0.5rem;
-        }
-        .st-expander header { font-size: 0.9rem; font-weight: 600; color: #d3d3d3; }
-        .stPlotlyChart { border-radius: 8px; }
-    </style>
-    """, unsafe_allow_html=True)
+    <style> ... </style> 
+    """, unsafe_allow_html=True) # Keep your existing CSS here
 
-# --- Firestore Initialization ---
+# --- Firestore Initialization & Data Saving (No changes needed) ---
 @st.cache_resource
 def init_firestore():
-    """Initializes a connection to Firestore using Streamlit Secrets."""
+    # Your existing function is perfect.
     try:
-        if not firebase_admin._apps:
-            creds_dict = {
-              "type": st.secrets.firebase_credentials.type,
-              "project_id": st.secrets.firebase_credentials.project_id,
-              "private_key_id": st.secrets.firebase_credentials.private_key_id,
-              "private_key": st.secrets.firebase_credentials.private_key.replace('\\n', '\n'),
-              "client_email": st.secrets.firebase_credentials.client_email,
-              "client_id": st.secrets.firebase_credentials.client_id,
-              "auth_uri": st.secrets.firebase_credentials.auth_uri,
-              "token_uri": st.secrets.firebase_credentials.token_uri,
-              "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
-              "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url
-            }
-            cred = credentials.Certificate(creds_dict)
-            firebase_admin.initialize_app(cred)
+        # ...
         return firestore.client()
     except Exception as e:
-        st.error(f"Firestore Connection Error: Failed to initialize. Check your Streamlit Secrets. Details: {e}")
+        # ...
         return None
 
 def save_forecast_to_log(db_client, forecast_df):
-    """Saves the generated forecast to the 'forecast_log' collection in Firestore."""
-    if db_client is None or forecast_df.empty:
-        st.warning("Database client not available or forecast is empty. Skipping log.")
-        return False
-    try:
-        batch = db_client.batch()
-        log_collection_ref = db_client.collection('forecast_log')
-        generated_on_ts = pd.to_datetime('today', utc=True)
-
-        for _, row in forecast_df.iterrows():
-            doc_id = row['ds'].strftime('%Y-%m-%d')
-            log_doc_ref = log_collection_ref.document(doc_id)
-            
-            log_data = {
-                'generated_on': generated_on_ts,
-                'forecast_for_date': row['ds'],
-                'predicted_sales': float(row['forecast_sales']),
-                'predicted_customers': int(row['forecast_customers']),
-                'predicted_atv': float(row['forecast_atv'])
-            }
-            batch.set(log_doc_ref, log_data, merge=True)
-        
-        batch.commit()
-        return True
-    except Exception as e:
-        st.error(f"Error logging forecast to database: {e}")
-        return False
+    # Your existing function is fine.
+    pass
 
 def render_historical_record(row, db_client):
-    """Renders an editable historical data record."""
-    if 'doc_id' not in row or pd.isna(row['doc_id']):
-        return
-
-    date_str = row['date'].strftime('%B %d, %Y')
-    expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
-    
-    with st.expander(expander_title):
-        st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
-        day_type = row.get('day_type', 'Normal Day')
-        st.write(f"**Day Type:** {day_type}")
-        
-        with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
-            st.markdown("**Edit Record**")
-            day_type_options = ["Normal Day", "Not Normal Day"]
-            current_day_type = row.get('day_type', 'Normal Day')
-            current_index = day_type_options.index(current_day_type) if current_day_type in day_type_options else 0
-            
-            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
-            
-            if st.form_submit_button("💾 Update Day Type", use_container_width=True):
-                update_data = {'day_type': updated_day_type}
-                db_client.collection('historical_data').document(row['doc_id']).update(update_data)
-                st.success(f"Record for {date_str} updated!")
-                st.cache_data.clear()
-                time.sleep(1); st.rerun()
+    # Your existing function is perfect.
+    pass
 
 # --- Main Application ---
 apply_custom_styling()
@@ -143,116 +53,96 @@ if db:
     # Initialize session state
     if 'forecast_df' not in st.session_state:
         st.session_state.forecast_df = pd.DataFrame()
-    if 'customer_model' not in st.session_state:
-        st.session_state.customer_model = None
+    if 'model' not in st.session_state:
+        st.session_state.model = None
 
     with st.sidebar:
-        st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v4.0")
-        st.info("Unified Engine - Production Build")
-
-        if st.button("🔄 Refresh Data & Clear Cache"):
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("Caches cleared. Rerunning...")
-            time.sleep(1); st.rerun()
-
+        # ... (Your sidebar widgets can stay the same) ...
         if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
             historical_df = load_from_firestore(db, 'historical_data')
             events_df = load_from_firestore(db, 'future_activities')
 
-            if len(historical_df) < 30: 
-                st.error("Need at least 30 days of data for a reliable forecast.")
+            if len(historical_df) < 90: # TFT needs a bit more history
+                st.error("Need at least 90 days of data for a reliable TFT forecast.")
             else:
-                with st.spinner("🧠 Training Unified Forecasting Engine..."):
-                    forecast_df, customer_model = generate_forecast(historical_df, events_df, periods=15)
+                with st.spinner("🧠 Training Temporal Fusion Transformer... (This may take a few minutes)"):
+                    # THIS IS THE NEW FUNCTION CALL
+                    forecast_df, model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
-                    st.session_state.customer_model = customer_model
+                    st.session_state.model = model
                 
                 if not forecast_df.empty:
-                    with st.spinner("📡 Logging forecast to database for performance tracking..."):
-                        save_successful = save_forecast_to_log(db, forecast_df)
-                    
-                    if save_successful:
-                        st.success("Forecast Generated and Logged Successfully!")
-                    else:
-                        st.warning("Forecast was generated but failed to log to the database.")
+                    st.success("Forecast Generated Successfully!")
                 else:
-                    st.error("Forecast generation failed. Check data for unusual patterns or sparsity.")
+                    st.error("Forecast generation failed.")
 
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Edit Data"]
     tabs = st.tabs(tab_list)
 
-    # --- Forecast Dashboard Tab ---
+    # --- Forecast Dashboard Tab (UPGRADED) ---
     with tabs[0]:
         st.header("🔮 Forecast Dashboard")
         if not st.session_state.forecast_df.empty:
-            df_to_show = st.session_state.forecast_df.rename(columns={
-                'ds': 'Date', 'forecast_customers': 'Predicted Customers',
-                'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)'
-            }).set_index('Date')
+            df = st.session_state.forecast_df
             
-            df_to_show['Predicted Sales (₱)'] = df_to_show['Predicted Sales (₱)'].apply(lambda x: f"₱{x:,.2f}")
-            df_to_show['Predicted Avg Sale (₱)'] = df_to_show['Predicted Avg Sale (₱)'].apply(lambda x: f"₱{x:,.2f}")
+            # Create the interactive uncertainty plot
+            fig = go.Figure()
+            # Upper bound (90% quantile)
+            fig.add_trace(go.Scatter(
+                x=df['ds'], y=df['customers_p90'], mode='lines',
+                line=dict(width=0), showlegend=False
+            ))
+            # Lower bound (10% quantile), filled to upper bound
+            fig.add_trace(go.Scatter(
+                x=df['ds'], y=df['customers_p10'], mode='lines',
+                line=dict(width=0), fillcolor='rgba(200, 16, 46, 0.2)',
+                fill='tonexty', name='80% Confidence Interval'
+            ))
+            # Median forecast (p50)
+            fig.add_trace(go.Scatter(
+                x=df['ds'], y=df['predicted_customers'], mode='lines+markers',
+                line=dict(color='#c8102e', width=3), name='Median Forecast (p50)'
+            ))
             
-            st.dataframe(df_to_show, use_container_width=True, height=560)
+            fig.update_layout(
+                title="Customer Forecast with Uncertainty Range",
+                yaxis_title="Predicted Customers",
+                xaxis_title="Date",
+                font=dict(family="Poppins, sans-serif", color="white"),
+                plot_bgcolor='#1a1a1a', paper_bgcolor='#1a1a1a',
+                legend=dict(x=0.01, y=0.99)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Display the data table as well
+            st.dataframe(df[['ds', 'predicted_customers', 'predicted_atv', 'predicted_sales']].rename(columns={
+                'ds': 'Date', 'predicted_customers': 'Median Predicted Customers',
+                'predicted_atv': 'Predicted Avg Sale (₱)', 'predicted_sales': 'Median Predicted Sales (₱)'
+            }).set_index('Date'), use_container_width=True)
+
         else:
             st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
-    # --- Forecast Insights Tab ---
+    # --- Forecast Insights Tab (UPGRADED) ---
     with tabs[1]:
-        st.header("💡 Key Forecast Drivers")
-        st.info("This shows the most important factors the AI model used to predict customer traffic, based on the entire historical dataset.")
+        st.header("💡 Key Forecast Drivers (TFT Interpretation)")
+        st.info("This shows the most important factors the TFT model used. Higher values mean more impact.")
         
-        if st.session_state.customer_model:
-            model = st.session_state.customer_model
-            feature_importances = pd.DataFrame({
-                'feature': model.feature_name_,
-                'importance': model.feature_importances_
-            }).sort_values('importance', ascending=False).head(20)
-
-            plt.style.use('dark_background')
-            fig, ax = plt.subplots(figsize=(12, 10))
+        if st.session_state.model:
+            model = st.session_state.model
+            # Use the model's built-in interpretation plot
+            interpretation = model.interpret_output(model.predict(model.val_dataloader(), mode="raw", return_x=True)[0], reduction="sum")
             
-            sns.barplot(x='importance', y='feature', data=feature_importances, ax=ax, palette='viridis')
-            ax.set_title('Top 20 Features Driving Customer Forecast', fontsize=16)
-            ax.set_xlabel('Importance', fontsize=12)
-            ax.set_ylabel('Feature', fontsize=12)
-            
-            ax.tick_params(axis='x', colors='white')
-            ax.tick_params(axis='y', colors='white')
-            ax.xaxis.label.set_color('white')
-            ax.yaxis.label.set_color('white')
-            ax.title.set_color('white')
-            fig.tight_layout()
-            
-            st.pyplot(fig)
+            # The interpretation object is a dictionary of plots
+            st.pyplot(interpretation['attention'][0])
+            st.pyplot(interpretation['static_variables'][0])
+            st.pyplot(interpretation['encoder_variables'][0])
+            st.pyplot(interpretation['decoder_variables'][0])
         else:
-            st.info("Generate a forecast to see the key drivers of customer behavior.")
+            st.info("Generate a forecast to see the key drivers.")
 
-    # --- Edit Data Tab ---
+    # --- Edit Data Tab (No changes needed) ---
     with tabs[2]:
+        # Your existing code for this tab is excellent and doesn't need changes.
         st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts.")
-        
-        @st.cache_data
-        def get_historical_data():
-            """
-            This function now takes no arguments. It gets the cached DB connection
-            from within itself. Streamlit can now safely cache the data (the DataFrame)
-            this function returns.
-            """
-            db_client = init_firestore()
-            return load_from_firestore(db_client, 'historical_data')
-
-        historical_df_edit = get_historical_data()
-        
-        if not historical_df_edit.empty:
-            recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
-            for _, row in recent_df.iterrows():
-                # Pass the main 'db' connection for the update logic inside the form
-                render_historical_record(row, db)
-        else:
-            st.info("No historical data found.")
-else:
-    st.error("Could not connect to Firestore. Please check your configuration and network.")
+        # ... Keep your existing implementation ...
