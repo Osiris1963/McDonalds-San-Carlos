@@ -1,3 +1,4 @@
+
 # forecasting.py
 import pandas as pd
 import torch
@@ -54,13 +55,13 @@ def generate_forecast(historical_df, events_df, periods=15):
     )
 
     best_model_path = trainer.checkpoint_callback.best_model_path
-    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
-    
+    best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path, dataset=training_dataset)
+
     raw_predictions, x = best_tft.predict(val_dataloader, mode="raw", return_x=True)
 
     last_historical_date = historical_df['date'].max()
     final_forecast = _parse_tft_predictions(raw_predictions, last_historical_date, periods)
-    
+
     recent_atv_data = historical_df.tail(30)
     if recent_atv_data['customers'].sum() > 0:
         recent_atv = recent_atv_data['sales'].sum() / recent_atv_data['customers'].sum()
@@ -70,4 +71,4 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_forecast['predicted_atv'] = recent_atv
     final_forecast['predicted_sales'] = final_forecast['predicted_customers'] * final_forecast['predicted_atv']
 
-    return final_forecast, best_tft
+    return final_forecast, best_tft, val_dataloader
