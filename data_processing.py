@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 def load_from_firestore(db_client, collection_name):
     if db_client is None:
