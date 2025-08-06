@@ -9,8 +9,6 @@ xgboost==2.1.0
 optuna==3.6.1
 plotly==5.22.0
 matplotlib==3.9.0
-
-# --- NEW ADDITIONS ---
-u8darts==0.27.0          # Time series forecasting models (PatchTST, Transformer, etc.)
-torch==2.3.0             # Required backend for Darts
-shap==0.45.0             # Model explainability (optional but powerful)
+u8darts==0.27.0
+torch==2.3.0
+shap==0.45.0
