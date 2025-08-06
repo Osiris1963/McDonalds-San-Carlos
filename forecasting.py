@@ -1,114 +1,92 @@
 # forecasting.py
 import pandas as pd
-import lightgbm as lgb
+import torch
+import pytorch_lightning as pl
+from pytorch_forecasting import TemporalFusionTransformer, QuantileLoss
 from datetime import timedelta
-from data_processing import create_advanced_features
+from data_processing import prepare_data_for_tft, create_tft_dataset
+
+def _parse_tft_predictions(prediction_output, last_date, periods):
+    """Helper function to format TFT predictions into a clean DataFrame."""
+    # The model returns predictions for all quantiles. We extract them.
+    # The shape is (batch_size, time_steps, quantiles)
+    preds = prediction_output.prediction[0]
+    
+    # Get the dates for the forecast horizon
+    dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
+    
+    # Create the DataFrame
+    forecast_df = pd.DataFrame({
+        'ds': dates,
+        # Quantiles are at indices: 0 (p10), 1 (p25), 2 (p50), 3 (p75), 4 (p90)
+        'customers_p10': preds[:, 0].numpy(),
+        'customers_p50': preds[:, 2].numpy(), # p50 is the median forecast
+        'customers_p90': preds[:, 4].numpy()
+    })
+
+    # Clip and round for realistic business values
+    forecast_df['predicted_customers'] = forecast_df['customers_p50'].clip(lower=0).round().astype(int)
+    
+    return forecast_df
 
 def generate_forecast(historical_df, events_df, periods=15):
     """
-    Generates a forecast using a two-stage, unified LightGBM model
-    with a recursive strategy for multi-step forecasting.
+    Generates a forecast using the Temporal Fusion Transformer.
+    This replaces the old LightGBM recursive strategy.
     """
-    # --- 1. Model Training ---
+    # --- 1. Data Preparation ---
+    df_prepared = prepare_data_for_tft(historical_df, events_df)
     
-    # Create a rich feature set from all historical data
-    df_featured = create_advanced_features(historical_df, events_df)
-    
-    # Drop initial rows where rolling features couldn't be computed
-    # This ensures the model trains on high-quality, complete data
-    train_df = df_featured.dropna(subset=['sales_rolling_mean_14']).reset_index(drop=True)
-    
-    # Define features and targets
-    FEATURES = [col for col in train_df.columns if col not in [
-        'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes'
-    ]]
-    TARGET_CUST = 'customers'
-    TARGET_ATV = 'atv'
+    # We use ~60 days of history to predict the next 15 days
+    max_encoder_length = 60
+    max_prediction_length = periods
 
-    # --- THIS IS THE CORRECTED SECTION ---
-    # Define model parameters with scikit-learn compatible keys
-    lgbm_params = {
-        'objective': 'regression_l1',
-        'metric': 'rmse',
-        'n_estimators': 1000,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
-        'reg_alpha': 0.1,      # Corrected from 'lambda_l1'
-        'reg_lambda': 0.1,     # Corrected from 'lambda_l2'
-        'num_leaves': 31,
-        'verbose': -1,
-        'n_jobs': -1,
-        'seed': 42,
-        'boosting_type': 'gbdt',
-    }
+    # --- 2. Create TFT Dataset and Dataloader ---
+    training_dataset = create_tft_dataset(df_prepared, max_encoder_length, max_prediction_length)
+    train_dataloader = training_dataset.to_dataloader(train=True, batch_size=16, num_workers=0)
+
+    # --- 3. Initialize and Train the Model ---
+    # For reproducibility
+    pl.seed_everything(42)
+
+    # Define the trainer. For a real app, you might increase epochs.
+    # On Streamlit Cloud's free tier, keep epochs low to avoid timeouts.
+    trainer = pl.Trainer(
+        max_epochs=25,
+        accelerator="cpu",
+        gradient_clip_val=0.1,
+        logger=False # Disable logging to avoid creating log files on Streamlit
+    )
+
+    # Define the TFT model
+    tft = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        learning_rate=0.01,
+        hidden_size=32,
+        attention_head_size=4,
+        dropout=0.1,
+        hidden_continuous_size=16,
+        loss=QuantileLoss(quantiles=[0.1, 0.25, 0.5, 0.75, 0.9]), # Key for uncertainty
+        optimizer="AdamW"
+    )
+
+    # Train the model
+    trainer.fit(tft, train_dataloaders=train_dataloader)
+
+    # --- 4. Generate Predictions ---
+    # Create a dataloader for the single series we want to predict
+    pred_dataloader = training_dataset.to_dataloader(train=False, batch_size=1)
     
-    # Train the Customer Forecasting Model
-    model_cust = lgb.LGBMRegressor(**lgbm_params)
-    model_cust.fit(train_df[FEATURES], train_df[TARGET_CUST])
+    # Make the prediction
+    raw_predictions = tft.predict(pred_dataloader, mode="quantiles", return_x=True)
 
-    # Train the ATV Forecasting Model
-    model_atv = lgb.LGBMRegressor(**lgbm_params)
-    model_atv.fit(train_df[FEATURES], train_df[TARGET_ATV])
-
-    # --- 2. Recursive Forecasting ---
+    # --- 5. Finalize and Return ---
+    last_historical_date = historical_df['date'].max()
+    final_forecast = _parse_tft_predictions(raw_predictions, last_historical_date, periods)
     
-    future_predictions = []
-    # Start with a full copy of historical data to generate features for future steps
-    history_df = historical_df.copy()
-    last_date = history_df['date'].max()
+    # For simplicity, we'll use a stable, recent ATV to calculate sales
+    recent_atv = historical_df.tail(14)['sales'].sum() / historical_df.tail(14)['customers'].sum()
+    final_forecast['predicted_atv'] = recent_atv
+    final_forecast['predicted_sales'] = final_forecast['predicted_customers'] * final_forecast['predicted_atv']
 
-    for i in range(periods):
-        current_pred_date = last_date + timedelta(days=i + 1)
-        
-        # Create a placeholder for the day we want to predict
-        future_placeholder = pd.DataFrame([{'date': current_pred_date}])
-        
-        # Append placeholder to history to create features for it
-        temp_df = pd.concat([history_df, future_placeholder], ignore_index=True)
-        
-        # Create features for this combined dataframe
-        featured_for_pred = create_advanced_features(temp_df, events_df)
-        
-        # The last row contains the features for the day we need to predict
-        X_pred = featured_for_pred[FEATURES].iloc[-1:]
-
-        # Predict customers and ATV
-        pred_cust = model_cust.predict(X_pred)[0]
-        pred_atv = model_atv.predict(X_pred)[0]
-        
-        # Store the prediction
-        new_row = {
-            'date': current_pred_date,
-            'customers': pred_cust,
-            'atv': pred_atv,
-            'sales': pred_cust * pred_atv,
-            'add_on_sales': 0 # Assume 0 for future
-        }
-        future_predictions.append(new_row)
-        
-        # Append the completed prediction back to history_df.
-        # This makes the prediction for day N available for the feature calculation of day N+1.
-        history_df = pd.concat([history_df, pd.DataFrame([new_row])], ignore_index=True)
-
-    if not future_predictions:
-        return pd.DataFrame(), None
-
-    # --- 3. Finalize and Return ---
-    
-    final_forecast = pd.DataFrame(future_predictions)
-    final_forecast.rename(columns={
-        'date': 'ds',
-        'customers': 'forecast_customers',
-        'atv': 'forecast_atv',
-        'sales': 'forecast_sales'
-    }, inplace=True)
-    
-    # Clip and round for realistic business values
-    final_forecast['forecast_sales'] = final_forecast['forecast_sales'].clip(lower=0)
-    final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
-    final_forecast['forecast_atv'] = final_forecast['forecast_atv'].clip(lower=0)
-    
-    # Return the forecast and the customer model for feature importance plots
-    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], model_cust
+    return final_forecast, tft
