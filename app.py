@@ -1,18 +1,20 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 import firebase_admin
 from firebase_admin import credentials, firestore
-import plotly.graph_objs as go
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- Import from our new, separated modules ---
 from data_processing import load_from_firestore
-from forecasting_2025 import generate_forecast_2025 as generate_forecast
+from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v3.0",
+    page_title="Sales Forecaster v4.0",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -47,6 +49,7 @@ def apply_custom_styling():
             background-color: #252525; margin-bottom: 0.5rem;
         }
         .st-expander header { font-size: 0.9rem; font-weight: 600; color: #d3d3d3; }
+        .stPlotlyChart { border-radius: 8px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -76,19 +79,14 @@ def init_firestore():
         return None
 
 def save_forecast_to_log(db_client, forecast_df):
-    """
-    Saves the generated forecast to the 'forecast_log' collection in Firestore.
-    This version uses the forecast date (YYYY-MM-DD) as the document ID to ensure
-    the collection is always stored in chronological order.
-    """
+    """Saves the generated forecast to the 'forecast_log' collection in Firestore."""
     if db_client is None or forecast_df.empty:
         st.warning("Database client not available or forecast is empty. Skipping log.")
         return False
-
     try:
         batch = db_client.batch()
         log_collection_ref = db_client.collection('forecast_log')
-        generated_on_ts = pd.to_datetime('today').normalize()
+        generated_on_ts = pd.to_datetime('today', utc=True)
 
         for _, row in forecast_df.iterrows():
             doc_id = row['ds'].strftime('%Y-%m-%d')
@@ -101,7 +99,7 @@ def save_forecast_to_log(db_client, forecast_df):
                 'predicted_customers': int(row['forecast_customers']),
                 'predicted_atv': float(row['forecast_atv'])
             }
-            batch.set(log_doc_ref, log_data)
+            batch.set(log_doc_ref, log_data, merge=True)
         
         batch.commit()
         return True
@@ -121,16 +119,12 @@ def render_historical_record(row, db_client):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
         day_type = row.get('day_type', 'Normal Day')
         st.write(f"**Day Type:** {day_type}")
-        if day_type == 'Not Normal Day':
-            st.write(f"**Notes:** {row.get('day_type_notes', 'N/A')}")
-
+        
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             st.markdown("**Edit Record**")
             day_type_options = ["Normal Day", "Not Normal Day"]
             current_day_type = row.get('day_type', 'Normal Day')
-            if current_day_type not in day_type_options:
-                current_day_type = day_type_options[0] 
-            current_index = day_type_options.index(current_day_type)
+            current_index = day_type_options.index(current_day_type) if current_day_type in day_type_options else 0
             
             updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
             
@@ -146,33 +140,34 @@ apply_custom_styling()
 db = init_firestore()
 
 if db:
+    # Initialize session state
     if 'forecast_df' not in st.session_state:
         st.session_state.forecast_df = pd.DataFrame()
-    if 'prophet_model' not in st.session_state:
-        st.session_state.prophet_model = None
+    if 'customer_model' not in st.session_state:
+        st.session_state.customer_model = None
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v3.0")
-        st.info("Anti-Fragile Production Build")
+        st.title("AI Forecaster v4.0")
+        st.info("Unified Engine - Production Build")
 
-        if st.button("🔄 Refresh Data from Firestore"):
+        if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear()
-            st.success("Data refreshed. Rerunning...")
+            st.cache_resource.clear()
+            st.success("Caches cleared. Rerunning...")
             time.sleep(1); st.rerun()
 
         if st.button("📈 Generate Forecast", type="primary", use_container_width=True):
             historical_df = load_from_firestore(db, 'historical_data')
             events_df = load_from_firestore(db, 'future_activities')
 
-            if len(historical_df) < 50:
-                st.error("Need at least 50 days of data for a reliable forecast.")
+            if len(historical_df) < 30: 
+                st.error("Need at least 30 days of data for a reliable forecast.")
             else:
-                forecast_df = pd.DataFrame() 
-                with st.spinner("🧠 Running Day-Specific Specialist Models..."):
-                    forecast_df, prophet_model = generate_forecast(historical_df, events_df, periods=15)
+                with st.spinner("🧠 Training Unified Forecasting Engine..."):
+                    forecast_df, customer_model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
-                    st.session_state.prophet_model = prophet_model
+                    st.session_state.customer_model = customer_model
                 
                 if not forecast_df.empty:
                     with st.spinner("📡 Logging forecast to database for performance tracking..."):
@@ -188,41 +183,74 @@ if db:
     tab_list = ["🔮 Forecast Dashboard", "💡 Forecast Insights", "✍️ Edit Data"]
     tabs = st.tabs(tab_list)
 
+    # --- Forecast Dashboard Tab ---
     with tabs[0]:
         st.header("🔮 Forecast Dashboard")
         if not st.session_state.forecast_df.empty:
             df_to_show = st.session_state.forecast_df.rename(columns={
                 'ds': 'Date', 'forecast_customers': 'Predicted Customers',
                 'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)'
-            })
-            st.dataframe(df_to_show.set_index('Date'), use_container_width=True, height=560)
+            }).set_index('Date')
+            
+            df_to_show['Predicted Sales (₱)'] = df_to_show['Predicted Sales (₱)'].apply(lambda x: f"₱{x:,.2f}")
+            df_to_show['Predicted Avg Sale (₱)'] = df_to_show['Predicted Avg Sale (₱)'].apply(lambda x: f"₱{x:,.2f}")
+            
+            st.dataframe(df_to_show, use_container_width=True, height=560)
         else:
             st.info("Click 'Generate Forecast' in the sidebar to begin.")
 
+    # --- Forecast Insights Tab ---
     with tabs[1]:
-        st.header("💡 Forecast Insights")
-        st.warning("Component breakdown is derived from the last trained specialist model (typically Sunday) and is for general insight only. The final forecast is a composite of all seven specialist models.")
-        if st.session_state.prophet_model:
-            future = st.session_state.prophet_model.make_future_dataframe(periods=15)
-            # Filter for the specific day of the week of the last model
-            last_model_weekday = st.session_state.prophet_model.history['ds'].dt.dayofweek.iloc[-1]
-            future = future[future['ds'].dt.dayofweek == last_model_weekday]
-            if not future.empty:
-                forecast_components = st.session_state.prophet_model.predict(future)
-                fig = st.session_state.prophet_model.plot_components(forecast_components)
-                st.pyplot(fig)
-            else:
-                st.info("Not enough future dates for this specific day's component breakdown.")
-        else:
-            st.info("Generate a forecast to see the breakdown of its components.")
+        st.header("💡 Key Forecast Drivers")
+        st.info("This shows the most important factors the AI model used to predict customer traffic, based on the entire historical dataset.")
+        
+        if st.session_state.customer_model:
+            model = st.session_state.customer_model
+            feature_importances = pd.DataFrame({
+                'feature': model.feature_name_,
+                'importance': model.feature_importances_
+            }).sort_values('importance', ascending=False).head(20)
 
+            plt.style.use('dark_background')
+            fig, ax = plt.subplots(figsize=(12, 10))
+            
+            sns.barplot(x='importance', y='feature', data=feature_importances, ax=ax, palette='viridis')
+            ax.set_title('Top 20 Features Driving Customer Forecast', fontsize=16)
+            ax.set_xlabel('Importance', fontsize=12)
+            ax.set_ylabel('Feature', fontsize=12)
+            
+            ax.tick_params(axis='x', colors='white')
+            ax.tick_params(axis='y', colors='white')
+            ax.xaxis.label.set_color('white')
+            ax.yaxis.label.set_color('white')
+            ax.title.set_color('white')
+            fig.tight_layout()
+            
+            st.pyplot(fig)
+        else:
+            st.info("Generate a forecast to see the key drivers of customer behavior.")
+
+    # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
-        st.info("Here you can correct the 'Day Type' for past dates if an unusual event occurred.")
-        historical_df = load_from_firestore(db, 'historical_data')
-        if not historical_df.empty:
-            recent_df = historical_df.sort_values(by="date", ascending=False).head(30)
+        st.info("Here you can correct the 'Day Type' for past dates. This improves future forecasts.")
+        
+        @st.cache_data
+        def get_historical_data():
+            """
+            This function now takes no arguments. It gets the cached DB connection
+            from within itself. Streamlit can now safely cache the data (the DataFrame)
+            this function returns.
+            """
+            db_client = init_firestore()
+            return load_from_firestore(db_client, 'historical_data')
+
+        historical_df_edit = get_historical_data()
+        
+        if not historical_df_edit.empty:
+            recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
             for _, row in recent_df.iterrows():
+                # Pass the main 'db' connection for the update logic inside the form
                 render_historical_record(row, db)
         else:
             st.info("No historical data found.")
