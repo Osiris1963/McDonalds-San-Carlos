@@ -4,6 +4,10 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
+# Firebase
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 from data_processing import (
     ensure_datetime_index,
     prepare_history,
@@ -18,22 +22,64 @@ from forecasting import (
     backtest_metrics,
 )
 
-st.set_page_config(page_title="AI Sales Forecaster (2025)", layout="wide")
+# --------------------
+# FIREBASE INIT
+# --------------------
+# Replace with the path to your Firebase service account JSON
+SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
 
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+    except Exception as e:
+        st.error(f"Firebase initialization failed: {e}")
+        db = None
+else:
+    db = firestore.client()
+
+# --------------------
+# STREAMLIT CONFIG
+# --------------------
+st.set_page_config(page_title="AI Sales Forecaster (2025)", layout="wide")
 st.title("AI Sales & Customer Forecaster — 2025 Edition")
 st.caption("Hybrid: ETS (trend-first) for Customers + Direct Multi-Horizon LightGBM for ATV. With events, PH holidays, and paydays.")
 
+# --------------------
+# FIREBASE SAVE FUNCTIONS
+# --------------------
+def save_forecast_to_firestore(df_forecast, run_id):
+    """Save forecast DataFrame to Firestore."""
+    if db is None:
+        return
+    batch = db.batch()
+    for date, row in df_forecast.iterrows():
+        doc_ref = db.collection("forecasts").document(f"{run_id}_{date.date()}")
+        batch.set(doc_ref, row.to_dict())
+    batch.commit()
+
+def save_backtest_to_firestore(metrics_df, run_id):
+    """Save backtest metrics to Firestore."""
+    if db is None:
+        return
+    batch = db.batch()
+    for _, row in metrics_df.iterrows():
+        doc_ref = db.collection("backtest_metrics").document(f"{run_id}_{row['cutoff'].date()}")
+        batch.set(doc_ref, row.to_dict())
+    batch.commit()
+
+# --------------------
+# FILE UPLOAD + SETTINGS
+# --------------------
 with st.expander("📘 Data format (CSV)"):
     st.markdown(
         """
         **Required columns** (case-insensitive):
-        - `date` (YYYY-MM-DD or any parseable date)
-        - **Either** `sales` **or** both `customers` **and** `atv`  
-          - If `sales` given but `customers`/`atv` not given, the app will derive `atv = sales / customers` **only if** customers provided.  
-          - Best: provide **customers** and **sales**; ATV will be computed as `sales/customers`.
-        - Optional: `weather`, `event_flag`, `notes` (ignored safely if present)
-
-        **Granularity:** Daily.
+        - `date` (YYYY-MM-DD or parseable date)
+        - `customers` and `sales` (ATV will be auto-computed),  
+          or `customers` and `atv`
+        **Granularity:** Daily
         """
     )
 
@@ -52,7 +98,6 @@ with left:
 
 with right:
     st.subheader("🎯 Events / Uplifts")
-    st.markdown("Provide **future** event uplifts (percent). Leave zeros if none.")
     start_for_future = st.date_input("Start date for future calendar", value=(datetime.utcnow() + timedelta(days=1)).date())
     events_editor = pd.DataFrame({
         "date": pd.date_range(start=start_for_future, periods=H, freq="D"),
@@ -67,29 +112,25 @@ go = run_cols[0].button("🚀 Run Forecast")
 do_backtest = run_cols[1].button("🧪 Backtest (Rolling Origin)")
 download_forecast = run_cols[2].button("💾 Download latest forecast (CSV)")
 
-# Internal state
 if "latest_forecast" not in st.session_state:
     st.session_state["latest_forecast"] = None
 
+# --------------------
+# VALIDATION + PIPELINE
+# --------------------
 def validate_and_prepare(df_raw: pd.DataFrame):
     df = df_raw.copy()
     df.columns = [c.strip().lower() for c in df.columns]
     if "date" not in df.columns:
         raise ValueError("CSV must include a 'date' column.")
     df = ensure_datetime_index(df)
-    df = prepare_history(df)  # computes atv if possible, checks integrity, adds derived cols
-    if df["customers"].isna().any():
-        raise ValueError("Customers column is required or derivable. Provide 'customers' or both 'sales' & 'customers'.")
-    if df["atv"].isna().any():
-        raise ValueError("ATV could not be derived. Provide either 'sales' & 'customers' or 'atv' explicitly.")
+    df = prepare_history(df)
     return df
 
 def run_pipeline(df_hist: pd.DataFrame, H: int, events_future: pd.DataFrame):
-    # Build future calendar with covariates + events
     future_cal = add_future_calendar(df_hist, periods=H)
     ev = build_event_frame(events_future)
 
-    # Customers (trend is king): ETS baseline + recent-trend correction + (optional) weekday caps + events
     cust_fc, cust_bands = forecast_customers_with_trend_correction(
         hist=df_hist,
         future_cal=future_cal,
@@ -100,7 +141,6 @@ def run_pipeline(df_hist: pd.DataFrame, H: int, events_future: pd.DataFrame):
         return_bands=show_bands,
     )
 
-    # ATV (stable): Direct multi-horizon LightGBM + guardrails + events
     atv_fc, atv_bands = forecast_atv_direct(
         hist=df_hist,
         future_cal=future_cal,
@@ -110,7 +150,6 @@ def run_pipeline(df_hist: pd.DataFrame, H: int, events_future: pd.DataFrame):
         return_bands=show_bands,
     )
 
-    # Combine into Sales
     combined = combine_sales_and_bands(
         dates=future_cal.index,
         customers=cust_fc,
@@ -121,6 +160,9 @@ def run_pipeline(df_hist: pd.DataFrame, H: int, events_future: pd.DataFrame):
     )
     return combined
 
+# --------------------
+# MAIN EXECUTION
+# --------------------
 if uploaded is not None:
     try:
         df_raw = pd.read_csv(uploaded)
@@ -130,32 +172,28 @@ if uploaded is not None:
         st.dataframe(hist.tail(30), use_container_width=True)
 
         if go:
+            run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             fc = run_pipeline(hist, H, events_df)
             st.session_state["latest_forecast"] = fc
+            save_forecast_to_firestore(fc, run_id)  # Save to Firestore
 
         if do_backtest:
             with st.spinner("Running backtest..."):
                 metrics = backtest_metrics(hist, horizon=H, folds=6)
             st.subheader("📊 Backtest Metrics (Rolling Origin)")
             st.write(metrics)
+            run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            save_backtest_to_firestore(metrics, run_id)  # Save to Firestore
 
         if st.session_state["latest_forecast"] is not None:
             st.subheader("🔮 Forecast")
             fc = st.session_state["latest_forecast"].copy()
-            show_cols = ["customers_p50", "atv_p50", "sales_p50"]
-            if show_bands:
-                show_cols = [
-                    "customers_p10", "customers_p50", "customers_p90",
-                    "atv_p10", "atv_p50", "atv_p90",
-                    "sales_p10", "sales_p50", "sales_p90",
-                ]
             pretty = fc.copy()
             for c in pretty.columns:
                 if c.startswith("atv") or c.startswith("sales"):
                     pretty[c] = pretty[c].apply(pretty_money)
                 else:
                     pretty[c] = pretty[c].round(0).astype(int)
-
             st.dataframe(pretty, use_container_width=True, height=400)
 
             st.line_chart(fc[["customers_p50"]].rename(columns={"customers_p50":"customers"}))
