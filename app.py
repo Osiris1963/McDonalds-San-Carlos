@@ -1,200 +1,271 @@
-# app.py — Firestore-first (no CSV), 1-click forecast → table, Edit Data tab, Insights tab
-
-import os
 import io
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
-# Firestore
-import firebase_admin
-from firebase_admin import credentials, firestore
+# Firebase / Firestore
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    _FB_OK = True
+except Exception:
+    _FB_OK = False
 
 # Local modules
-from data_processing import load_from_firestore, create_advanced_features
-from forecasting import generate_forecast
+from data_processing import (
+    load_history_from_firestore,
+    load_events_from_firestore,
+    ensure_datetime_index,
+    prepare_history,
+    add_future_calendar,
+    build_event_frame_from_df,
+    pretty_money,
+)
+from forecasting import (
+    forecast_customers_with_trend_correction,
+    forecast_atv_direct,
+    combine_sales_and_bands,
+    backtest_metrics,
+    _train_direct_horizon_models,   # for Insights
+    _recent_trend_multiplier,       # for Insights
+)
 
-# ----------------- CONFIG -----------------
+# --------------------------
+# STREAMLIT CONFIG
+# --------------------------
 st.set_page_config(page_title="AI Sales & Customer Forecaster — 2025", layout="wide")
+st.title("AI Sales & Customer Forecaster — 2025 Edition")
+st.caption("Firestore-first. ETS + recent-trend (Customers) • Direct multi-horizon LightGBM (ATV) • PH holidays, paydays, events • Backtesting • Insights.")
 
-HISTORY_COLLECTION = "historical_data"
-EVENTS_COLLECTION = "future_activities"
-FORECAST_LOG_COLLECTION = "forecast_log"
-
-# ----------------- STYLES (kept simple) -----------------
-st.markdown("""
-<style>
-    .stButton > button { border-radius: 8px; font-weight: 600; padding: 10px 16px; }
-    .stTabs [data-baseweb="tab"] { font-weight: 600; }
-</style>
-""", unsafe_allow_html=True)
-
-# ----------------- FIRESTORE INIT (uses st.secrets.firebase_credentials) -----------------
+# --------------------------
+# FIRESTORE INIT (Secrets)
+# --------------------------
 @st.cache_resource
-def init_firestore():
+def get_firestore_client():
+    if not _FB_OK:
+        return None
     try:
         if not firebase_admin._apps:
-            creds_dict = {
-                "type": st.secrets.firebase_credentials.type,
-                "project_id": st.secrets.firebase_credentials.project_id,
-                "private_key_id": st.secrets.firebase_credentials.private_key_id,
-                "private_key": st.secrets.firebase_credentials.private_key.replace("\\n", "\n"),
-                "client_email": st.secrets.firebase_credentials.client_email,
-                "client_id": st.secrets.firebase_credentials.client_id,
-                "auth_uri": st.secrets.firebase_credentials.auth_uri,
-                "token_uri": st.secrets.firebase_credentials.token_uri,
-                "auth_provider_x509_cert_url": st.secrets.firebase_credentials.auth_provider_x509_cert_url,
-                "client_x509_cert_url": st.secrets.firebase_credentials.client_x509_cert_url
-            }
-            cred = credentials.Certificate(creds_dict)
+            if "gcp_service_account" in st.secrets:
+                cred = credentials.Certificate(dict(st.secrets["gcp_service_account"]))
+            else:
+                # allow env/file fallback (optional)
+                sa_path = os.getenv("SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
+                cred = credentials.Certificate(sa_path) if os.path.exists(sa_path) else None
+            if cred is None:
+                return None
             firebase_admin.initialize_app(cred)
         return firestore.client()
-    except Exception as e:
-        st.error(f"Firestore Connection Error. Check your Streamlit secrets → firebase_credentials. Details: {e}")
+    except Exception:
         return None
 
-db = init_firestore()
-if db is None:
-    st.stop()
+db = get_firestore_client()
 
-# ----------------- STATE -----------------
-if "forecast_df" not in st.session_state:
-    st.session_state.forecast_df = pd.DataFrame()
-if "customer_model" not in st.session_state:
-    st.session_state.customer_model = None
-if "history_df" not in st.session_state:
-    st.session_state.history_df = pd.DataFrame()
+with st.sidebar:
+    st.header("Firestore Collections")
+    HIST_COLLECTION = st.text_input("History (read/write)", value="daily_history")
+    EVENTS_COLLECTION = st.text_input("Future events (read)", value="future_activities")
+    FORECASTS_COLLECTION = st.text_input("Forecasts (write)", value="forecasts")
+    BACKTEST_COLLECTION = st.text_input("Backtest metrics (write)", value="backtest_metrics")
 
-# ----------------- TABS -----------------
+    if db is None:
+        st.error("Firestore not configured. Add service account to secrets as `gcp_service_account`.")
+        st.stop()
+    else:
+        st.success("Firestore connected")
+
+    save_runs = st.toggle("Save new runs to Firestore", value=True)
+
+# --------------------------
+# TABS
+# --------------------------
 tab_forecast, tab_edit, tab_insights = st.tabs(["📈 Forecast", "✏️ Edit Data", "🧠 Insights"])
 
-# =========================== FORECAST TAB ===========================
+# Keep state
+if "hist_data" not in st.session_state:
+    st.session_state["hist_data"] = None
+if "latest_forecast" not in st.session_state:
+    st.session_state["latest_forecast"] = None
+
+# =========================
+# FORECAST TAB
+# =========================
 with tab_forecast:
-    st.header("📈 Forecast")
+    st.subheader("Run Forecast")
 
-    # Load data straight from Firestore
-    history_df = load_from_firestore(db, HISTORY_COLLECTION)
-    events_df = load_from_firestore(db, EVENTS_COLLECTION)
-
-    if history_df.empty:
-        st.error(f"No documents found in '{HISTORY_COLLECTION}'. Add data in Firestore then refresh.")
+    # Load history/events from Firestore (always)
+    hist_raw = load_history_from_firestore(db, HIST_COLLECTION)
+    if hist_raw.empty:
+        st.error(f"No documents found in '{HIST_COLLECTION}'.")
         st.stop()
 
-    st.caption("Preview of history (last 30 rows)")
-    st.dataframe(history_df.sort_values("date").tail(30), use_container_width=True)
+    # Prepare history (compute ATV if needed, add features, etc.)
+    hist = ensure_datetime_index(hist_raw)
+    hist = prepare_history(hist)
 
-    # Controls
+    st.caption("Recent history (last 30 rows)")
+    st.dataframe(hist.tail(30), use_container_width=True)
+
+    H = st.number_input("Forecast horizon (days)", 7, 35, 15, 1)
+
     left, right = st.columns([1,1])
     with left:
-        periods = st.number_input("Forecast horizon (days)", min_value=7, max_value=35, value=15, step=1)
+        st.subheader("Options")
+        apply_caps = st.checkbox("Apply weekday growth caps (Customers)", True)
+        decay_lambda = st.slider("Recent-trend decay (Customers)", 0.75, 0.99, 0.90, 0.01)
+        atv_guard = st.slider("ATV guardrail (MAD×)", 2.0, 5.0, 3.0, 0.5)
+        show_bands = st.checkbox("Show P10/P50/P90 bands", True)
     with right:
-        run_btn = st.button("🚀 Generate Forecast", type="primary", use_container_width=True)
+        st.subheader("Events/Uplifts (from Firestore or edit below)")
+        ev_db = load_events_from_firestore(db, EVENTS_COLLECTION, horizon=H, start_date=(hist.index.max() + pd.Timedelta(days=1)))
+        ev_edit = st.data_editor(ev_db, use_container_width=True, num_rows="dynamic", key="ev_editor")
 
-    # Generate forecast
+    run_btn = st.button("🚀 Run Forecast", type="primary", use_container_width=True)
+    bt_btn = st.button("🧪 Backtest (Rolling Origin)", use_container_width=True)
+
+    def run_pipeline(df_hist: pd.DataFrame, H: int, events_future_df: pd.DataFrame) -> pd.DataFrame:
+        future_cal = add_future_calendar(df_hist, periods=H)
+        ev = build_event_frame_from_df(events_future_df, index=future_cal.index)
+
+        cust_fc, cust_bands = forecast_customers_with_trend_correction(
+            hist=df_hist, future_cal=future_cal, H=H,
+            decay_lambda=decay_lambda, apply_weekday_caps=apply_caps,
+            event_uplift_pct=ev["uplift_customers_pct"] if "uplift_customers_pct" in ev else None,
+            return_bands=show_bands,
+        )
+        atv_fc, atv_bands = forecast_atv_direct(
+            hist=df_hist, future_cal=future_cal, H=H,
+            guardrail_mad_mult=atv_guard,
+            event_uplift_pct=ev["uplift_atv_pct"] if "uplift_atv_pct" in ev else None,
+            return_bands=show_bands,
+        )
+        combined = combine_sales_and_bands(
+            dates=future_cal.index, customers=cust_fc, customers_bands=cust_bands,
+            atv=atv_fc, atv_bands=atv_bands, return_bands=show_bands,
+        )
+        return combined
+
+    def save_forecast(df_fc: pd.DataFrame):
+        if not (save_runs and db is not None):
+            return
+        batch = db.batch()
+        col = db.collection(FORECASTS_COLLECTION)
+        run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        for dt, row in df_fc.iterrows():
+            doc = col.document(f"{run_id}_{dt.date()}")
+            payload = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+            payload["forecast_for_date"] = dt.to_pydatetime()
+            payload["generated_on"] = datetime.utcnow()
+            batch.set(doc, payload, merge=True)
+        batch.commit()
+
     if run_btn:
-        with st.spinner("Training & forecasting..."):
-            forecast_df, customer_model = generate_forecast(history_df, events_df, periods=int(periods))
-            st.session_state.forecast_df = forecast_df
-            st.session_state.customer_model = customer_model
+        with st.spinner("Forecasting..."):
+            fc = run_pipeline(hist, int(H), ev_edit)
+        st.session_state["latest_forecast"] = fc
+        save_forecast(fc)
 
-        if not forecast_df.empty:
-            # Save to forecast_log
-            try:
-                batch = db.batch()
-                log_ref = db.collection(FORECAST_LOG_COLLECTION)
-                generated_ts = pd.Timestamp.utcnow().to_pydatetime()
-                for _, r in forecast_df.iterrows():
-                    doc_id = pd.to_datetime(r["ds"]).strftime("%Y-%m-%d")
-                    batch.set(
-                        log_ref.document(doc_id),
-                        {
-                            "generated_on": generated_ts,
-                            "forecast_for_date": r["ds"].to_pydatetime() if hasattr(r["ds"], "to_pydatetime") else pd.to_datetime(r["ds"]).to_pydatetime(),
-                            "predicted_sales": float(r["forecast_sales"]),
-                            "predicted_customers": int(r["forecast_customers"]),
-                            "predicted_atv": float(r["forecast_atv"]),
-                        },
-                        merge=True
-                    )
-                batch.commit()
-                st.success("Forecast generated and logged to Firestore.")
-            except Exception as e:
-                st.warning(f"Forecast generated but failed to log: {e}")
+    if bt_btn:
+        with st.spinner("Running backtest..."):
+            metrics = backtest_metrics(hist, horizon=int(H), folds=6)
+        st.subheader("📊 Backtest Metrics")
+        st.dataframe(metrics, use_container_width=True)
+        # save backtest
+        if save_runs and db is not None and not metrics.empty:
+            batch = db.batch()
+            col = db.collection(BACKTEST_COLLECTION)
+            run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            for _, r in metrics.iterrows():
+                ref = col.document(f"{run_id}_{r['cutoff'].date()}")
+                batch.set(ref, r.to_dict(), merge=True)
+            batch.commit()
+            st.success("Backtest metrics saved.")
 
-    # Show table
-    if not st.session_state.forecast_df.empty:
+    if st.session_state["latest_forecast"] is not None:
         st.subheader("🔮 Forecast (table)")
-        show = st.session_state.forecast_df.copy()
-        show["forecast_customers"] = show["forecast_customers"].astype(int)
-        show["forecast_atv"] = show["forecast_atv"].round(2)
-        show["forecast_sales"] = show["forecast_sales"].round(2)
-        st.dataframe(show, use_container_width=True, height=420)
+        fc = st.session_state["latest_forecast"].copy()
+        pretty = fc.copy()
+        for c in pretty.columns:
+            if c.startswith(("atv", "sales")):
+                pretty[c] = pretty[c].apply(pretty_money)
+            else:
+                pretty[c] = pretty[c].round(0).astype(int)
+        st.dataframe(pretty, use_container_width=True, height=420)
 
-        # download
+        # Download
         buf = io.StringIO()
-        show.to_csv(buf, index=False)
+        st.session_state["latest_forecast"].to_csv(buf)
         st.download_button("Download forecast.csv", buf.getvalue(), "forecast.csv", "text/csv")
 
-# =========================== EDIT DATA TAB ===========================
+# =========================
+# EDIT DATA TAB (Firestore)
+# =========================
 with tab_edit:
-    st.header("✏️ Edit Data (Firestore)")
-    df_edit = load_from_firestore(db, HISTORY_COLLECTION)
+    st.subheader("Edit History Data (Firestore)")
+
+    df_edit = load_history_from_firestore(db, HIST_COLLECTION, raw=True)  # get raw for full columns
     if df_edit.empty:
-        st.info(f"No docs in '{HISTORY_COLLECTION}'.")
+        st.info(f"No docs in '{HIST_COLLECTION}'.")
     else:
-        # keep clean user-facing columns
-        display_cols = [c for c in df_edit.columns if c not in ("doc_id",)]
-        df_edit_view = df_edit[display_cols].sort_values("date", ascending=False)
-        edited = st.data_editor(df_edit_view, use_container_width=True, num_rows="dynamic")
+        # Normalize date display
+        if "date" in df_edit.columns:
+            df_edit["date"] = pd.to_datetime(df_edit["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        edited = st.data_editor(df_edit, use_container_width=True, num_rows="dynamic", key="edit_history")
 
-        if st.button("💾 Save Changes"):
-            try:
-                batch = db.batch()
-                col_ref = db.collection(HISTORY_COLLECTION)
-                for _, row in edited.iterrows():
-                    if pd.isna(row.get("date")):
-                        continue
-                    # use yyyy-mm-dd as doc id
-                    doc_id = pd.to_datetime(row["date"]).strftime("%Y-%m-%d")
-                    payload = {k: (None if pd.isna(v) else v) for k, v in row.items()}
-                    # cast numeric fields if present
-                    for k in ("customers", "sales", "atv", "add_on_sales"):
-                        if k in payload and payload[k] is not None:
-                            try:
-                                payload[k] = float(payload[k])
-                            except Exception:
-                                pass
+        if st.button("💾 Save Changes to Firestore"):
+            batch = db.batch()
+            col = db.collection(HIST_COLLECTION)
+            for _, r in edited.iterrows():
+                if pd.isna(r.get("date")):
+                    continue
+                doc_id = str(r["date"])
+                payload = dict(r.dropna())
+                # cast numerics
+                for k in ("customers", "sales", "atv"):
+                    if k in payload:
+                        try: payload[k] = float(payload[k])
+                        except Exception: pass
+                # date back to timestamp
+                try:
                     payload["date"] = pd.to_datetime(payload["date"]).to_pydatetime()
-                    batch.set(col_ref.document(doc_id), payload, merge=True)
-                batch.commit()
-                st.success("Saved to Firestore.")
-            except Exception as e:
-                st.error(f"Save failed: {e}")
+                except Exception:
+                    pass
+                batch.set(col.document(doc_id), payload, merge=True)
+            batch.commit()
+            st.success("Saved.")
 
-# =========================== INSIGHTS TAB ===========================
+# =========================
+# INSIGHTS TAB
+# =========================
 with tab_insights:
-    st.header("🧠 Forecast Insights")
-    if st.session_state.customer_model is None or st.session_state.forecast_df.empty:
-        st.info("Run a forecast first to see insights.")
+    st.subheader("Model Insights")
+    hist = st.session_state.get("hist_data") or prepare_history(ensure_datetime_index(load_history_from_firestore(db, HIST_COLLECTION)))
+    if hist is None or hist.empty:
+        st.info("No history available.")
     else:
-        model = st.session_state.customer_model
-        # Feature importance (works for LGBMRegressor)
+        st.caption("Recent-trend multiplier used for Customers (higher = stronger recent lift)")
         try:
-            importances = getattr(model, "feature_importances_", None)
-            if importances is not None:
-                # rebuild features from history (same feature builder)
-                feats_df = create_advanced_features(
-                    load_from_firestore(db, HISTORY_COLLECTION),
-                    load_from_firestore(db, EVENTS_COLLECTION)
-                )
-                # columns used during training in forecasting.py
-                FEATURE_COLS = [c for c in feats_df.columns if c not in ("date","customers","sales","atv")]
-                imp_df = pd.DataFrame({"feature": FEATURE_COLS, "importance": importances})
-                imp_df = imp_df.sort_values("importance", ascending=False)
-                st.subheader("ATV/Customers model — feature importance")
-                st.dataframe(imp_df.head(40), use_container_width=True)
-            else:
-                st.info("Model does not expose feature_importances_.")
+            mult = _recent_trend_multiplier(hist, decay_lambda=0.90)
+            st.metric("Recent-trend multiplier", f"{mult:.3f}")
         except Exception as e:
-            st.warning(f"Could not compute importances: {e}")
+            st.warning(f"Trend metric failed: {e}")
+
+        H_ins = st.number_input("Horizons for importance (ATV)", 7, 30, 15, 1, key="H_insights")
+        try:
+            models, feats = _train_direct_horizon_models(hist, int(H_ins))
+            importances = []
+            for m in models:
+                if hasattr(m, "feature_importances_"):
+                    importances.append(m.feature_importances_)
+            if importances:
+                imp_avg = np.mean(np.vstack(importances), axis=0)
+                imp_df = pd.DataFrame({"feature": feats, "importance": imp_avg}).sort_values("importance", ascending=False)
+                imp_df["importance"] = imp_df["importance"].round(3)
+                st.write("ATV feature importance (avg across horizons):")
+                st.dataframe(imp_df, use_container_width=True, height=360)
+            else:
+                st.info("No feature_importances_ available (very short history?).")
+        except Exception as e:
+            st.warning(f"Insights failed: {e}")
