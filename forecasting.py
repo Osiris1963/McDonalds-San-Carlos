@@ -1,16 +1,19 @@
+# forecasting.py — resilient to short history, LightGBM optional
+
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.ensemble import GradientBoostingRegressor
 
-# LightGBM is great but sometimes not available on Streamlit builds.
+# LightGBM is great but optional (falls back if unavailable)
 try:
     import lightgbm as lgb
     _HAS_LGBM = True
 except Exception:
     _HAS_LGBM = False
 
+# ---------- Metrics ----------
 def smape(y_true, y_pred):
     y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
     denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
@@ -27,12 +30,46 @@ def mase(y_true, y_pred, y_train):
 
 # ---------- Customers ----------
 def _ets_baseline_customers(hist: pd.DataFrame, H: int) -> pd.Series:
-    y = hist["customers"].astype(float)
-    model = ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal="add", seasonal_periods=7, initialization_method="estimated")
-    fit = model.fit(optimized=True, use_brute=True)
-    fc = fit.forecast(H)
-    fc.index = pd.date_range(hist.index.max() + pd.Timedelta(days=1), periods=H, freq="D")
-    return fc.clip(lower=0)
+    """
+    Robust ETS baseline:
+    - <10 pts: repeat last-week mean (or last value)
+    - <2*seasonal_period: trend-only ETS
+    - else: additive trend + weekly seasonality
+    """
+    y = hist["customers"].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+    future_index = pd.date_range(hist.index.max() + pd.Timedelta(days=1), periods=H, freq="D")
+
+    # Very short history → naive mean/last
+    if len(y) < 10:
+        base = (y.tail(7).mean() if len(y) >= 7 else y.iloc[-1])
+        return pd.Series(base, index=future_index)
+
+    seasonal_periods = 7
+    try:
+        if len(y) < 2 * seasonal_periods:
+            # Not enough to estimate seasonality → trend-only
+            model = ExponentialSmoothing(
+                y, trend="add", damped_trend=True, seasonal=None,
+                initialization_method="estimated",
+            )
+        else:
+            # Full model with weekly seasonality
+            model = ExponentialSmoothing(
+                y, trend="add", damped_trend=True, seasonal="add", seasonal_periods=seasonal_periods,
+                initialization_method="estimated",
+            )
+        fit = model.fit(optimized=True, use_brute=True)
+        fc = fit.forecast(H)
+        fc.index = future_index
+        return fc.clip(lower=0)
+    except Exception:
+        # Last-resort fallback: weekly repeat
+        last_week = y.tail(7).values
+        if len(last_week) == 0:
+            last_week = np.array([0.0])
+        reps = int(np.ceil(H / len(last_week)))
+        vals = np.tile(last_week, reps)[:H]
+        return pd.Series(vals, index=future_index).clip(lower=0)
 
 def _recent_trend_multiplier(hist: pd.DataFrame, decay_lambda: float = 0.9) -> float:
     recent = hist.tail(28)
@@ -101,7 +138,6 @@ def _train_direct_horizon_models(hist: pd.DataFrame, H: int):
                 min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1, random_state=42,
             )
         else:
-            # Fallback if LightGBM is missing or dataset too small
             model = GradientBoostingRegressor(random_state=42)
         model.fit(df_h[features], df_h["y"]); models.append(model)
     return models, features
