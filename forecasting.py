@@ -1,19 +1,19 @@
-# forecasting.py — resilient to short history, LightGBM optional
-
 import numpy as np
 import pandas as pd
 from typing import Tuple, Optional
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.ensemble import GradientBoostingRegressor
 
-# LightGBM is great but optional (falls back if unavailable)
+# LightGBM is optional: we fall back if it isn't available
 try:
     import lightgbm as lgb
     _HAS_LGBM = True
 except Exception:
     _HAS_LGBM = False
 
-# ---------- Metrics ----------
+# =======================
+# Metrics
+# =======================
 def smape(y_true, y_pred):
     y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
     denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
@@ -28,7 +28,9 @@ def mase(y_true, y_pred, y_train):
     scale = max(scale, 1e-8)
     return np.mean(np.abs(y_true - y_pred)) / scale
 
-# ---------- Customers ----------
+# =======================
+# Customers (ETS + trend)
+# =======================
 def _ets_baseline_customers(hist: pd.DataFrame, H: int) -> pd.Series:
     """
     Robust ETS baseline:
@@ -41,23 +43,15 @@ def _ets_baseline_customers(hist: pd.DataFrame, H: int) -> pd.Series:
 
     # Very short history → naive mean/last
     if len(y) < 10:
-        base = (y.tail(7).mean() if len(y) >= 7 else y.iloc[-1])
+        base = (y.tail(7).mean() if len(y) >= 7 else (y.iloc[-1] if len(y) else 0.0))
         return pd.Series(base, index=future_index)
 
     seasonal_periods = 7
     try:
         if len(y) < 2 * seasonal_periods:
-            # Not enough to estimate seasonality → trend-only
-            model = ExponentialSmoothing(
-                y, trend="add", damped_trend=True, seasonal=None,
-                initialization_method="estimated",
-            )
+            model = ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal=None, initialization_method="estimated")
         else:
-            # Full model with weekly seasonality
-            model = ExponentialSmoothing(
-                y, trend="add", damped_trend=True, seasonal="add", seasonal_periods=seasonal_periods,
-                initialization_method="estimated",
-            )
+            model = ExponentialSmoothing(y, trend="add", damped_trend=True, seasonal="add", seasonal_periods=seasonal_periods, initialization_method="estimated")
         fit = model.fit(optimized=True, use_brute=True)
         fc = fit.forecast(H)
         fc.index = future_index
@@ -111,41 +105,87 @@ def forecast_customers_with_trend_correction(
             bands = pd.DataFrame({"p10": np.percentile(sims,10,axis=0), "p50": fc.values, "p90": np.percentile(sims,90,axis=0)}, index=fc.index)
     return fc, bands
 
-# ---------- ATV ----------
+# =======================
+# ATV (Direct multi-horizon)
+# =======================
+_ATV_FEATS = [
+    "dow","is_weekend","is_holiday","is_payday","is_payday_minus1","is_payday_plus1",
+    "month","week",
+    "atv_lag7","atv_lag14","atv_lag28",
+    "atv_roll7_med","atv_roll14_med","atv_roll28_med",
+    "customers_lag7","customers_lag14","customers_lag28",
+]
+
 def _build_atv_feature_matrix(hist: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-    feats = [
-        "dow","is_weekend","is_holiday","is_payday","is_payday_minus1","is_payday_plus1",
-        "month","week",
-        "atv_lag7","atv_lag14","atv_lag28",
-        "atv_roll7_med","atv_roll14_med","atv_roll28_med",
-        "customers_lag7","customers_lag14","customers_lag28",
-    ]
-    X = hist[feats].copy()
-    y = hist["atv"].astype(float).copy()
-    X = X.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
-    return X, y
+    # Ensure all required columns exist; if missing, create with 0 and forward-fill later
+    df = hist.copy()
+    for c in _ATV_FEATS:
+        if c not in df.columns:
+            df[c] = np.nan
+    X = df[_ATV_FEATS].copy()
+    y = df.get("atv", pd.Series(index=df.index, dtype=float)).astype(float)
+
+    # Clean: numeric only, replace inf, then fill, then drop any still-missing
+    X = (X.apply(pd.to_numeric, errors="coerce")
+           .replace([np.inf, -np.inf], np.nan)
+           .fillna(method="ffill").fillna(method="bfill"))
+    y = y.replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
+
+    # Align and drop rows where either X or y is missing
+    df_h = pd.concat([X, y.rename("y")], axis=1).dropna()
+    if df_h.empty:
+        return pd.DataFrame(), pd.Series(dtype=float)
+    return df_h.drop(columns=["y"]), df_h["y"]
+
+def _fit_atv_model(X: pd.DataFrame, y: pd.Series):
+    # Choose model based on availability and sample size
+    if _HAS_LGBM and len(X) >= 100:
+        model = lgb.LGBMRegressor(
+            n_estimators=600, learning_rate=0.03, max_depth=-1,
+            subsample=0.85, colsample_bytree=0.85,
+            min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1, random_state=42,
+        )
+    else:
+        model = GradientBoostingRegressor(random_state=42)
+    model.fit(X, y)
+    return model
 
 def _train_direct_horizon_models(hist: pd.DataFrame, H: int):
     X_full, y_full = _build_atv_feature_matrix(hist)
-    models, features = [], X_full.columns.tolist()
+    models, features = [], _ATV_FEATS
+
+    # If not enough clean rows, return empty (caller will fallback)
+    if X_full.empty or len(X_full) < 30:
+        return [], features
+
     for h in range(1, H+1):
         y_h = y_full.shift(-h)
         df_h = pd.concat([X_full, y_h.rename("y")], axis=1).dropna()
-        if _HAS_LGBM and len(df_h) >= 100:
-            model = lgb.LGBMRegressor(
-                n_estimators=600, learning_rate=0.03, max_depth=-1,
-                subsample=0.85, colsample_bytree=0.85,
-                min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1, random_state=42,
-            )
-        else:
-            model = GradientBoostingRegressor(random_state=42)
-        model.fit(df_h[features], df_h["y"]); models.append(model)
+        if df_h.empty or len(df_h) < 20:
+            # not enough for this horizon; stop expanding (we'll fallback for future)
+            break
+        m = _fit_atv_model(df_h[features], df_h["y"])
+        models.append(m)
+
     return models, features
 
 def _apply_guardrails_atv(hist: pd.DataFrame, preds: pd.Series, mad_mult: float) -> pd.Series:
     atv_hist = hist["atv"].astype(float)
-    med = atv_hist.median(); mad = np.median(np.abs(atv_hist - med)) + 1e-6
+    med = atv_hist.median() if len(atv_hist) else 0.0
+    mad = np.median(np.abs(atv_hist - med)) + 1e-6 if len(atv_hist) else 1.0
     return preds.clip(lower=max(5.0, med - mad_mult*mad), upper=(med + mad_mult*mad))
+
+def _atv_baseline(hist: pd.DataFrame, H: int) -> pd.Series:
+    """Fallback when we can't train: rolling median of last 14 (or last value)."""
+    idx = pd.date_range(hist.index.max() + pd.Timedelta(days=1), periods=H, freq="D")
+    atv = hist["atv"].astype(float)
+    if len(atv) >= 14:
+        base = float(atv.tail(14).median())
+    elif len(atv) > 0:
+        base = float(atv.iloc[-1])
+    else:
+        base = 0.0
+    return pd.Series(base, index=idx)
 
 def forecast_atv_direct(
     hist: pd.DataFrame, future_cal: pd.DataFrame, H: int,
@@ -153,17 +193,34 @@ def forecast_atv_direct(
     return_bands: bool = True,
 ) -> Tuple[pd.Series, Optional[pd.DataFrame]]:
     models, features = _train_direct_horizon_models(hist, H)
-    last = hist.iloc[-1:].copy()
-    Xf = future_cal.copy()
-    for col in ["atv_lag7","atv_lag14","atv_lag28","atv_roll7_med","atv_roll14_med","atv_roll28_med","customers_lag7","customers_lag14","customers_lag28"]:
-        Xf[col] = float(last[col].iloc[0]) if col in last.columns else np.nan
-    Xf = Xf[features].replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(method="bfill")
 
-    preds = []
-    for i, m in enumerate(models):
-        row = Xf.iloc[[i]] if i < len(Xf) else Xf.iloc[[-1]]
-        preds.append(float(m.predict(row)[0]))
-    preds = pd.Series(preds, index=future_cal.index, name="atv")
+    # If no models trained, use baseline
+    if not models:
+        preds = _atv_baseline(hist, H)
+    else:
+        # Build horizon design matrix from future calendar + last known lag/rolls
+        last = hist.iloc[-1:].copy()
+        Xf = future_cal.copy()
+        for col in ["atv_lag7","atv_lag14","atv_lag28","atv_roll7_med","atv_roll14_med","atv_roll28_med",
+                    "customers_lag7","customers_lag14","customers_lag28"]:
+            Xf[col] = float(last[col].iloc[0]) if col in last.columns else np.nan
+
+        # Ensure all required features present and numeric
+        for c in _ATV_FEATS:
+            if c not in Xf.columns:
+                Xf[c] = np.nan
+        Xf = (Xf[_ATV_FEATS]
+                .apply(pd.to_numeric, errors="coerce")
+                .replace([np.inf, -np.inf], np.nan)
+                .fillna(method="ffill").fillna(method="bfill"))
+
+        # Predict per-horizon; if fewer models than H, repeat last model
+        preds_list = []
+        for i in range(H):
+            model_idx = min(i, len(models) - 1)
+            row = Xf.iloc[[i if i < len(Xf) else -1]]
+            preds_list.append(float(models[model_idx].predict(row)[0]))
+        preds = pd.Series(preds_list, index=future_cal.index, name="atv")
 
     if event_uplift_pct is not None and len(event_uplift_pct) == H:
         preds = preds * (1.0 + (event_uplift_pct.values / 100.0))
@@ -172,15 +229,26 @@ def forecast_atv_direct(
 
     bands = None
     if return_bands:
+        # Residual-based bands from a quick proxy model; safe to compute
         X_hist, y_hist = _build_atv_feature_matrix(hist)
-        proxy = GradientBoostingRegressor(random_state=42).fit(X_hist, y_hist)
-        resid = y_hist - proxy.predict(X_hist)
-        if len(resid) >= 30:
-            draws = np.random.choice(resid.values, size=(1000, H), replace=True)
-            sims = preds.values + draws
-            bands = pd.DataFrame({"p10": np.percentile(sims,10,axis=0), "p50": preds.values, "p90": np.percentile(sims,90,axis=0)}, index=preds.index)
+        bands = None
+        if not X_hist.empty and len(y_hist) >= 30:
+            proxy = GradientBoostingRegressor(random_state=42).fit(X_hist, y_hist)
+            resid = y_hist - proxy.predict(X_hist)
+            if len(resid) >= 30:
+                draws = np.random.choice(resid.values, size=(1000, H), replace=True)
+                sims = preds.values + draws
+                bands = pd.DataFrame(
+                    {"p10": np.percentile(sims, 10, axis=0),
+                     "p50": preds.values,
+                     "p90": np.percentile(sims, 90, axis=0)},
+                    index=preds.index,
+                )
     return preds, bands
 
+# =======================
+# Combine & Backtest
+# =======================
 def combine_sales_and_bands(dates, customers, customers_bands, atv, atv_bands, return_bands=True):
     out = pd.DataFrame(index=dates)
     if return_bands and customers_bands is not None and atv_bands is not None:
@@ -194,12 +262,15 @@ def combine_sales_and_bands(dates, customers, customers_bands, atv, atv_bands, r
         out["sales_p50"] = out["customers_p50"] * out["atv_p50"]
         out["sales_p90"] = out["customers_p90"] * out["atv_p90"]
     else:
-        out["customers_p50"] = customers; out["atv_p50"] = atv; out["sales_p50"] = customers * atv
+        out["customers_p50"] = customers
+        out["atv_p50"] = atv
+        out["sales_p50"] = customers * atv
     return out
 
 def backtest_metrics(hist: pd.DataFrame, horizon: int = 15, folds: int = 6) -> pd.DataFrame:
     cutoffs, sm_c, sm_a, sm_s, ms_c, ms_a, ms_s = [], [], [], [], [], [], []
-    total_len = len(hist); min_train = 200 if total_len > 400 else int(total_len * 0.5)
+    total_len = len(hist)
+    min_train = 200 if total_len > 400 else int(total_len * 0.5)
     step = max(1, (total_len - min_train - horizon) // max(1, folds))
     for i in range(folds):
         train_end = min_train + i*step
@@ -212,4 +283,8 @@ def backtest_metrics(hist: pd.DataFrame, horizon: int = 15, folds: int = 6) -> p
         sm_c.append(smape(test["customers"], cust_fc)); sm_a.append(smape(test["atv"], atv_fc)); sm_s.append(smape(test["sales"], sales_fc))
         ms_c.append(mase(test["customers"], cust_fc, train["customers"])); ms_a.append(mase(test["atv"], atv_fc, train["atv"])); ms_s.append(mase(test["sales"], sales_fc, train["sales"]))
         cutoffs.append(train.index.max())
-    return pd.DataFrame({"cutoff": cutoffs, "sMAPE_customers": sm_c, "sMAPE_atv": sm_a, "sMAPE_sales": sm_s, "MASE_customers": ms_c, "MASE_atv": ms_a, "MASE_sales": ms_s})
+    return pd.DataFrame({
+        "cutoff": cutoffs,
+        "sMAPE_customers": sm_c, "sMAPE_atv": sm_a, "sMAPE_sales": sm_s,
+        "MASE_customers": ms_c,  "MASE_atv": ms_a,  "MASE_sales": ms_s,
+    })
