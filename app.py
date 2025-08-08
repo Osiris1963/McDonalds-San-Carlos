@@ -1,5 +1,5 @@
-# Firestore-first (no CSV). Tabs: Forecast / Edit Data / Insights.
-# Secrets key supported: [firebase_credentials]  (your format) or [gcp_service_account]
+# Firestore-first (no CSV), upgraded logic, tabs: Forecast / Edit Data / Insights
+# Secrets key supported: [firebase_credentials] (your format) or [gcp_service_account]
 
 import io, os, json
 import numpy as np
@@ -29,13 +29,13 @@ from forecasting import (
     forecast_atv_direct,
     combine_sales_and_bands,
     backtest_metrics,
-    _train_direct_horizon_models,   # for Insights
-    _recent_trend_multiplier,       # for Insights
+    _train_direct_horizon_models,   # Insights
+    _recent_trend_multiplier,       # Insights
 )
 
 st.set_page_config(page_title="AI Sales & Customer Forecaster — 2025", layout="wide")
 st.title("AI Sales & Customer Forecaster — 2025 Edition")
-st.caption("Firestore-first · ETS+damped trend + recent-trend (Customers) · Direct multi-horizon LightGBM (ATV) · Events/PH holidays/paydays · Backtesting · Insights")
+st.caption("Firestore-first · ETS+damped trend + recent-trend (Customers) · Direct multi-horizon (ATV) · Events/PH holidays/paydays · Backtesting · Insights")
 
 # ---------- Firestore init ----------
 @st.cache_resource
