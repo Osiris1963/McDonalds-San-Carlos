@@ -1,125 +1,130 @@
-# data_processing.py — Firestore I/O + feature engineering
-
 import pandas as pd
 import numpy as np
+import holidays
 
-def load_from_firestore(db_client, collection_name: str) -> pd.DataFrame:
-    """Load a collection from Firestore into a clean DataFrame with a proper date index."""
-    if db_client is None:
-        return pd.DataFrame()
+PH_HOLIDAYS = holidays.country_holidays("PH")
 
-    docs = list(db_client.collection(collection_name).stream())
+def load_history_from_firestore(db, collection: str, raw: bool = False) -> pd.DataFrame:
+    docs = list(db.collection(collection).stream())
     rows = []
     for d in docs:
         rec = d.to_dict() or {}
-        # prefer explicit 'date' field; else use doc id
         rec_date = rec.get("date", d.id)
-        # Firestore Timestamp → datetime
-        if hasattr(rec_date, "to_datetime"):
+        if hasattr(rec_date, "to_datetime"):  # Firestore Timestamp
             rec_date = rec_date.to_datetime()
-        # datetime/date → string
         if hasattr(rec_date, "isoformat"):
             rec_date = rec_date.strftime("%Y-%m-%d")
         rec["date"] = rec_date
         rec["doc_id"] = d.id
         rows.append(rec)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df.columns = [c.strip().lower() for c in df.columns]
-    if "date" not in df.columns:
-        return pd.DataFrame()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    df = df.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    if raw or df.empty:  # return as-is for Edit tab if raw=True
+        return df
+    df.columns = [c.lower() for c in df.columns]
     return df
 
-def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Feature builder used for both training and forecasting.
-    - computes atv if sales+customers present
-    - calendar, payday, weekend, cyclical features
-    - weather dummies (if present)
-    - lags & rolling stats for customers/atv
-    - event flag (from events_df)
-    - day_type guard (is_not_normal_day if provided)
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
+def load_events_from_firestore(db, collection: str, horizon: int, start_date) -> pd.DataFrame:
+    docs = list(db.collection(collection).stream())
+    rows = []
+    for d in docs:
+        rec = d.to_dict() or {}
+        rec_date = rec.get("date", d.id)
+        if hasattr(rec_date, "to_datetime"):
+            rec_date = rec_date.to_datetime()
+        if hasattr(rec_date, "isoformat"):
+            rec_date = rec_date.strftime("%Y-%m-%d")
+        rows.append({
+            "date": rec_date,
+            "uplift_customers_pct": float(rec.get("uplift_customers_pct", 0) or 0),
+            "uplift_atv_pct": float(rec.get("uplift_atv_pct", 0) or 0),
+            "notes": rec.get("notes", ""),
+        })
+    ev = pd.DataFrame(rows)
+    if ev.empty:
+        # create empty frame for next H days
+        idx = pd.date_range(start=pd.to_datetime(start_date), periods=horizon, freq="D")
+        return pd.DataFrame({"date": idx, "uplift_customers_pct": 0.0, "uplift_atv_pct": 0.0, "notes": ""})
+    ev["date"] = pd.to_datetime(ev["date"], errors="coerce")
+    ev = ev.dropna(subset=["date"]).sort_values("date")
+    return ev
 
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # numeric casts
-    for col in ("customers", "sales", "atv", "add_on_sales"):
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out.columns = [c.strip().lower() for c in out.columns]
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date")
+    out = out.set_index("date")
+    return out
 
-    # compute atv if possible — remove add_on_sales from base
-    if "atv" not in out.columns or out["atv"].isna().all():
-        if "sales" in out.columns and "customers" in out.columns:
-            base_sales = out["sales"] - out.get("add_on_sales", 0)
-            cust = out["customers"].replace(0, np.nan)
-            out["atv"] = base_sales / cust
+def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    idx = out.index
+    out["dow"] = idx.dayofweek                     # 0=Mon
+    out["dom"] = idx.day
+    out["week"] = idx.isocalendar().week.astype(int)
+    out["month"] = idx.month
+    out["year"] = idx.year
+    out["is_weekend"] = (out["dow"] >= 5).astype(int)
+    out["is_holiday"] = [int(d in PH_HOLIDAYS) for d in idx.date]
 
-    # calendar
-    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
-    out = out.dropna(subset=["date"]).sort_values("date")
-    out["month"] = out["date"].dt.month
-    out["day"] = out["date"].dt.day
-    out["dayofweek"] = out["date"].dt.dayofweek
-    out["dayofyear"] = out["date"].dt.dayofyear
-    out["weekofyear"] = out["date"].dt.isocalendar().week.astype(int)
-    out["year"] = out["date"].dt.year
-    out["time_idx"] = (out["date"] - out["date"].min()).dt.days
+    # paydays (15th & month-end) ±1 day
+    out["is_payday"] = ((out["dom"] == 15) | (idx == (idx + pd.offsets.MonthEnd(0)))).astype(int)
+    out["is_payday_minus1"] = ((idx + pd.Timedelta(days=1)).day == 15).astype(int) | ((idx + pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) + pd.Timedelta(days=1))).astype(int)
+    out["is_payday_plus1"]  = ((idx - pd.Timedelta(days=1)).day == 15).astype(int) | ((idx - pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) - pd.Timedelta(days=1))).astype(int)
+    return out
 
-    # payday / weekend interactions
-    out["is_payday_period"] = out["day"].isin([14,15,16,29,30,31,1,2]).astype(int)
-    out["is_weekend"] = (out["dayofweek"] >= 5).astype(int)
-    out["payday_weekend_interaction"] = out["is_payday_period"] * out["is_weekend"]
+def _compute_atv_if_missing(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "sales" in out.columns and "customers" in out.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["atv"] = out["sales"] / out["customers"].replace(0, np.nan)
+    elif "atv" in out.columns and "customers" in out.columns and "sales" not in out.columns:
+        out["sales"] = out["atv"] * out["customers"]
+    elif "sales" in out.columns and "atv" in out.columns and "customers" not in out.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["customers"] = out["sales"] / out["atv"].replace(0, np.nan)
+    # sanitize
+    for c in ("customers","sales","atv"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf,-np.inf], np.nan)
+    return out
 
-    # weather dummies if present
-    if "weather" in out.columns:
-        out["weather"] = out["weather"].fillna("Unknown").astype(str)
-        wd = pd.get_dummies(out["weather"], prefix="weather", dtype=int)
-        out = pd.concat([out, wd], axis=1)
+def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out = _compute_atv_if_missing(out)
+    out = _add_calendar_features(out)
+    # lags & rolls for ATV + customers
+    for lag in [7,14,28]:
+        if "customers" in out.columns: out[f"customers_lag{lag}"] = out["customers"].shift(lag)
+        if "atv" in out.columns: out[f"atv_lag{lag}"] = out["atv"].shift(lag)
+    out["atv_roll7_med"]  = out["atv"].rolling(7,  min_periods=3).median()
+    out["atv_roll14_med"] = out["atv"].rolling(14, min_periods=5).median()
+    out["atv_roll28_med"] = out["atv"].rolling(28, min_periods=7).median()
+    return out.dropna().copy()
 
-    # lags & rolling
-    for lag in (7, 14, 28):
-        if "customers" in out.columns:
-            out[f"customers_lag{lag}"] = out["customers"].shift(lag)
-        if "atv" in out.columns:
-            out[f"atv_lag{lag}"] = out["atv"].shift(lag)
+def add_future_calendar(hist: pd.DataFrame, periods: int) -> pd.DataFrame:
+    last = hist.index.max()
+    idx = pd.date_range(start=last + pd.Timedelta(days=1), periods=periods, freq="D")
+    fut = pd.DataFrame(index=idx)
+    fut = _add_calendar_features(fut)
+    return fut
 
-    for w in (7, 14):
-        if "customers" in out.columns:
-            out[f"customers_roll_mean_{w}"] = out["customers"].shift(1).rolling(w, min_periods=1).mean()
-            out[f"customers_roll_std_{w}"]  = out["customers"].shift(1).rolling(w, min_periods=1).std()
-        if "atv" in out.columns:
-            out[f"atv_roll_mean_{w}"] = out["atv"].shift(1).rolling(w, min_periods=1).mean()
-            out[f"atv_roll_std_{w}"]  = out["atv"].shift(1).rolling(w, min_periods=1).std()
+def build_event_frame_from_df(ev_df: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
+    # align provided event uplift DF to future index
+    ev = pd.DataFrame(index=index)
+    if ev_df is None or ev_df.empty:
+        ev["uplift_customers_pct"] = 0.0
+        ev["uplift_atv_pct"] = 0.0
+        return ev
+    tmp = ev_df.copy()
+    tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+    tmp = tmp.dropna(subset=["date"]).set_index("date").sort_index()
+    ev["uplift_customers_pct"] = tmp.reindex(index, fill_value=0.0)["uplift_customers_pct"]
+    ev["uplift_atv_pct"] = tmp.reindex(index, fill_value=0.0)["uplift_atv_pct"]
+    return ev
 
-    # cyclical encodings
-    out["dayofyear_sin"] = np.sin(2 * np.pi * out["dayofyear"] / 365.25)
-    out["dayofyear_cos"] = np.cos(2 * np.pi * out["dayofyear"] / 365.25)
-    out["weekofyear_sin"] = np.sin(2 * np.pi * out["weekofyear"] / 52)
-    out["weekofyear_cos"] = np.cos(2 * np.pi * out["weekofyear"] / 52)
-
-    # events flag
-    if events_df is not None and not events_df.empty:
-        ev = events_df.copy()
-        ev["date"] = pd.to_datetime(ev["date"], errors="coerce").dt.normalize()
-        ev = ev.dropna(subset=["date"]).drop_duplicates(subset=["date"])
-        out = out.merge(ev[["date"]], on="date", how="left", indicator=True)
-        out["is_event"] = (out["_merge"] == "both").astype(int)
-        out = out.drop(columns=["_merge"])
-    else:
-        out["is_event"] = 0
-
-    # day_type
-    if "day_type" in out.columns:
-        out["is_not_normal_day"] = (out["day_type"].astype(str) == "Not Normal Day").astype(int)
-    else:
-        out["is_not_normal_day"] = 0
-
-    return out.fillna(0)
+def pretty_money(x: float) -> str:
+    try:
+        return f"₱{x:,.2f}"
+    except Exception:
+        return str(x)
