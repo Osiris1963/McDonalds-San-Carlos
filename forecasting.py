@@ -3,7 +3,13 @@ import pandas as pd
 from typing import Tuple, Optional
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.ensemble import GradientBoostingRegressor
-import lightgbm as lgb
+
+# LightGBM is great but sometimes not available on Streamlit builds.
+try:
+    import lightgbm as lgb
+    _HAS_LGBM = True
+except Exception:
+    _HAS_LGBM = False
 
 def smape(y_true, y_pred):
     y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
@@ -88,14 +94,15 @@ def _train_direct_horizon_models(hist: pd.DataFrame, H: int):
     for h in range(1, H+1):
         y_h = y_full.shift(-h)
         df_h = pd.concat([X_full, y_h.rename("y")], axis=1).dropna()
-        if len(df_h) < 100:
-            model = GradientBoostingRegressor(random_state=42)
-        else:
+        if _HAS_LGBM and len(df_h) >= 100:
             model = lgb.LGBMRegressor(
                 n_estimators=600, learning_rate=0.03, max_depth=-1,
                 subsample=0.85, colsample_bytree=0.85,
                 min_child_samples=20, reg_alpha=0.1, reg_lambda=0.1, random_state=42,
             )
+        else:
+            # Fallback if LightGBM is missing or dataset too small
+            model = GradientBoostingRegressor(random_state=42)
         model.fit(df_h[features], df_h["y"]); models.append(model)
     return models, features
 
@@ -146,3 +153,27 @@ def combine_sales_and_bands(dates, customers, customers_bands, atv, atv_bands, r
         out["customers_p90"] = np.maximum(0, customers_bands["p90"])
         out["atv_p10"] = np.maximum(0, atv_bands["p10"])
         out["atv_p50"] = np.maximum(0, atv_bands["p50"])
+        out["atv_p90"] = np.maximum(0, atv_bands["p90"])
+        out["sales_p10"] = out["customers_p10"] * out["atv_p10"]
+        out["sales_p50"] = out["customers_p50"] * out["atv_p50"]
+        out["sales_p90"] = out["customers_p90"] * out["atv_p90"]
+    else:
+        out["customers_p50"] = customers; out["atv_p50"] = atv; out["sales_p50"] = customers * atv
+    return out
+
+def backtest_metrics(hist: pd.DataFrame, horizon: int = 15, folds: int = 6) -> pd.DataFrame:
+    cutoffs, sm_c, sm_a, sm_s, ms_c, ms_a, ms_s = [], [], [], [], [], [], []
+    total_len = len(hist); min_train = 200 if total_len > 400 else int(total_len * 0.5)
+    step = max(1, (total_len - min_train - horizon) // max(1, folds))
+    for i in range(folds):
+        train_end = min_train + i*step
+        if train_end + horizon >= total_len: break
+        train, test = hist.iloc[:train_end], hist.iloc[train_end:train_end+horizon]
+        future_cal = test[["dow","is_weekend","is_holiday","is_payday","is_payday_minus1","is_payday_plus1","month","week"]].copy()
+        cust_fc,_ = forecast_customers_with_trend_correction(train, future_cal, horizon, return_bands=False)
+        atv_fc,_  = forecast_atv_direct(train, future_cal, horizon, return_bands=False)
+        sales_fc = cust_fc * atv_fc
+        sm_c.append(smape(test["customers"], cust_fc)); sm_a.append(smape(test["atv"], atv_fc)); sm_s.append(smape(test["sales"], sales_fc))
+        ms_c.append(mase(test["customers"], cust_fc, train["customers"])); ms_a.append(mase(test["atv"], atv_fc, train["atv"])); ms_s.append(mase(test["sales"], sales_fc, train["sales"]))
+        cutoffs.append(train.index.max())
+    return pd.DataFrame({"cutoff": cutoffs, "sMAPE_customers": sm_c, "sMAPE_atv": sm_a, "sMAPE_sales": sm_s, "MASE_customers": ms_c, "MASE_atv": ms_a, "MASE_sales": ms_s})
