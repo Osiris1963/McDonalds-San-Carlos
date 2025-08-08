@@ -1,144 +1,121 @@
-# data_processing.py
-import pandas as pd
 import numpy as np
+import pandas as pd
+from datetime import datetime, date
+import holidays
+from dateutil.relativedelta import relativedelta
 
-def load_from_firestore(db_client, collection_name):
-    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
-    if db_client is None:
-        return pd.DataFrame()
-    
-    docs = db_client.collection(collection_name).stream()
-    records = []
-    for doc in docs:
-        record = doc.to_dict()
-        record['doc_id'] = doc.id
-        records.append(record)
-        
-    if not records:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(records)
-    
-    if 'date' not in df.columns:
-        return pd.DataFrame()
+PH_HOLIDAYS = holidays.country_holidays("PH")
 
-    df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df.dropna(subset=['date'], inplace=True)
-    
-    if pd.api.types.is_datetime64_any_dtype(df['date']):
-        if getattr(df['date'].dt, "tz", None) is not None:
-            df['date'] = df['date'].dt.tz_convert(None)
-        df['date'] = df['date'].dt.normalize()
+REQ_BASE_COLS = ["date"]
+OPTIONAL_COLS = ["sales", "customers", "atv", "weather", "event_flag", "notes"]
 
-    df.sort_values(by='date', inplace=True)
-    df.drop_duplicates(subset=['date'], keep='last', inplace=True)
-    
-    numeric_cols = ['sales', 'customers', 'add_on_sales']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    if out["date"].isna().any():
+        raise ValueError("Some dates could not be parsed. Please clean your 'date' column.")
+    out = out.sort_values("date").drop_duplicates("date")
+    out = out.set_index("date")
+    return out
 
-    return df.sort_values(by='date').reset_index(drop=True)
+def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    idx = out.index
+    out["dow"] = idx.dayofweek  # 0=Mon
+    out["dom"] = idx.day
+    out["week"] = idx.isocalendar().week.astype(int)
+    out["month"] = idx.month
+    out["year"] = idx.year
+    out["is_weekend"] = (out["dow"] >= 5).astype(int)
 
+    # Paydays (15th and end-of-month); plus ±1 day effect
+    out["is_payday"] = ((out["dom"] == 15) | (idx == (idx + pd.offsets.MonthEnd(0)))).astype(int)
+    out["is_payday_minus1"] = ((idx + pd.Timedelta(days=1)).day == 15).astype(int) | ((idx + pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) + pd.Timedelta(days=1))).astype(int)
+    out["is_payday_plus1"]  = ((idx - pd.Timedelta(days=1)).day == 15).astype(int) | ((idx - pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) - pd.Timedelta(days=1))).astype(int)
 
-def _same_dow_baseline_columns(df_copy, var, weeks=[1,2,3,4,5,6,7,8]):
-    """
-    Build robust same-weekday baselines by averaging var shifted by multiples of 7 days.
-    """
-    lags = []
-    for w in weeks:
-        col = f'{var}_lag_{7*w}'
-        df_copy[col] = df_copy[var].shift(7*w)
-        lags.append(col)
-    # Robust stats across the last 8 same-weekday observations
-    vals = df_copy[lags]
-    df_copy[f'{var}_same_dow_mean_8w'] = vals.mean(axis=1)
-    df_copy[f'{var}_same_dow_median_8w'] = vals.median(axis=1)
-    df_copy[f'{var}_same_dow_std_8w'] = vals.std(axis=1)
-    return df_copy
+    # PH holidays
+    out["is_holiday"] = [int(d in PH_HOLIDAYS) for d in idx.date]
+    return out
 
+def _compute_atv_if_missing(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    has_sales = "sales" in out.columns
+    has_customers = "customers" in out.columns
+    has_atv = "atv" in out.columns
+    if has_sales and has_customers:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["atv"] = out["sales"] / out["customers"]
+    elif has_atv and has_customers and not has_sales:
+        out["sales"] = out["atv"] * out["customers"]
+    elif has_atv and has_sales and not has_customers:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out["customers"] = np.where(out["atv"] > 0, out["sales"] / out["atv"], np.nan)
 
-def create_advanced_features(df, events_df):
-    """
-    Creates a rich feature set for a unified Gradient Boosting model from the full time series,
-    intentionally de-emphasizing very recent values to avoid trend-chasing.
-    """
-    df_copy = df.copy()
+    # sanitize
+    if "customers" in out.columns:
+        out["customers"] = out["customers"].replace([np.inf, -np.inf], np.nan)
+    if "atv" in out.columns:
+        out["atv"] = out["atv"].replace([np.inf, -np.inf], np.nan)
+    if "sales" in out.columns:
+        out["sales"] = out["sales"].replace([np.inf, -np.inf], np.nan)
+    return out
 
-    # --- Foundational Metrics (Cleansed) ---
-    customers_safe = df_copy['customers'].replace(0, np.nan)
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-    df_copy['atv'] = (base_sales / customers_safe)
+def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    # --- Time-Based Features ---
-    df_copy['month'] = df_copy['date'].dt.month
-    df_copy['day'] = df_copy['date'].dt.day
-    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
-    df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
-    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('int')
-    df_copy['year'] = df_copy['date'].dt.year
-    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
+    # ensure expected numeric cols exist if provided
+    for c in ["sales", "customers", "atv"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-    # One-hot for dayofweek (stabilizes weekday patterns)
-    dow_dummies = pd.get_dummies(df_copy['dayofweek'], prefix='dow', dtype=int)
-    df_copy = pd.concat([df_copy, dow_dummies], axis=1)
+    out = _compute_atv_if_missing(out)
 
-    # --- Cyclical & Payday Features ---
-    df_copy['is_payday_period'] = df_copy['date'].apply(
-        lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
-    ).astype(int)
-    df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
-    df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
+    # Basic validity checks
+    if "customers" in out.columns and out["customers"].notna().sum() == 0:
+        raise ValueError("No valid 'customers' found/derivable.")
+    if "atv" in out.columns and out["atv"].notna().sum() == 0:
+        raise ValueError("No valid 'atv' found/derivable.")
+    if "sales" in out.columns and out["sales"].notna().sum() == 0:
+        # If sales entirely missing, compute now that we (likely) have both customers and atv
+        out["sales"] = out["customers"] * out["atv"]
 
-    # --- Weather (categorical) ---
-    if 'weather' in df_copy.columns:
-        df_copy['weather'] = df_copy['weather'].fillna('Unknown')
-        weather_dummies = pd.get_dummies(df_copy['weather'], prefix='weather', dtype=int)
-        df_copy = pd.concat([df_copy, weather_dummies], axis=1)
-        df_copy.drop('weather', axis=1, inplace=True)
+    out = _add_calendar_features(out)
 
-    # --- Advanced Time Series Features ---
-    # IMPORTANT: deliberately drop ultra-short lags (1,2) to reduce trend chasing.
-    target_vars = ['sales', 'customers', 'atv']
+    # Lags/rolling (for ATV modeling mostly)
+    for lag in [7, 14, 28]:
+        out[f"customers_lag{lag}"] = out["customers"].shift(lag)
+        out[f"atv_lag{lag}"] = out["atv"].shift(lag)
+    out["atv_roll7_med"] = out["atv"].rolling(7, min_periods=3).median()
+    out["atv_roll14_med"] = out["atv"].rolling(14, min_periods=5).median()
+    out["atv_roll28_med"] = out["atv"].rolling(28, min_periods=7).median()
 
-    # Weekly lags only
-    lag_days = [7, 14, 21, 28]
-    for var in target_vars:
-        for lag in lag_days:
-            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+    out = out.dropna().copy()  # safe for modeling
+    return out
 
-    # Rolling stats over longer windows and on shifted series
-    windows = [14, 28]
-    for var in target_vars:
-        for w in windows:
-            series_shifted = df_copy[var].shift(7)  # shift by 1 week to avoid using yesterday
-            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+def add_future_calendar(hist: pd.DataFrame, periods: int) -> pd.DataFrame:
+    last_date = hist.index.max()
+    future_idx = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods, freq="D")
+    future = pd.DataFrame(index=future_idx)
+    future = _add_calendar_features(future)
+    return future
 
-        # Exponential moving averages with small alpha (smoother)
-        df_copy[f'{var}_ewm_30'] = df_copy[var].shift(7).ewm(span=30, adjust=False, min_periods=1).mean()
+def build_event_frame(events_df: pd.DataFrame) -> pd.DataFrame:
+    ev = events_df.copy()
+    ev["date"] = pd.to_datetime(ev["date"], errors="coerce")
+    if ev["date"].isna().any():
+        raise ValueError("Event dates contain invalid entries.")
+    ev = ev.set_index("date").sort_index()
+    # Enforce columns
+    for c in ["uplift_customers_pct", "uplift_atv_pct"]:
+        if c not in ev.columns:
+            ev[c] = 0.0
+        ev[c] = pd.to_numeric(ev[c], errors="coerce").fillna(0.0)
+    if "notes" not in ev.columns:
+        ev["notes"] = ""
+    return ev
 
-        # Same-day-of-week robust baselines (last 8 occurrences)
-        df_copy = _same_dow_baseline_columns(df_copy, var, weeks=[1,2,3,4,5,6,7,8])
-
-    # Seasonality cycles
-    df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
-    df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
-    df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
-    df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
-
-    # --- External Events ---
-    if events_df is not None and not events_df.empty:
-        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
-        events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
-        df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event')
-        df_copy['is_event'] = (df_copy['is_event'] == 'both').astype(int)
-    else:
-        df_copy['is_event'] = 0
-
-    if 'day_type' in df_copy.columns:
-        df_copy['is_not_normal_day'] = (df_copy['day_type'] == 'Not Normal Day').astype(int)
-    else:
-        df_copy['is_not_normal_day'] = 0
-        
-    return df_copy.fillna(0)
+def pretty_money(x: float) -> str:
+    try:
+        return f"₱{x:,.2f}"
+    except Exception:
+        return str(x)
