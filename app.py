@@ -1,5 +1,6 @@
-# app.py — Firestore-first (no CSV), upgraded 2025 logic, tabs: Forecast / Edit Data / Insights
-# Uses Streamlit Secrets key: [firebase_credentials]  (your posted format)  — also supports [gcp_service_account]
+# app.py — Firestore-first (no CSV), upgraded 2025 logic
+# Uses Streamlit Secrets key: [firebase_credentials]
+# Collections (defaults): historical_data, future_activities, forecasts, backtest_metrics
 
 import io
 import os
@@ -9,7 +10,7 @@ import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
-# --- Firebase / Firestore (optional import error handled) ---
+# --- Firebase / Firestore ---
 try:
     import firebase_admin
     from firebase_admin import credentials, firestore
@@ -17,7 +18,7 @@ try:
 except Exception:
     _FB_OK = False
 
-# ---- Local modules (from files we already set up) ----
+# Local modules (from files we already set up)
 from data_processing import (
     load_history_from_firestore,
     load_events_from_firestore,
@@ -44,7 +45,7 @@ st.title("AI Sales & Customer Forecaster — 2025 Edition")
 st.caption("Firestore-first. ETS+damped trend + recent-trend (Customers) • Direct multi-horizon LightGBM (ATV) • Events/PH holidays/paydays • Backtesting • Insights")
 
 # =========================
-# FIRESTORE INIT (reads your [firebase_credentials])
+# FIRESTORE INIT
 # =========================
 @st.cache_resource
 def get_firestore_client():
@@ -54,37 +55,34 @@ def get_firestore_client():
         if not firebase_admin._apps:
             cred = None
 
-            # 1) Preferred: [firebase_credentials] (your secrets) or [gcp_service_account]
+            # Preferred: [firebase_credentials] (your secrets) or [gcp_service_account]
             for key in ("firebase_credentials", "gcp_service_account"):
                 if key in st.secrets:
                     info = dict(st.secrets[key])
-                    # Fix escaped newlines inside private_key
                     if "private_key" in info and isinstance(info["private_key"], str):
                         info["private_key"] = info["private_key"].replace("\\n", "\n")
                     cred = credentials.Certificate(info)
                     break
 
-            # 2) Raw JSON in secrets
+            # Raw JSON string
             if cred is None and "GOOGLE_APPLICATION_CREDENTIALS_JSON" in st.secrets:
                 info = json.loads(str(st.secrets["GOOGLE_APPLICATION_CREDENTIALS_JSON"]))
                 if "private_key" in info:
                     info["private_key"] = info["private_key"].replace("\\n", "\n")
                 cred = credentials.Certificate(info)
 
-            # 3) Path in secrets / env / default file
+            # Path fallback
             if cred is None:
-                path = None
-                if "service_account_file" in st.secrets:
-                    path = st.secrets["service_account_file"]
-                elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-                    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-                elif os.path.exists("serviceAccountKey.json"):
-                    path = "serviceAccountKey.json"
-                if path and os.path.exists(path):
+                path = (
+                    st.secrets.get("service_account_file", None)
+                    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                    or ("serviceAccountKey.json" if os.path.exists("serviceAccountKey.json") else None)
+                )
+                if path:
                     cred = credentials.Certificate(path)
 
             if cred is None:
-                return None  # no credentials found
+                return None
 
             firebase_admin.initialize_app(cred)
 
@@ -100,19 +98,18 @@ db = get_firestore_client()
 # =========================
 with st.sidebar:
     st.header("Firestore Collections")
-    HIST_COLLECTION = st.text_input("History (read/write)", value="daily_history")
+    HIST_COLLECTION = st.text_input("History (read/write)", value="historical_data")
     EVENTS_COLLECTION = st.text_input("Future events (read)", value="future_activities")
     FORECASTS_COLLECTION = st.text_input("Forecasts (write)", value="forecasts")
     BACKTEST_COLLECTION = st.text_input("Backtest metrics (write)", value="backtest_metrics")
 
     if db is None:
-        st.error("Firestore not configured. Secrets must contain [firebase_credentials] (your format).")
+        st.error("Firestore not configured. Secrets must contain [firebase_credentials].")
     else:
         st.success("Firestore connected.")
 
     save_runs = st.toggle("Save new runs to Firestore", value=(db is not None))
 
-# Stop early if no DB
 if db is None:
     st.stop()
 
@@ -133,10 +130,10 @@ if "latest_forecast" not in st.session_state:
 with tab_forecast:
     st.subheader("Run Forecast")
 
-    # 1) Pull history & events from Firestore (no CSV needed)
+    # Load history from Firestore
     hist_raw = load_history_from_firestore(db, HIST_COLLECTION)
     if hist_raw.empty:
-        st.error(f"No documents found in '{HIST_COLLECTION}'. Please populate your history collection.")
+        st.error(f"No documents found in '{HIST_COLLECTION}'.")
         st.stop()
 
     hist = ensure_datetime_index(hist_raw)
@@ -158,7 +155,6 @@ with tab_forecast:
         show_bands = st.checkbox("Show P10/P50/P90 bands", True)
     with right:
         st.subheader("Events/Uplifts")
-        # Load any planned events; if none, show empty template for next H days
         ev_db = load_events_from_firestore(
             db,
             EVENTS_COLLECTION,
@@ -170,7 +166,7 @@ with tab_forecast:
     run_btn = st.button("🚀 Run Forecast", type="primary", use_container_width=True)
     bt_btn = st.button("🧪 Backtest (Rolling Origin)", use_container_width=True)
 
-    # ---------- Pipeline ----------
+    # Pipeline
     def run_pipeline(df_hist: pd.DataFrame, H: int, events_future_df: pd.DataFrame) -> pd.DataFrame:
         future_cal = add_future_calendar(df_hist, periods=H)
         ev = build_event_frame_from_df(events_future_df, index=future_cal.index)
@@ -220,7 +216,6 @@ with tab_forecast:
             metrics = backtest_metrics(hist, horizon=int(H), folds=6)
         st.subheader("📊 Backtest Metrics")
         st.dataframe(metrics, use_container_width=True)
-        # Save backtest metrics
         if save_runs and db is not None and not metrics.empty:
             batch = db.batch()
             col = db.collection(BACKTEST_COLLECTION)
@@ -242,7 +237,6 @@ with tab_forecast:
                 pretty[c] = pretty[c].round(0).astype(int)
         st.dataframe(pretty, use_container_width=True, height=420)
 
-        # Download
         buf = io.StringIO()
         st.session_state["latest_forecast"].to_csv(buf)
         st.download_button("Download forecast.csv", buf.getvalue(), "forecast.csv", "text/csv")
@@ -267,7 +261,7 @@ with tab_edit:
                     continue
                 doc_id = str(r["date"])
                 payload = dict(r.dropna())
-                for k in ("customers", "sales", "atv"):
+                for k in ("customers", "sales", "atv", "add_on_sales"):
                     if k in payload:
                         try:
                             payload[k] = float(payload[k])
