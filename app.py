@@ -1,12 +1,18 @@
 import io
+import os
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
 
-# Firebase
-import firebase_admin
-from firebase_admin import credentials, firestore
+# Firebase (optional)
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    _FIREBASE_AVAILABLE = True
+except Exception:
+    _FIREBASE_AVAILABLE = False
 
 from data_processing import (
     ensure_datetime_index,
@@ -23,23 +29,6 @@ from forecasting import (
 )
 
 # --------------------
-# FIREBASE INIT
-# --------------------
-# Replace with the path to your Firebase service account JSON
-SERVICE_ACCOUNT_PATH = "serviceAccountKey.json"
-
-if not firebase_admin._apps:
-    try:
-        cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-    except Exception as e:
-        st.error(f"Firebase initialization failed: {e}")
-        db = None
-else:
-    db = firestore.client()
-
-# --------------------
 # STREAMLIT CONFIG
 # --------------------
 st.set_page_config(page_title="AI Sales Forecaster (2025)", layout="wide")
@@ -47,48 +36,77 @@ st.title("AI Sales & Customer Forecaster — 2025 Edition")
 st.caption("Hybrid: ETS (trend-first) for Customers + Direct Multi-Horizon LightGBM for ATV. With events, PH holidays, and paydays.")
 
 # --------------------
-# FIREBASE SAVE FUNCTIONS
+# OPTIONAL FIREBASE INIT (non-blocking, no banner)
 # --------------------
-def save_forecast_to_firestore(df_forecast, run_id):
-    """Save forecast DataFrame to Firestore."""
-    if db is None:
-        return
-    batch = db.batch()
-    for date, row in df_forecast.iterrows():
-        doc_ref = db.collection("forecasts").document(f"{run_id}_{date.date()}")
-        batch.set(doc_ref, row.to_dict())
-    batch.commit()
+def get_firestore_client():
+    """
+    Initialize Firestore if credentials exist.
+    Priority:
+      1) st.secrets['gcp_service_account']  (dict)
+      2) st.secrets['service_account_file'] (path)
+      3) ENV SERVICE_ACCOUNT_PATH           (path)
+    Returns firestore.Client or None.
+    """
+    if not _FIREBASE_AVAILABLE:
+        return None
+    try:
+        if not firebase_admin._apps:
+            cred = None
+            # 1) Dict credentials from Streamlit Secrets
+            if "gcp_service_account" in st.secrets:
+                cred_info = dict(st.secrets["gcp_service_account"])
+                cred = credentials.Certificate(cred_info)
+            # 2) File path from secrets
+            elif "service_account_file" in st.secrets and os.path.exists(st.secrets["service_account_file"]):
+                cred = credentials.Certificate(st.secrets["service_account_file"])
+            else:
+                # 3) ENV var (or default file) if exists
+                sa_path = os.getenv("SERVICE_ACCOUNT_PATH", "serviceAccountKey.json")
+                if os.path.exists(sa_path):
+                    cred = credentials.Certificate(sa_path)
 
-def save_backtest_to_firestore(metrics_df, run_id):
-    """Save backtest metrics to Firestore."""
-    if db is None:
-        return
-    batch = db.batch()
-    for _, row in metrics_df.iterrows():
-        doc_ref = db.collection("backtest_metrics").document(f"{run_id}_{row['cutoff'].date()}")
-        batch.set(doc_ref, row.to_dict())
-    batch.commit()
+            if cred is None:
+                return None  # credentials not provided; run app without Firestore
+
+            firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception:
+        # Never break the UI if Firebase fails
+        return None
+
+db = get_firestore_client()
+
+# Sidebar toggle to save to Firestore only if db is available
+with st.sidebar:
+    st.subheader("Storage")
+    if db is not None:
+        save_to_firestore = st.toggle("Save runs to Firestore", value=True, help="Turn off if you want local-only runs.")
+        st.success("Firestore connected.")
+    else:
+        save_to_firestore = False
+        st.info("Firestore not configured. App runs normally without saving.")
 
 # --------------------
-# FILE UPLOAD + SETTINGS
+# HELP / DATA FORMAT (kept like before)
 # --------------------
 with st.expander("📘 Data format (CSV)"):
     st.markdown(
         """
         **Required columns** (case-insensitive):
         - `date` (YYYY-MM-DD or parseable date)
-        - `customers` and `sales` (ATV will be auto-computed),  
-          or `customers` and `atv`
+        - `customers` and `sales` (ATV auto-computed), **or** `customers` and `atv`  
         **Granularity:** Daily
         """
     )
 
+# --------------------
+# CONTROLS (same layout/feel)
+# --------------------
 uploaded = st.file_uploader("Upload historical CSV", type=["csv"])
 default_horizon = 15
 H = st.number_input("Forecast horizon (days)", min_value=7, max_value=35, value=default_horizon, step=1)
 
 left, right = st.columns([1,1])
-
 with left:
     st.subheader("🔧 Options")
     apply_weekday_caps = st.checkbox("Apply realistic weekday growth caps for Customers", value=True)
@@ -114,6 +132,27 @@ download_forecast = run_cols[2].button("💾 Download latest forecast (CSV)")
 
 if "latest_forecast" not in st.session_state:
     st.session_state["latest_forecast"] = None
+
+# --------------------
+# FIRESTORE SAVE HELPERS (only used when toggle is on)
+# --------------------
+def save_forecast_to_firestore(df_forecast, run_id):
+    if not (save_to_firestore and db is not None):
+        return
+    batch = db.batch()
+    for date_idx, row in df_forecast.iterrows():
+        doc_ref = db.collection("forecasts").document(f"{run_id}_{date_idx.date()}")
+        batch.set(doc_ref, row.to_dict())
+    batch.commit()
+
+def save_backtest_to_firestore(metrics_df, run_id):
+    if not (save_to_firestore and db is not None):
+        return
+    batch = db.batch()
+    for _, row in metrics_df.iterrows():
+        doc_ref = db.collection("backtest_metrics").document(f"{run_id}_{row['cutoff'].date()}")
+        batch.set(doc_ref, row.to_dict())
+    batch.commit()
 
 # --------------------
 # VALIDATION + PIPELINE
@@ -161,7 +200,7 @@ def run_pipeline(df_hist: pd.DataFrame, H: int, events_future: pd.DataFrame):
     return combined
 
 # --------------------
-# MAIN EXECUTION
+# MAIN
 # --------------------
 if uploaded is not None:
     try:
@@ -175,7 +214,7 @@ if uploaded is not None:
             run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             fc = run_pipeline(hist, H, events_df)
             st.session_state["latest_forecast"] = fc
-            save_forecast_to_firestore(fc, run_id)  # Save to Firestore
+            save_forecast_to_firestore(fc, run_id)
 
         if do_backtest:
             with st.spinner("Running backtest..."):
@@ -183,7 +222,7 @@ if uploaded is not None:
             st.subheader("📊 Backtest Metrics (Rolling Origin)")
             st.write(metrics)
             run_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            save_backtest_to_firestore(metrics, run_id)  # Save to Firestore
+            save_backtest_to_firestore(metrics, run_id)
 
         if st.session_state["latest_forecast"] is not None:
             st.subheader("🔮 Forecast")
@@ -193,6 +232,7 @@ if uploaded is not None:
                 if c.startswith("atv") or c.startswith("sales"):
                     pretty[c] = pretty[c].apply(pretty_money)
                 else:
+                    # customers columns
                     pretty[c] = pretty[c].round(0).astype(int)
             st.dataframe(pretty, use_container_width=True, height=400)
 
@@ -202,8 +242,7 @@ if uploaded is not None:
 
             if download_forecast:
                 buf = io.StringIO()
-                out = fc.copy()
-                out.to_csv(buf, index=True)
+                fc.to_csv(buf, index=True)
                 st.download_button(
                     "Download forecast.csv",
                     buf.getvalue(),
