@@ -1,121 +1,125 @@
-import numpy as np
+# data_processing.py — Firestore I/O + feature engineering
+
 import pandas as pd
-from datetime import datetime, date
-import holidays
-from dateutil.relativedelta import relativedelta
+import numpy as np
 
-PH_HOLIDAYS = holidays.country_holidays("PH")
+def load_from_firestore(db_client, collection_name: str) -> pd.DataFrame:
+    """Load a collection from Firestore into a clean DataFrame with a proper date index."""
+    if db_client is None:
+        return pd.DataFrame()
 
-REQ_BASE_COLS = ["date"]
-OPTIONAL_COLS = ["sales", "customers", "atv", "weather", "event_flag", "notes"]
+    docs = list(db_client.collection(collection_name).stream())
+    rows = []
+    for d in docs:
+        rec = d.to_dict() or {}
+        # prefer explicit 'date' field; else use doc id
+        rec_date = rec.get("date", d.id)
+        # Firestore Timestamp → datetime
+        if hasattr(rec_date, "to_datetime"):
+            rec_date = rec_date.to_datetime()
+        # datetime/date → string
+        if hasattr(rec_date, "isoformat"):
+            rec_date = rec_date.strftime("%Y-%m-%d")
+        rec["date"] = rec_date
+        rec["doc_id"] = d.id
+        rows.append(rec)
 
-def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "date" not in df.columns:
+        return pd.DataFrame()
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    df = df.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return df
+
+def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Feature builder used for both training and forecasting.
+    - computes atv if sales+customers present
+    - calendar, payday, weekend, cyclical features
+    - weather dummies (if present)
+    - lags & rolling stats for customers/atv
+    - event flag (from events_df)
+    - day_type guard (is_not_normal_day if provided)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     out = df.copy()
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    if out["date"].isna().any():
-        raise ValueError("Some dates could not be parsed. Please clean your 'date' column.")
-    out = out.sort_values("date").drop_duplicates("date")
-    out = out.set_index("date")
-    return out
+    # numeric casts
+    for col in ("customers", "sales", "atv", "add_on_sales"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
-def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    idx = out.index
-    out["dow"] = idx.dayofweek  # 0=Mon
-    out["dom"] = idx.day
-    out["week"] = idx.isocalendar().week.astype(int)
-    out["month"] = idx.month
-    out["year"] = idx.year
-    out["is_weekend"] = (out["dow"] >= 5).astype(int)
+    # compute atv if possible — remove add_on_sales from base
+    if "atv" not in out.columns or out["atv"].isna().all():
+        if "sales" in out.columns and "customers" in out.columns:
+            base_sales = out["sales"] - out.get("add_on_sales", 0)
+            cust = out["customers"].replace(0, np.nan)
+            out["atv"] = base_sales / cust
 
-    # Paydays (15th and end-of-month); plus ±1 day effect
-    out["is_payday"] = ((out["dom"] == 15) | (idx == (idx + pd.offsets.MonthEnd(0)))).astype(int)
-    out["is_payday_minus1"] = ((idx + pd.Timedelta(days=1)).day == 15).astype(int) | ((idx + pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) + pd.Timedelta(days=1))).astype(int)
-    out["is_payday_plus1"]  = ((idx - pd.Timedelta(days=1)).day == 15).astype(int) | ((idx - pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) - pd.Timedelta(days=1))).astype(int)
+    # calendar
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out = out.dropna(subset=["date"]).sort_values("date")
+    out["month"] = out["date"].dt.month
+    out["day"] = out["date"].dt.day
+    out["dayofweek"] = out["date"].dt.dayofweek
+    out["dayofyear"] = out["date"].dt.dayofyear
+    out["weekofyear"] = out["date"].dt.isocalendar().week.astype(int)
+    out["year"] = out["date"].dt.year
+    out["time_idx"] = (out["date"] - out["date"].min()).dt.days
 
-    # PH holidays
-    out["is_holiday"] = [int(d in PH_HOLIDAYS) for d in idx.date]
-    return out
+    # payday / weekend interactions
+    out["is_payday_period"] = out["day"].isin([14,15,16,29,30,31,1,2]).astype(int)
+    out["is_weekend"] = (out["dayofweek"] >= 5).astype(int)
+    out["payday_weekend_interaction"] = out["is_payday_period"] * out["is_weekend"]
 
-def _compute_atv_if_missing(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    has_sales = "sales" in out.columns
-    has_customers = "customers" in out.columns
-    has_atv = "atv" in out.columns
-    if has_sales and has_customers:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out["atv"] = out["sales"] / out["customers"]
-    elif has_atv and has_customers and not has_sales:
-        out["sales"] = out["atv"] * out["customers"]
-    elif has_atv and has_sales and not has_customers:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out["customers"] = np.where(out["atv"] > 0, out["sales"] / out["atv"], np.nan)
+    # weather dummies if present
+    if "weather" in out.columns:
+        out["weather"] = out["weather"].fillna("Unknown").astype(str)
+        wd = pd.get_dummies(out["weather"], prefix="weather", dtype=int)
+        out = pd.concat([out, wd], axis=1)
 
-    # sanitize
-    if "customers" in out.columns:
-        out["customers"] = out["customers"].replace([np.inf, -np.inf], np.nan)
-    if "atv" in out.columns:
-        out["atv"] = out["atv"].replace([np.inf, -np.inf], np.nan)
-    if "sales" in out.columns:
-        out["sales"] = out["sales"].replace([np.inf, -np.inf], np.nan)
-    return out
+    # lags & rolling
+    for lag in (7, 14, 28):
+        if "customers" in out.columns:
+            out[f"customers_lag{lag}"] = out["customers"].shift(lag)
+        if "atv" in out.columns:
+            out[f"atv_lag{lag}"] = out["atv"].shift(lag)
 
-def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    for w in (7, 14):
+        if "customers" in out.columns:
+            out[f"customers_roll_mean_{w}"] = out["customers"].shift(1).rolling(w, min_periods=1).mean()
+            out[f"customers_roll_std_{w}"]  = out["customers"].shift(1).rolling(w, min_periods=1).std()
+        if "atv" in out.columns:
+            out[f"atv_roll_mean_{w}"] = out["atv"].shift(1).rolling(w, min_periods=1).mean()
+            out[f"atv_roll_std_{w}"]  = out["atv"].shift(1).rolling(w, min_periods=1).std()
 
-    # ensure expected numeric cols exist if provided
-    for c in ["sales", "customers", "atv"]:
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce")
+    # cyclical encodings
+    out["dayofyear_sin"] = np.sin(2 * np.pi * out["dayofyear"] / 365.25)
+    out["dayofyear_cos"] = np.cos(2 * np.pi * out["dayofyear"] / 365.25)
+    out["weekofyear_sin"] = np.sin(2 * np.pi * out["weekofyear"] / 52)
+    out["weekofyear_cos"] = np.cos(2 * np.pi * out["weekofyear"] / 52)
 
-    out = _compute_atv_if_missing(out)
+    # events flag
+    if events_df is not None and not events_df.empty:
+        ev = events_df.copy()
+        ev["date"] = pd.to_datetime(ev["date"], errors="coerce").dt.normalize()
+        ev = ev.dropna(subset=["date"]).drop_duplicates(subset=["date"])
+        out = out.merge(ev[["date"]], on="date", how="left", indicator=True)
+        out["is_event"] = (out["_merge"] == "both").astype(int)
+        out = out.drop(columns=["_merge"])
+    else:
+        out["is_event"] = 0
 
-    # Basic validity checks
-    if "customers" in out.columns and out["customers"].notna().sum() == 0:
-        raise ValueError("No valid 'customers' found/derivable.")
-    if "atv" in out.columns and out["atv"].notna().sum() == 0:
-        raise ValueError("No valid 'atv' found/derivable.")
-    if "sales" in out.columns and out["sales"].notna().sum() == 0:
-        # If sales entirely missing, compute now that we (likely) have both customers and atv
-        out["sales"] = out["customers"] * out["atv"]
+    # day_type
+    if "day_type" in out.columns:
+        out["is_not_normal_day"] = (out["day_type"].astype(str) == "Not Normal Day").astype(int)
+    else:
+        out["is_not_normal_day"] = 0
 
-    out = _add_calendar_features(out)
-
-    # Lags/rolling (for ATV modeling mostly)
-    for lag in [7, 14, 28]:
-        out[f"customers_lag{lag}"] = out["customers"].shift(lag)
-        out[f"atv_lag{lag}"] = out["atv"].shift(lag)
-    out["atv_roll7_med"] = out["atv"].rolling(7, min_periods=3).median()
-    out["atv_roll14_med"] = out["atv"].rolling(14, min_periods=5).median()
-    out["atv_roll28_med"] = out["atv"].rolling(28, min_periods=7).median()
-
-    out = out.dropna().copy()  # safe for modeling
-    return out
-
-def add_future_calendar(hist: pd.DataFrame, periods: int) -> pd.DataFrame:
-    last_date = hist.index.max()
-    future_idx = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods, freq="D")
-    future = pd.DataFrame(index=future_idx)
-    future = _add_calendar_features(future)
-    return future
-
-def build_event_frame(events_df: pd.DataFrame) -> pd.DataFrame:
-    ev = events_df.copy()
-    ev["date"] = pd.to_datetime(ev["date"], errors="coerce")
-    if ev["date"].isna().any():
-        raise ValueError("Event dates contain invalid entries.")
-    ev = ev.set_index("date").sort_index()
-    # Enforce columns
-    for c in ["uplift_customers_pct", "uplift_atv_pct"]:
-        if c not in ev.columns:
-            ev[c] = 0.0
-        ev[c] = pd.to_numeric(ev[c], errors="coerce").fillna(0.0)
-    if "notes" not in ev.columns:
-        ev["notes"] = ""
-    return ev
-
-def pretty_money(x: float) -> str:
-    try:
-        return f"₱{x:,.2f}"
-    except Exception:
-        return str(x)
+    return out.fillna(0)
