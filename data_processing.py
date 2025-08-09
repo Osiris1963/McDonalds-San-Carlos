@@ -50,15 +50,11 @@ def create_advanced_features(df, events_df):
     """
     df_copy = df.copy()
 
-    # --- Foundational Metrics (Cleansed) ---
-    # // SENIOR DEV NOTE //: THE FIX IS HERE. We only run these calculations if the source columns exist.
-    # This prevents the KeyError when we pass a future-only dataframe.
     if 'customers' in df_copy.columns and 'sales' in df_copy.columns:
         customers_safe = df_copy['customers'].replace(0, np.nan)
         df_copy['base_sales'] = df_copy['sales'] - df_copy.get('add_on_sales', 0)
         df_copy['atv'] = (df_copy['base_sales'] / customers_safe)
 
-    # --- Time-Based Features (Always runs) ---
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['day'] = df_copy['date'].dt.day
     df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
@@ -67,7 +63,6 @@ def create_advanced_features(df, events_df):
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
 
-    # --- Cyclical & Event Features (Always runs) ---
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
@@ -81,29 +76,31 @@ def create_advanced_features(df, events_df):
         df_copy.drop('weather', axis=1, inplace=True)
 
     # --- Advanced Time Series Features ---
-    # // SENIOR DEV NOTE //: This section is also wrapped in a check. Lag/rolling features
-    # can only be created if there is historical data to create them from.
     if 'customers' in df_copy.columns:
         target_vars = ['sales', 'customers', 'atv', 'base_sales']
+        
+        # // SENIOR DEV NOTE //: THE FIX IS HERE. Restoring the nested loops.
         lag_days = [1, 2, 7, 14] 
         for var in target_vars:
             if var in df_copy:
-                 df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+                # This 'for' loop was missing, causing the NameError on 'lag'. It is now restored.
+                for lag in lag_days:
+                     df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
         windows = [3, 7, 14]
         for var in target_vars:
             if var in df_copy:
                 series_shifted = df_copy[var].shift(1)
-                df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-                df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+                # This 'for' loop was also missing, which would cause a NameError on 'w'. It is now restored.
+                for w in windows:
+                    df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+                    df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
-    # --- Cyclical & Event Features (Continued - Always runs) ---
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
     df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
     
-    # --- External Regressors (Events & Holidays - Always runs) ---
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         if 'date' in events_df_unique.columns:
