@@ -1,12 +1,10 @@
-# forecasting.py (Tuned Models & Stacked Ensemble)
+# forecasting.py (Final Production Version)
 import pandas as pd
 from prophet import Prophet
 import lightgbm as lgb
 import xgboost as xgb
-from sklearn.linear_model import RidgeCV
 from datetime import timedelta
 import warnings
-import numpy as np
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -65,69 +63,20 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     if len(future_dates) == 0:
         return pd.DataFrame(), None
 
-    # --- Base Model Training ---
     df_prophet = df_day_featured[['date', target]].rename(columns={'date': 'ds', target: 'y'})
     prophet_holidays = generate_ph_holidays(df_prophet['ds'].min(), future_dates.max(), events_df)
     prophet_model = Prophet(holidays=prophet_holidays, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
     prophet_model.fit(df_prophet)
+    future_prophet_df = pd.DataFrame({'ds': future_dates})
+    forecast_prophet = prophet_model.predict(future_prophet_df)
 
-    MIN_SAMPLES_FOR_TREE_MODELS = 15
+    MIN_SAMPLES_FOR_TREE_MODELS = 10
     if len(df_train) < MIN_SAMPLES_FOR_TREE_MODELS:
-        forecast_prophet = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
         return forecast_prophet[['ds', 'yhat']], prophet_model
         
     X_train = df_train[final_features]
     y_train = df_train[target]
-    
-    # --- MODIFICATION START: Target-Specific Training Adjustments ---
-    sample_weights = None
-    y_train_for_training = y_train
 
-    # 1. For 'customers', add more weight to recent data points to follow trends more closely.
-    if target == 'customers':
-        print(f"Applying AGGRESSIVE recency weights for CUSTOMERS on day {day_of_week}.")
-        # --- MORE AGGRESSIVE WEIGHTING ---
-        # The weight range is now 0.25 to 2.0, making the newest data 8x more influential than the oldest.
-        time_weights = np.linspace(0.25, 2.0, len(X_train)) 
-        sample_weights = pd.Series(time_weights, index=X_train.index)
-
-    # 2. For 'atv', cap outliers at the 95th percentile to create a more conservative forecast.
-    if target == 'atv':
-        print(f"Capping outliers for ATV on day {day_of_week}.")
-        p95 = y_train.quantile(0.95)
-        # The training target for tree models and the meta-learner will be the capped version.
-        y_train_for_training = y_train.clip(upper=p95)
-    # --- MODIFICATION END ---
-    
-    # --- Pre-tuned Hyperparameters (Result of Offline Optuna Study) ---
-    lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.1, 'lambda_l2': 0.1, 'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt'}
-    xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'seed': 42, 'n_jobs': -1}
-
-    lgbm = lgb.LGBMRegressor(**lgbm_params)
-    lgbm.fit(X_train, y_train_for_training, sample_weight=sample_weights)
-
-    xgb_model = xgb.XGBRegressor(**xgb_params)
-    xgb_model.fit(X_train, y_train_for_training, sample_weight=sample_weights)
-    
-    # --- Stacking Ensemble ---
-    # 1. Get base model predictions on the training data itself to train the meta-learner
-    prophet_train_fcst = prophet_model.predict(df_train[['date']].rename(columns={'date':'ds'}))
-    lgbm_train_preds = lgbm.predict(X_train)
-    xgb_train_preds = xgb_model.predict(X_train)
-
-    # 2. Create the meta-feature set
-    X_meta = pd.DataFrame({
-        'prophet': prophet_train_fcst['yhat'].values,
-        'lgbm': lgbm_train_preds,
-        'xgb': xgb_train_preds
-    })
-
-    # 3. Train the meta-learner (RidgeCV is robust and fast)
-    meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
-    # Train the meta-learner on the adjusted (potentially capped) target data
-    meta_learner.fit(X_meta, y_train_for_training)
-
-    # 4. Get base model predictions on FUTURE data
     future_placeholder = pd.DataFrame({'date': future_dates})
     combined_df_for_features = pd.concat([df_day_featured, future_placeholder], ignore_index=True)
     combined_df_with_features = create_features(combined_df_for_features, events_df)
@@ -137,21 +86,22 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
     X_future.fillna(method='ffill', inplace=True) 
     X_future.fillna(0, inplace=True)
 
-    prophet_future_fcst = prophet_model.predict(pd.DataFrame({'ds': future_dates}))
-    lgbm_future_preds = lgbm.predict(X_future)
-    xgb_future_preds = xgb_model.predict(X_future)
+    lgbm = lgb.LGBMRegressor(random_state=42)
+    lgbm.fit(X_train, y_train)
+    lgbm_preds = lgbm.predict(X_future)
 
-    # 5. Create the future meta-feature set
-    X_meta_future = pd.DataFrame({
-        'prophet': prophet_future_fcst['yhat'].values,
-        'lgbm': lgbm_future_preds,
-        'xgb': xgb_future_preds
-    })
-
-    # 6. Make the final prediction using the meta-learner
-    final_stacked_preds = meta_learner.predict(X_meta_future)
+    xgb_model = xgb.XGBRegressor(random_state=42)
+    xgb_model.fit(X_train, y_train)
+    xgb_preds = xgb_model.predict(X_future)
     
-    day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_stacked_preds})
+    weights = {'prophet': 0.3, 'lgbm': 0.4, 'xgb': 0.3}
+    final_preds = (
+        forecast_prophet['yhat'].values * weights['prophet'] +
+        lgbm_preds * weights['lgbm'] +
+        xgb_preds * weights['xgb']
+    )
+    
+    day_forecast_df = pd.DataFrame({'ds': future_dates, 'yhat': final_preds})
     
     return day_forecast_df, prophet_model
 
@@ -186,6 +136,7 @@ def generate_forecast(historical_df, events_df, periods=15):
     cust_forecast_final.rename(columns={'yhat': 'forecast_customers'}, inplace=True)
     atv_forecast_final.rename(columns={'yhat': 'forecast_atv'}, inplace=True)
 
+    # Use an inner merge as a final safeguard to ensure dates align perfectly
     final_df = pd.merge(cust_forecast_final, atv_forecast_final, on='ds', how='inner')
     if final_df.empty:
         return pd.DataFrame(), None
