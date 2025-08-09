@@ -1,4 +1,5 @@
 # data_processing.py
+from typing import Optional
 import pandas as pd
 import numpy as np
 
@@ -79,17 +80,13 @@ def _add_weekend_payday_flags(df: pd.DataFrame):
     df["is_weekend"] = (dow >= 5).astype(int)
     # Simple payday heuristic: 15th & 30th/31st, plus nearest Friday if weekend
     d = df["date"].dt.day
-    m = df["date"].dt.month
-    y = df["date"].dt.year
-
     payday = (d.isin([15, 30, 31])).astype(int)
-    # Nudge: Friday near payday (±1)
     friday = (dow == 4)
     payday |= ((d.isin([14, 16, 29])) & friday).astype(int)
     df["is_paydayish"] = payday
     return df
 
-def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -> pd.DataFrame:
+def create_advanced_features(df: pd.DataFrame, events_df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """
     Creates a robust feature set for customers + ATV models.
     Assumes df has columns: date, sales, customers, add_on_sales (optional), day_type/notes (optional).
@@ -117,12 +114,12 @@ def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -
     df["is_month_start"] = df["date"].dt.is_month_start.astype(int)
     df["is_month_end"] = df["date"].dt.is_month_end.astype(int)
 
-    # Cyclical encodings (help generalization, avoid step jumps)
+    # Cyclical encodings
     dow_cyc = _cyclical_encode(df["dayofweek"], 7, "dow")
     moy_cyc = _cyclical_encode(df["month"], 12, "moy")
     df = pd.concat([df, dow_cyc, moy_cyc], axis=1)
 
-    # Lags (use shift to avoid leakage)
+    # Lags (shifted to avoid leakage)
     for col in ["customers", "sales"]:
         df[f"{col}_lag_1"] = df[col].shift(1)
         df[f"{col}_lag_2"] = df[col].shift(2)
@@ -130,14 +127,15 @@ def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -
         df[f"{col}_lag_14"] = df[col].shift(14)
 
     # Rolling stats (shifted by 1)
-    df["customers_rm7"] = _rolling_shifted(df["customers"], 7, 1, "mean")
-    df["customers_rm14"] = _rolling_shifted(df["customers"], 14, 1, "mean")
-    df["customers_rm28"] = _rolling_shifted(df["customers"], 28, 1, "mean")
-    df["sales_rm7"] = _rolling_shifted(df["sales"], 7, 1, "mean")
-    df["sales_rm14"] = _rolling_shifted(df["sales"], 14, 1, "mean")
-    df["sales_rm28"] = _rolling_shifted(df["sales"], 28, 1, "mean")
-    df["sales_rstd14"] = _rolling_shifted(df["sales"], 14, 1, "std")
-    df["customers_rstd14"] = _rolling_shifted(df["customers"], 14, 1, "std")
+    def _roll(col): return df[col]
+    df["customers_rm7"] = _rolling_shifted(_roll("customers"), 7, 1, "mean")
+    df["customers_rm14"] = _rolling_shifted(_roll("customers"), 14, 1, "mean")
+    df["customers_rm28"] = _rolling_shifted(_roll("customers"), 28, 1, "mean")
+    df["sales_rm7"] = _rolling_shifted(_roll("sales"), 7, 1, "mean")
+    df["sales_rm14"] = _rolling_shifted(_roll("sales"), 14, 1, "mean")
+    df["sales_rm28"] = _rolling_shifted(_roll("sales"), 28, 1, "mean")
+    df["sales_rstd14"] = _rolling_shifted(_roll("sales"), 14, 1, "std")
+    df["customers_rstd14"] = _rolling_shifted(_roll("customers"), 14, 1, "std")
 
     # Flags
     df = _add_weekend_payday_flags(df)
@@ -153,13 +151,13 @@ def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -
     else:
         df["is_event"] = 0
 
-    # Day-type from data if present
+    # Day-type
     if "day_type" in df.columns:
         df["is_not_normal_day"] = (df["day_type"].astype(str) == "Not Normal Day").astype(int)
     else:
         df["is_not_normal_day"] = 0
 
-    # Fill NaNs for model stability
+    # Fill NaNs
     df = df.fillna(0)
 
     return df
