@@ -19,7 +19,6 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    # // SENIOR DEV NOTE //: Added 'future_activities' as a potential collection name to handle gracefully if date is missing.
     if 'date' not in df.columns:
         if collection_name == 'future_activities' and 'event_date' in df.columns:
             df.rename(columns={'event_date': 'date'}, inplace=True)
@@ -52,8 +51,12 @@ def create_advanced_features(df, events_df):
 
     # --- Foundational Metrics (Cleansed) ---
     customers_safe = df_copy['customers'].replace(0, np.nan)
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-    df_copy['atv'] = (base_sales / customers_safe)
+    
+    # // SENIOR DEV NOTE //: THIS IS THE CRITICAL CHANGE.
+    # We are now creating an explicit 'base_sales' column. This is the target our
+    # sales model will be trained on, aligning it with the user's ATV logic.
+    df_copy['base_sales'] = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    df_copy['atv'] = (df_copy['base_sales'] / customers_safe)
 
     # --- Time-Based Features ---
     df_copy['month'] = df_copy['date'].dt.month
@@ -78,21 +81,23 @@ def create_advanced_features(df, events_df):
         df_copy.drop('weather', axis=1, inplace=True)
 
     # --- Advanced Time Series Features ---
-    target_vars = ['sales', 'customers', 'atv']
+    # We now create lags and rolling features for 'base_sales' as well.
+    target_vars = ['sales', 'customers', 'atv', 'base_sales']
     
     lag_days = [1, 2, 7, 14] 
     for var in target_vars:
         for lag in lag_days:
-            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+            # Check if column exists to avoid errors on first run
+            if var in df_copy:
+                 df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
-    # // SENIOR DEV NOTE //: Added a 3-day window to capture very recent trends.
-    # This gives the model explicit features about short-term momentum, which complements the sample weighting.
     windows = [3, 7, 14]
     for var in target_vars:
         for w in windows:
-            series_shifted = df_copy[var].shift(1)
-            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+            if var in df_copy:
+                series_shifted = df_copy[var].shift(1)
+                df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+                df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
     # --- Cyclical & Event Features (Continued) ---
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
