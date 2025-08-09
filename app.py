@@ -15,7 +15,7 @@ from forecasting import generate_customer_forecast, generate_atv_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v5.1 (Patched)",
+    page_title="Sales Forecaster v5.2 (Patched)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -107,7 +107,7 @@ def get_events_data(_db_conn):
     return load_from_firestore(_db_conn, 'future_activities')
 
 def render_historical_record(row, db_client):
-    """Renders an editable historical data record."""
+    """Renders an editable historical data record with data integrity checks."""
     if 'doc_id' not in row or pd.isna(row['doc_id']):
         return
 
@@ -117,17 +117,12 @@ def render_historical_record(row, db_client):
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
 
-        # --- THIS IS THE CORRECTED SECTION ---
-        # SENIOR DEV NOTE: This logic now robustly handles bad data from Firestore.
-        # It prevents the app from crashing if 'day_type' is null, empty, or an unexpected value.
         day_type_options = ["Normal Day", "Not Normal Day"]
-        current_day_type = row.get('day_type', day_type_options[0]) # Default to 'Normal Day' if key is missing
+        current_day_type = row.get('day_type', day_type_options[0])
 
-        # Safely determine the index for the selectbox
         try:
             current_index = day_type_options.index(current_day_type)
         except ValueError:
-            # If the value from the DB is invalid (e.g., None, '', 'Holiday'), default to the first option
             current_index = 0
             current_day_type = day_type_options[0]
             st.warning(f"Found an invalid 'day_type' for {date_str}. Defaulting to 'Normal Day'.")
@@ -137,7 +132,6 @@ def render_historical_record(row, db_client):
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             st.markdown("**Edit Record**")
             
-            # Use the safely determined index
             updated_day_type = st.selectbox(
                 "Day Type", 
                 day_type_options, 
@@ -157,7 +151,6 @@ apply_custom_styling()
 db = init_firestore()
 
 if db:
-    # SENIOR DEV NOTE: Session state is the key to managing the new multi-step workflow.
     if 'customer_forecast_df' not in st.session_state:
         st.session_state.customer_forecast_df = None
     if 'atv_forecast_df' not in st.session_state:
@@ -169,12 +162,11 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.1")
+        st.title("AI Forecaster v5.2")
         st.info("Decoupled Engine: LGBM + Prophet")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear(); st.cache_resource.clear()
-            # Clear workflow state as well
             for key in ['customer_forecast_df', 'atv_forecast_df', 'final_forecast_df', 'customer_model']:
                 st.session_state[key] = None
             st.success("Caches & state cleared. Rerunning..."); time.sleep(1); st.rerun()
@@ -191,7 +183,7 @@ if db:
                     cust_df, cust_model = generate_customer_forecast(historical_df, events_df)
                     st.session_state.customer_forecast_df = cust_df
                     st.session_state.customer_model = cust_model
-                    st.session_state.final_forecast_df = None # Invalidate final forecast
+                    st.session_state.final_forecast_df = None
                 st.success("Customer forecast complete!")
 
         st.subheader("Step 2: Forecast ATV")
@@ -204,7 +196,7 @@ if db:
                 with st.spinner("⏳ Training ATV Model (Prophet)..."):
                     atv_df, _ = generate_atv_forecast(historical_df, events_df)
                     st.session_state.atv_forecast_df = atv_df
-                    st.session_state.final_forecast_df = None # Invalidate final forecast
+                    st.session_state.final_forecast_df = None
                 st.success("ATV forecast complete!")
         
         st.markdown("---")
@@ -225,7 +217,6 @@ if db:
         if is_disabled:
             st.caption("Complete Steps 1 & 2 to enable.")
 
-    # --- Main Panel with Tabs ---
     tab_list = ["🔮 Forecast Dashboard", "💡 Customer Model Insights", "✍️ Edit Data"]
     tabs = st.tabs(tab_list)
 
