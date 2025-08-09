@@ -1,7 +1,7 @@
 # app.py
+from typing import Optional
 import streamlit as st
 import pandas as pd
-import time
 from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -9,52 +9,36 @@ from firebase_admin import credentials, firestore
 from data_processing import load_from_firestore
 from forecasting import generate_forecast
 
-# ---------------------------
-# Page Config & Styles
-# ---------------------------
 st.set_page_config(page_title="Sales & Customers Forecaster", page_icon="📈", layout="wide")
 
 st.markdown("""
 <style>
-/* Tidy up the look a bit */
 .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
 [data-testid="stMetricValue"] { font-weight: 800; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------
-# Firestore Connection
-# ---------------------------
 @st.cache_resource(show_spinner=False)
-def get_db_client(_service_json: dict | None):
-    """
-    Returns a Firestore client. If firebase_admin is already initialized, reuse it.
-    Otherwise initialize from a provided service account dict or st.secrets["firebase"].
-    """
+def get_db_client(_service_json: Optional[dict]):
     if firestore is None:
         return None
-
     if not firebase_admin._apps:
         try:
             if _service_json:
                 cred = credentials.Certificate(_service_json)
             else:
-                # Try secrets (if configured in Streamlit Cloud)
                 cred = credentials.Certificate(st.secrets["firebase"])  # type: ignore
             firebase_admin.initialize_app(cred)
         except Exception:
             return None
     return firestore.client()
 
-# ---------------------------
-# Sidebar Controls
-# ---------------------------
 with st.sidebar:
     st.header("🔐 Firestore")
     auth_mode = st.radio("Auth source", ["Secrets", "Paste JSON"], horizontal=True)
     svc_json = None
     if auth_mode == "Paste JSON":
-        svc_text = st.text_area("Service Account JSON", height=180, help="Paste the full service account JSON here.")
+        svc_text = st.text_area("Service Account JSON", height=180)
         if svc_text.strip():
             import json
             try:
@@ -80,9 +64,6 @@ if db is None:
     st.error("Could not connect to Firestore. Check your credentials.")
     st.stop()
 
-# ---------------------------
-# Load Data
-# ---------------------------
 with st.spinner("Loading history..."):
     hist_df = load_from_firestore(db, history_col)
 
@@ -94,7 +75,6 @@ events_df = pd.DataFrame()
 if events_col:
     with st.spinner("Loading events..."):
         events_df = load_from_firestore(db, events_col)
-        # Only keep date column as a calendar of event days
         if not events_df.empty:
             events_df = events_df[["date"]].drop_duplicates()
 
@@ -112,9 +92,6 @@ with c4:
 
 st.dataframe(hist_df.tail(30), use_container_width=True)
 
-# ---------------------------
-# Forecast
-# ---------------------------
 st.subheader("Forecast Result")
 with st.spinner("Training models and generating forecast..."):
     fc_df, model_c = generate_forecast(hist_df.rename(columns={"date": "date"}), events_df, periods=int(horizon))
@@ -123,7 +100,6 @@ if fc_df.empty:
     st.warning("No forecast could be generated.")
     st.stop()
 
-# KPI row
 k1, k2, k3 = st.columns(3)
 with k1:
     st.metric("Forecast Days", len(fc_df))
@@ -135,15 +111,11 @@ with k3:
 st.write("### Table")
 st.dataframe(fc_df, use_container_width=True)
 
-# ---------------------------
-# Optional Logging
-# ---------------------------
 def log_forecast(db_client, collection_name: str, forecast_df: pd.DataFrame) -> bool:
     try:
         batch = db_client.batch()
         ts = datetime.utcnow().isoformat()
         for _, row in forecast_df.iterrows():
-            # deterministic doc id: YYYY-MM-DD
             doc_id = pd.to_datetime(row["ds"]).strftime("%Y-%m-%d")
             ref = db_client.collection(collection_name).document(doc_id)
             payload = {
@@ -164,5 +136,3 @@ if do_log:
     ok = log_forecast(db, logs_col, fc_df)
     if ok:
         st.success(f"Logged {len(fc_df)} forecast rows to '{logs_col}'.")
-
-st.caption("Tip: To fine-tune, add more history and label special event days in your events collection.")
