@@ -19,7 +19,6 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    # // SENIOR DEV NOTE //: Added 'future_activities' as a potential collection name to handle gracefully if date is missing.
     if 'date' not in df.columns:
         if collection_name == 'future_activities' and 'event_date' in df.columns:
             df.rename(columns={'event_date': 'date'}, inplace=True)
@@ -85,8 +84,6 @@ def create_advanced_features(df, events_df):
         for lag in lag_days:
             df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
-    # // SENIOR DEV NOTE //: Added a 3-day window to capture very recent trends.
-    # This gives the model explicit features about short-term momentum, which complements the sample weighting.
     windows = [3, 7, 14]
     for var in target_vars:
         for w in windows:
