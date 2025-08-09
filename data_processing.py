@@ -1,163 +1,120 @@
 # data_processing.py
-from typing import Optional
 import pandas as pd
 import numpy as np
 
-# ---------------------------
-# Firestore -> DataFrame
-# ---------------------------
-def load_from_firestore(db_client, collection_name: str) -> pd.DataFrame:
-    """
-    Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates.
-    Expected doc fields (typical): date (str/ts), sales (float), customers (int),
-    add_on_sales (float, optional), day_type (str, optional), day_type_notes (str, optional).
-    """
+def load_from_firestore(db_client, collection_name):
+    """Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates."""
     if db_client is None:
         return pd.DataFrame()
-
+    
     docs = db_client.collection(collection_name).stream()
     records = []
     for doc in docs:
-        d = doc.to_dict() or {}
-        d["doc_id"] = doc.id
-        records.append(d)
-
+        record = doc.to_dict()
+        record['doc_id'] = doc.id
+        records.append(record)
+        
     if not records:
         return pd.DataFrame()
-
+    
     df = pd.DataFrame(records)
-    # Normalize date
-    if "date" not in df.columns:
-        return pd.DataFrame()
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    
+    # // SENIOR DEV NOTE //: Added 'future_activities' as a potential collection name to handle gracefully if date is missing.
+    if 'date' not in df.columns:
+        if collection_name == 'future_activities' and 'event_date' in df.columns:
+            df.rename(columns={'event_date': 'date'}, inplace=True)
+        else:
+            return pd.DataFrame()
 
-    # Basic cols
-    for col in ["sales", "customers", "add_on_sales"]:
-        if col not in df.columns:
-            df[col] = 0.0 if col != "customers" else 0
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df.dropna(subset=['date'], inplace=True)
+    
+    if pd.api.types.is_datetime64_any_dtype(df['date']):
+        if df['date'].dt.tz is not None:
+            df['date'] = df['date'].dt.tz_convert(None)
+        df['date'] = df['date'].dt.normalize()
 
-    # De-duplicate by date (keep latest)
-    df = df.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
+    df.sort_values(by='date', inplace=True)
+    df.drop_duplicates(subset=['date'], keep='last', inplace=True)
+    
+    numeric_cols = ['sales', 'customers', 'add_on_sales']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-    # Type safety
-    df["customers"] = pd.to_numeric(df["customers"], errors="coerce").fillna(0).astype(int)
-    df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0.0)
-    df["add_on_sales"] = pd.to_numeric(df["add_on_sales"], errors="coerce").fillna(0.0)
+    return df.sort_values(by='date').reset_index(drop=True)
 
-    # Guard for negatives
-    df["customers"] = df["customers"].clip(lower=0)
-    df["sales"] = df["sales"].clip(lower=0)
-    df["add_on_sales"] = df["add_on_sales"].clip(lower=0)
-
-    return df.sort_values("date").reset_index(drop=True)
-
-# ---------------------------
-# Feature Engineering
-# ---------------------------
-def _cyclical_encode(series: pd.Series, period: int, prefix: str) -> pd.DataFrame:
-    angle = 2 * np.pi * series / period
-    return pd.DataFrame({
-        f"{prefix}_sin": np.sin(angle),
-        f"{prefix}_cos": np.cos(angle),
-    }, index=series.index)
-
-def _safe_div(n, d):
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out = np.where(d == 0, np.nan, n / d)
-    return pd.Series(out)
-
-def _rolling_shifted(s: pd.Series, window: int, shift_by: int = 1, fn: str = "mean"):
-    if fn == "mean":
-        return s.shift(shift_by).rolling(window).mean()
-    if fn == "std":
-        return s.shift(shift_by).rolling(window).std()
-    if fn == "sum":
-        return s.shift(shift_by).rolling(window).sum()
-    return s.shift(shift_by).rolling(window).mean()
-
-def _add_weekend_payday_flags(df: pd.DataFrame):
-    dow = df["date"].dt.dayofweek
-    df["is_weekend"] = (dow >= 5).astype(int)
-    # Simple payday heuristic: 15th & 30th/31st, plus nearest Friday if weekend
-    d = df["date"].dt.day
-    payday = (d.isin([15, 30, 31])).astype(int)
-    friday = (dow == 4)
-    payday |= ((d.isin([14, 16, 29])) & friday).astype(int)
-    df["is_paydayish"] = payday
-    return df
-
-def create_advanced_features(df: pd.DataFrame, events_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+def create_advanced_features(df, events_df):
     """
-    Creates a robust feature set for customers + ATV models.
-    Assumes df has columns: date, sales, customers, add_on_sales (optional), day_type/notes (optional).
-    Returns a DataFrame with features + targets (customers, atv).
+    Creates a rich feature set for a unified Gradient Boosting model from the full time series.
     """
-    if df is None or df.empty:
-        return pd.DataFrame()
+    df_copy = df.copy()
 
-    df = df.copy()
-    df = df.sort_values("date").reset_index(drop=True)
+    # --- Foundational Metrics (Cleansed) ---
+    customers_safe = df_copy['customers'].replace(0, np.nan)
+    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    df_copy['atv'] = (base_sales / customers_safe)
 
-    # Base and ATV (base = sales minus add-ons)
-    if "add_on_sales" not in df.columns:
-        df["add_on_sales"] = 0.0
-    base_sales = (df["sales"] - df["add_on_sales"]).clip(lower=0)
-    customers_safe = df["customers"].replace(0, np.nan)
-    df["atv"] = _safe_div(base_sales, customers_safe)
+    # --- Time-Based Features ---
+    df_copy['month'] = df_copy['date'].dt.month
+    df_copy['day'] = df_copy['date'].dt.day
+    df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
+    df_copy['dayofyear'] = df_copy['date'].dt.dayofyear
+    df_copy['weekofyear'] = df_copy['date'].dt.isocalendar().week.astype('int')
+    df_copy['year'] = df_copy['date'].dt.year
+    df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
 
-    # Calendar features
-    df["month"] = df["date"].dt.month
-    df["day"] = df["date"].dt.day
-    df["dayofweek"] = df["date"].dt.dayofweek
-    df["dayofyear"] = df["date"].dt.dayofyear
-    df["weekofyear"] = df["date"].dt.isocalendar().week.astype(int)
-    df["is_month_start"] = df["date"].dt.is_month_start.astype(int)
-    df["is_month_end"] = df["date"].dt.is_month_end.astype(int)
+    # --- Cyclical & Event Features ---
+    df_copy['is_payday_period'] = df_copy['date'].apply(
+        lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
+    ).astype(int)
+    df_copy['is_weekend'] = (df_copy['dayofweek'] >= 5).astype(int)
+    df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
 
-    # Cyclical encodings
-    dow_cyc = _cyclical_encode(df["dayofweek"], 7, "dow")
-    moy_cyc = _cyclical_encode(df["month"], 12, "moy")
-    df = pd.concat([df, dow_cyc, moy_cyc], axis=1)
+    if 'weather' in df_copy.columns:
+        df_copy['weather'] = df_copy['weather'].fillna('Unknown')
+        weather_dummies = pd.get_dummies(df_copy['weather'], prefix='weather', dtype=int)
+        df_copy = pd.concat([df_copy, weather_dummies], axis=1)
+        df_copy.drop('weather', axis=1, inplace=True)
 
-    # Lags (shifted to avoid leakage)
-    for col in ["customers", "sales"]:
-        df[f"{col}_lag_1"] = df[col].shift(1)
-        df[f"{col}_lag_2"] = df[col].shift(2)
-        df[f"{col}_lag_7"] = df[col].shift(7)
-        df[f"{col}_lag_14"] = df[col].shift(14)
+    # --- Advanced Time Series Features ---
+    target_vars = ['sales', 'customers', 'atv']
+    
+    lag_days = [1, 2, 7, 14] 
+    for var in target_vars:
+        for lag in lag_days:
+            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
-    # Rolling stats (shifted by 1)
-    def _roll(col): return df[col]
-    df["customers_rm7"] = _rolling_shifted(_roll("customers"), 7, 1, "mean")
-    df["customers_rm14"] = _rolling_shifted(_roll("customers"), 14, 1, "mean")
-    df["customers_rm28"] = _rolling_shifted(_roll("customers"), 28, 1, "mean")
-    df["sales_rm7"] = _rolling_shifted(_roll("sales"), 7, 1, "mean")
-    df["sales_rm14"] = _rolling_shifted(_roll("sales"), 14, 1, "mean")
-    df["sales_rm28"] = _rolling_shifted(_roll("sales"), 28, 1, "mean")
-    df["sales_rstd14"] = _rolling_shifted(_roll("sales"), 14, 1, "std")
-    df["customers_rstd14"] = _rolling_shifted(_roll("customers"), 14, 1, "std")
+    # // SENIOR DEV NOTE //: Added a 3-day window to capture very recent trends.
+    # This gives the model explicit features about short-term momentum, which complements the sample weighting.
+    windows = [3, 7, 14]
+    for var in target_vars:
+        for w in windows:
+            series_shifted = df_copy[var].shift(1)
+            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
-    # Flags
-    df = _add_weekend_payday_flags(df)
-
-    # Events integration (binary)
-    if events_df is not None and not events_df.empty and "date" in events_df.columns:
-        e = events_df.copy()
-        e["date"] = pd.to_datetime(e["date"]).dt.normalize()
-        e = e.drop_duplicates(subset=["date"], keep="first")
-        df = df.merge(e[["date"]], on="date", how="left", indicator=True)
-        df["is_event"] = (df["_merge"] == "both").astype(int)
-        df.drop(columns=["_merge"], inplace=True)
+    # --- Cyclical & Event Features (Continued) ---
+    df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
+    df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
+    df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
+    df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
+    
+    # --- External Regressors (Events & Holidays) ---
+    if events_df is not None and not events_df.empty:
+        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
+        if 'date' in events_df_unique.columns:
+            events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
+            df_copy = pd.merge(df_copy, events_df_unique[['date']], on='date', how='left', indicator='is_event')
+            df_copy['is_event'] = (df_copy['is_event'] == 'both').astype(int)
+        else:
+            df_copy['is_event'] = 0
     else:
-        df["is_event"] = 0
+        df_copy['is_event'] = 0
 
-    # Day-type
-    if "day_type" in df.columns:
-        df["is_not_normal_day"] = (df["day_type"].astype(str) == "Not Normal Day").astype(int)
+    if 'day_type' in df_copy.columns:
+        df_copy['is_not_normal_day'] = (df_copy['day_type'] == 'Not Normal Day').astype(int)
     else:
-        df["is_not_normal_day"] = 0
-
-    # Fill NaNs
-    df = df.fillna(0)
-
-    return df
+        df_copy['is_not_normal_day'] = 0
+        
+    return df_copy.fillna(0)
