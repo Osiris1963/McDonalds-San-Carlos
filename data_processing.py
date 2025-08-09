@@ -1,4 +1,4 @@
-# data_processing.py (Enhanced with Interaction Features)
+# data_processing.py (Corrected for Realistic Future Features)
 import pandas as pd
 import numpy as np
 from datetime import timedelta
@@ -40,12 +40,12 @@ def load_from_firestore(db_client, collection_name):
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_features(df, events_df):
-    """Creates time-based, event-based, and advanced interaction features."""
+    """Creates time-based, event-based, and lag features that are knowable in the future."""
     df_copy = df.copy()
 
     feature_cols_to_drop = [
         'atv', 'month', 'dayofyear', 'weekofyear', 'year', 'dayofweek_num', 'dayofweek',
-        'is_payday_period', 'is_event', 'is_not_normal_day', 'is_weekend', 'payday_weekend_interaction',
+        'is_payday_period', 'is_event', 'is_not_normal_day',
         'day_Friday', 'day_Monday', 'day_Saturday', 'day_Sunday', 'day_Thursday', 'day_Tuesday', 'day_Wednesday'
     ]
     for col in df_copy.columns:
@@ -71,11 +71,6 @@ def create_features(df, events_df):
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
     
-    # --- NEW: Interaction Features ---
-    df_copy['is_weekend'] = (df_copy['date'].dt.dayofweek >= 5).astype(int) # Saturday=5, Sunday=6
-    df_copy['payday_weekend_interaction'] = df_copy['is_payday_period'] * df_copy['is_weekend']
-    # --- END NEW ---
-
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
@@ -90,8 +85,11 @@ def create_features(df, events_df):
     else:
         df_copy['is_not_normal_day'] = 0
 
+    # --- MODIFICATION: Only create lag features, which are knowable in the future. ---
+    # Rolling window features of the target are removed as they are unknowable.
     shift_val = 1 
-    for target in ['sales', 'customers', 'atv']:
+    targets_for_features = ['sales', 'customers', 'atv']
+    for target in targets_for_features:
         if target in df_copy.columns:
             df_copy[f'{target}_lag_7'] = df_copy[target].shift(shift_val + 6)
             df_copy[f'{target}_lag_14'] = df_copy[target].shift(shift_val + 13)
