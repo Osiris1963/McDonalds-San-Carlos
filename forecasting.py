@@ -2,120 +2,129 @@
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+from prophet import Prophet
 from datetime import timedelta
 from data_processing import create_advanced_features
 
 def generate_forecast(historical_df, events_df, periods=15):
     """
-    Generates a forecast by training the monetary model on 'base_sales' to align
-    with the business's specific definition of ATV.
+    Generates a forecast using a hybrid engine:
+    - Customers: Retains the robust Direct Multi-Step LightGBM strategy.
+    - Base Sales: Uses Facebook's Prophet model to handle time-series decomposition
+      and external regressors, providing a different and potentially more stable forecast.
     """
-    # --- 1. Model Training ---
-    
+    # --- 1. Data and Feature Preparation ---
     df_featured = create_advanced_features(historical_df, events_df)
-    train_df = df_featured.dropna(subset=['sales_rolling_mean_14']).reset_index(drop=True)
     
-    # // SENIOR DEV NOTE //: We update the FEATURES list to exclude our new target 'base_sales'
-    # and the original 'sales' to prevent data leakage.
-    FEATURES = [col for col in train_df.columns if col not in [
-        'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes',
-        'base_sales' # Add new target to exclusion list
+    # --- 2. Customer Model Training (UNCHANGED) ---
+    # We keep the superior Direct Multi-Step strategy for the customer forecast.
+    
+    FEATURES_LGBM = [col for col in df_featured.columns if col not in [
+        'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes', 'base_sales'
     ]]
-    TARGET_CUST = 'customers'
-    TARGET_BASE_SALES = 'base_sales' # The new, correct target for the monetary model.
-
+    models_cust = {}
     lgbm_params_cust = {
-        'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000,
+        'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 500,
         'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
         'bagging_freq': 1, 'reg_alpha': 0.1, 'reg_lambda': 0.1,
-        'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42,
-        'boosting_type': 'gbdt',
+        'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42
     }
+
+    for h in range(1, periods + 1):
+        train_df_lgbm = df_featured.copy()
+        train_df_lgbm['target_cust'] = train_df_lgbm['customers'].shift(-h)
+        train_df_lgbm.dropna(subset=['target_cust'], inplace=True)
+        
+        model_cust = lgb.LGBMRegressor(**lgbm_params_cust)
+        model_cust.fit(train_df_lgbm[FEATURES_LGBM], train_df_lgbm['target_cust'])
+        models_cust[h] = model_cust
+
+    # --- 3. Base Sales Model Training (NEW: PROPHET) ---
     
-    lgbm_params_sales = {
-        'objective': 'quantile', 'alpha': 0.5, 'metric': 'regression_l1',
-        'n_estimators': 1000, 'learning_rate': 0.05, 'feature_fraction': 0.8,
-        'bagging_fraction': 0.8, 'bagging_freq': 1, 'reg_alpha': 0.1,
-        'reg_lambda': 0.1, 'num_leaves': 31, 'verbose': -1,
-        'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt',
-    }
+    # // SENIOR DEV NOTE //: We now build and train a single Prophet model for base_sales.
+    # Prophet requires specific column names: 'ds' for date and 'y' for the target value.
+    prophet_train_df = df_featured[['date', 'base_sales']].rename(columns={'date': 'ds', 'base_sales': 'y'})
     
-    start_weight = 0.2
-    end_weight = 1.0
-    sample_weights = np.linspace(start_weight, end_weight, len(train_df))
+    # Define which of our features can be used as "extra regressors" in Prophet.
+    # These must be known for the future. Lag/rolling features cannot be used here.
+    PROPHET_REGRESSORS = [
+        'is_payday_period', 'is_weekend', 'payday_weekend_interaction',
+        'dayofyear_sin', 'dayofyear_cos', 'weekofyear_sin', 'weekofyear_cos',
+        'is_event', 'is_not_normal_day'
+    ]
+    
+    # Add the regressor columns to the training data.
+    for regressor in PROPHET_REGRESSORS:
+        if regressor in df_featured.columns:
+            prophet_train_df[regressor] = df_featured[regressor]
 
-    model_cust = lgb.LGBMRegressor(**lgbm_params_cust)
-    model_cust.fit(train_df[FEATURES], train_df[TARGET_CUST], sample_weight=sample_weights)
+    # Initialize and configure the Prophet model
+    model_base_sales_prophet = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=True,
+        daily_seasonality=False,
+        seasonality_mode='multiplicative', # Sales often have multiplicative seasonality
+        growth='linear'
+    )
+    
+    # Add each regressor to the model
+    for regressor in PROPHET_REGRESSORS:
+        if regressor in prophet_train_df.columns:
+            model_base_sales_prophet.add_regressor(regressor, mode='additive')
 
-    # Train the monetary model on the correct target: base_sales
-    model_base_sales = lgb.LGBMRegressor(**lgbm_params_sales)
-    model_base_sales.fit(train_df[FEATURES], train_df[TARGET_BASE_SALES], sample_weight=sample_weights)
-
-    # // SENIOR DEV NOTE //: To reconstruct total sales, we need a way to estimate add-on sales.
-    # We'll use a simple, stable historical ratio: average add-on sales per customer.
-    # We calculate this from the training data to avoid looking at future data.
-    safe_customers = train_df['customers'].replace(0, 1) # Avoid division by zero
-    avg_addon_per_customer = train_df['add_on_sales'].sum() / safe_customers.sum()
+    # Fit the Prophet model on the entire history
+    model_base_sales_prophet.fit(prophet_train_df.dropna())
 
 
-    # --- 2. Recursive Forecasting ---
+    # --- 4. Forecasting ---
+    
+    # First, get all customer predictions from our LightGBM models
+    lgbm_pred_features = df_featured[FEATURES_LGBM].iloc[-1:]
+    customer_predictions = [models_cust[h].predict(lgbm_pred_features)[0] for h in range(1, periods + 1)]
+
+    # Next, get all base_sales predictions from our Prophet model
+    # Create the 'future' dataframe that Prophet needs for forecasting
+    last_date = historical_df['date'].max()
+    future_dates = [last_date + timedelta(days=h) for h in range(1, periods + 1)]
+    future_df = pd.DataFrame({'ds': future_dates})
+
+    # We must generate the regressor features for these future dates
+    future_df_featured = create_advanced_features(pd.DataFrame({'date': future_dates}), events_df)
+    for regressor in PROPHET_REGRESSORS:
+         if regressor in future_df_featured.columns:
+            future_df[regressor] = future_df_featured[regressor]
+
+    # Predict future base_sales
+    sales_forecast_prophet = model_base_sales_prophet.predict(future_df)
+    base_sales_predictions = sales_forecast_prophet['yhat'].tolist()
+    
+    # --- 5. Combine and Finalize ---
     
     future_predictions = []
-    history_df = historical_df.copy()
-    last_date = history_df['date'].max()
+    avg_addon_per_customer = historical_df['add_on_sales'].sum() / historical_df['customers'].replace(0, 1).sum()
 
     for i in range(periods):
-        current_pred_date = last_date + timedelta(days=i + 1)
+        pred_cust = max(0, customer_predictions[i])
+        pred_base_sales = max(0, base_sales_predictions[i])
         
-        future_placeholder = pd.DataFrame([{'date': current_pred_date}])
-        temp_df = pd.concat([history_df, future_placeholder], ignore_index=True)
-        featured_for_pred = create_advanced_features(temp_df, events_df)
-        X_pred = featured_for_pred[FEATURES].iloc[-1:]
-
-        # Predict customers and BASE sales
-        pred_cust = model_cust.predict(X_pred)[0]
-        pred_base_sales = model_base_sales.predict(X_pred)[0]
-        
-        pred_cust = max(0, pred_cust)
-        pred_base_sales = max(0, pred_base_sales)
-
-        # Calculate ATV using the business-aligned logic. This will now be accurate.
         pred_atv = (pred_base_sales / pred_cust) if pred_cust > 0 else 0
         
-        # Estimate add-on sales and reconstruct the total sales forecast for the dashboard.
         estimated_add_on_sales = pred_cust * avg_addon_per_customer
         pred_total_sales = pred_base_sales + estimated_add_on_sales
-
-        # This new row will be used to generate features for the *next* day's forecast.
+        
         new_row = {
-            'date': current_pred_date,
-            'customers': pred_cust,
-            'sales': pred_total_sales,  # Use reconstructed total sales for history
-            'base_sales': pred_base_sales, # Add base_sales to history
-            'atv': pred_atv,
-            'add_on_sales': estimated_add_on_sales, # Add estimated add-ons
-            'day_type': 'Forecast'
+            'ds': last_date + timedelta(days=i + 1),
+            'forecast_customers': pred_cust,
+            'forecast_sales': pred_total_sales,
+            'forecast_atv': pred_atv,
         }
         future_predictions.append(new_row)
         
-        history_df = pd.concat([history_df, pd.DataFrame([new_row])], ignore_index=True)
-
-    if not future_predictions:
-        return pd.DataFrame(), None
-
-    # --- 3. Finalize and Return ---
-    
     final_forecast = pd.DataFrame(future_predictions)
-    # The 'sales' column in the dataframe now correctly refers to the reconstructed total sales.
-    final_forecast.rename(columns={
-        'date': 'ds',
-        'customers': 'forecast_customers',
-        'atv': 'forecast_atv',
-        'sales': 'forecast_sales'
-    }, inplace=True)
     
     final_forecast['forecast_sales'] = final_forecast['forecast_sales'].clip(lower=0)
     final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
     final_forecast['forecast_atv'] = final_forecast['forecast_atv'].clip(lower=0)
     
-    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], model_cust
+    # We return the first customer model for feature importance, as it remains a key part of the system.
+    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], models_cust.get(1)
