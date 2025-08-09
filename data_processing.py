@@ -1,120 +1,165 @@
+# data_processing.py
 import pandas as pd
 import numpy as np
-import holidays
 
-PH_HOLIDAYS = holidays.country_holidays("PH")
+# ---------------------------
+# Firestore -> DataFrame
+# ---------------------------
+def load_from_firestore(db_client, collection_name: str) -> pd.DataFrame:
+    """
+    Loads and preprocesses data from a Firestore collection, ensuring no duplicate dates.
+    Expected doc fields (typical): date (str/ts), sales (float), customers (int),
+    add_on_sales (float, optional), day_type (str, optional), day_type_notes (str, optional).
+    """
+    if db_client is None:
+        return pd.DataFrame()
 
-def load_history_from_firestore(db, collection: str, raw: bool = False) -> pd.DataFrame:
-    docs = list(db.collection(collection).stream())
-    rows = []
-    for d in docs:
-        rec = d.to_dict() or {}
-        rec_date = rec.get("date", d.id)
-        if hasattr(rec_date, "to_datetime"): rec_date = rec_date.to_datetime()
-        if hasattr(rec_date, "isoformat"):   rec_date = rec_date.strftime("%Y-%m-%d")
-        rec["date"] = rec_date; rec["doc_id"] = d.id; rows.append(rec)
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
-    if raw or df.empty: return df
-    df.columns = [c.lower() for c in df.columns]
+    docs = db_client.collection(collection_name).stream()
+    records = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        d["doc_id"] = doc.id
+        records.append(d)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    # Normalize date
+    if "date" not in df.columns:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+
+    # Basic cols
+    for col in ["sales", "customers", "add_on_sales"]:
+        if col not in df.columns:
+            df[col] = 0.0 if col != "customers" else 0
+
+    # De-duplicate by date (keep latest)
+    df = df.sort_values(["date"]).drop_duplicates(subset=["date"], keep="last")
+
+    # Type safety
+    df["customers"] = pd.to_numeric(df["customers"], errors="coerce").fillna(0).astype(int)
+    df["sales"] = pd.to_numeric(df["sales"], errors="coerce").fillna(0.0)
+    df["add_on_sales"] = pd.to_numeric(df["add_on_sales"], errors="coerce").fillna(0.0)
+
+    # Guard for negatives
+    df["customers"] = df["customers"].clip(lower=0)
+    df["sales"] = df["sales"].clip(lower=0)
+    df["add_on_sales"] = df["add_on_sales"].clip(lower=0)
+
+    return df.sort_values("date").reset_index(drop=True)
+
+# ---------------------------
+# Feature Engineering
+# ---------------------------
+def _cyclical_encode(series: pd.Series, period: int, prefix: str) -> pd.DataFrame:
+    angle = 2 * np.pi * series / period
+    return pd.DataFrame({
+        f"{prefix}_sin": np.sin(angle),
+        f"{prefix}_cos": np.cos(angle),
+    }, index=series.index)
+
+def _safe_div(n, d):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.where(d == 0, np.nan, n / d)
+    return pd.Series(out)
+
+def _rolling_shifted(s: pd.Series, window: int, shift_by: int = 1, fn: str = "mean"):
+    if fn == "mean":
+        return s.shift(shift_by).rolling(window).mean()
+    if fn == "std":
+        return s.shift(shift_by).rolling(window).std()
+    if fn == "sum":
+        return s.shift(shift_by).rolling(window).sum()
+    return s.shift(shift_by).rolling(window).mean()
+
+def _add_weekend_payday_flags(df: pd.DataFrame):
+    dow = df["date"].dt.dayofweek
+    df["is_weekend"] = (dow >= 5).astype(int)
+    # Simple payday heuristic: 15th & 30th/31st, plus nearest Friday if weekend
+    d = df["date"].dt.day
+    m = df["date"].dt.month
+    y = df["date"].dt.year
+
+    payday = (d.isin([15, 30, 31])).astype(int)
+    # Nudge: Friday near payday (±1)
+    friday = (dow == 4)
+    payday |= ((d.isin([14, 16, 29])) & friday).astype(int)
+    df["is_paydayish"] = payday
     return df
 
-def load_events_from_firestore(db, collection: str, horizon: int, start_date) -> pd.DataFrame:
-    docs = list(db.collection(collection).stream())
-    rows = []
-    for d in docs:
-        rec = d.to_dict() or {}
-        rec_date = rec.get("date", d.id)
-        if hasattr(rec_date, "to_datetime"): rec_date = rec_date.to_datetime()
-        if hasattr(rec_date, "isoformat"):   rec_date = rec_date.strftime("%Y-%m-%d")
-        rows.append({
-            "date": rec_date,
-            "uplift_customers_pct": float(rec.get("uplift_customers_pct", 0) or 0),
-            "uplift_atv_pct": float(rec.get("uplift_atv_pct", 0) or 0),
-            "notes": rec.get("notes", ""),
-        })
-    ev = pd.DataFrame(rows)
-    if ev.empty:
-        idx = pd.date_range(start=pd.to_datetime(start_date), periods=horizon, freq="D")
-        return pd.DataFrame({"date": idx, "uplift_customers_pct": 0.0, "uplift_atv_pct": 0.0, "notes": ""})
-    ev["date"] = pd.to_datetime(ev["date"], errors="coerce")
-    ev = ev.dropna(subset=["date"]).sort_values("date")
-    return ev
+def create_advanced_features(df: pd.DataFrame, events_df: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Creates a robust feature set for customers + ATV models.
+    Assumes df has columns: date, sales, customers, add_on_sales (optional), day_type/notes (optional).
+    Returns a DataFrame with features + targets (customers, atv).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [c.strip().lower() for c in out.columns]
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out = out.dropna(subset=["date"]).drop_duplicates(subset=["date"]).sort_values("date")
-    out = out.set_index("date")
-    return out
+    df = df.copy()
+    df = df.sort_values("date").reset_index(drop=True)
 
-def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy(); idx = out.index
-    out["dow"] = idx.dayofweek
-    out["dom"] = idx.day
-    out["week"] = idx.isocalendar().week.astype(int)
-    out["month"] = idx.month
-    out["year"] = idx.year
-    out["is_weekend"] = (out["dow"] >= 5).astype(int)
-    out["is_holiday"] = [int(d in PH_HOLIDAYS) for d in idx.date]
-    out["is_payday"] = ((out["dom"] == 15) | (idx == (idx + pd.offsets.MonthEnd(0)))).astype(int)
-    out["is_payday_minus1"] = ((idx + pd.Timedelta(days=1)).day == 15).astype(int) | ((idx + pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) + pd.Timedelta(days=1))).astype(int)
-    out["is_payday_plus1"]  = ((idx - pd.Timedelta(days=1)).day == 15).astype(int) | ((idx - pd.Timedelta(days=1)) == ((idx + pd.offsets.MonthEnd(0)) - pd.Timedelta(days=1))).astype(int)
-    return out
+    # Base and ATV (base = sales minus add-ons)
+    if "add_on_sales" not in df.columns:
+        df["add_on_sales"] = 0.0
+    base_sales = (df["sales"] - df["add_on_sales"]).clip(lower=0)
+    customers_safe = df["customers"].replace(0, np.nan)
+    df["atv"] = _safe_div(base_sales, customers_safe)
 
-def _compute_atv_if_missing(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "sales" in out.columns and "customers" in out.columns:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out["atv"] = out["sales"] / out["customers"].replace(0, np.nan)
-    elif "atv" in out.columns and "customers" in out.columns and "sales" not in out.columns:
-        out["sales"] = out["atv"] * out["customers"]
-    elif "sales" in out.columns and "atv" in out.columns and "customers" not in out.columns:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out["customers"] = out["sales"] / out["atv"].replace(0, np.nan)
-    for c in ("customers","sales","atv"):
-        if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf,-np.inf], np.nan)
-    return out
+    # Calendar features
+    df["month"] = df["date"].dt.month
+    df["day"] = df["date"].dt.day
+    df["dayofweek"] = df["date"].dt.dayofweek
+    df["dayofyear"] = df["date"].dt.dayofyear
+    df["weekofyear"] = df["date"].dt.isocalendar().week.astype(int)
+    df["is_month_start"] = df["date"].dt.is_month_start.astype(int)
+    df["is_month_end"] = df["date"].dt.is_month_end.astype(int)
 
-def prepare_history(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out = _compute_atv_if_missing(out)
-    out = _add_calendar_features(out)
-    for lag in [7,14,28]:
-        if "customers" in out.columns: out[f"customers_lag{lag}"] = out["customers"].shift(lag)
-        if "atv" in out.columns: out[f"atv_lag{lag}"] = out["atv"].shift(lag)
-    out["atv_roll7_med"]  = out["atv"].rolling(7,  min_periods=3).median()
-    out["atv_roll14_med"] = out["atv"].rolling(14, min_periods=5).median()
-    out["atv_roll28_med"] = out["atv"].rolling(28, min_periods=7).median()
-    return out.dropna().copy()
+    # Cyclical encodings (help generalization, avoid step jumps)
+    dow_cyc = _cyclical_encode(df["dayofweek"], 7, "dow")
+    moy_cyc = _cyclical_encode(df["month"], 12, "moy")
+    df = pd.concat([df, dow_cyc, moy_cyc], axis=1)
 
-def add_future_calendar(hist: pd.DataFrame, periods: int) -> pd.DataFrame:
-    last = hist.index.max()
-    idx = pd.date_range(start=last + pd.Timedelta(days=1), periods=periods, freq="D")
-    fut = pd.DataFrame(index=idx)
-    fut = _add_calendar_features(fut)
-    return fut
+    # Lags (use shift to avoid leakage)
+    for col in ["customers", "sales"]:
+        df[f"{col}_lag_1"] = df[col].shift(1)
+        df[f"{col}_lag_2"] = df[col].shift(2)
+        df[f"{col}_lag_7"] = df[col].shift(7)
+        df[f"{col}_lag_14"] = df[col].shift(14)
 
-def build_event_frame_from_df(ev_df: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
-    # Robust to duplicate dates: aggregate then align.
-    ev = pd.DataFrame(index=index)
-    ev["uplift_customers_pct"] = 0.0
-    ev["uplift_atv_pct"] = 0.0
-    if ev_df is None or ev_df.empty:
-        return ev
-    tmp = ev_df.copy()
-    tmp["date"] = pd.to_datetime(tmp.get("date"), errors="coerce")
-    for c in ("uplift_customers_pct", "uplift_atv_pct"):
-        if c not in tmp.columns: tmp[c] = 0.0
-        tmp[c] = pd.to_numeric(tmp[c], errors="coerce").fillna(0.0)
-    tmp = tmp.dropna(subset=["date"])
-    tmp = tmp.groupby("date", as_index=True)[["uplift_customers_pct","uplift_atv_pct"]].sum().sort_index()
-    aligned = tmp.reindex(index, fill_value=0.0)
-    ev["uplift_customers_pct"] = aligned["uplift_customers_pct"].values
-    ev["uplift_atv_pct"] = aligned["uplift_atv_pct"].values
-    return ev
+    # Rolling stats (shifted by 1)
+    df["customers_rm7"] = _rolling_shifted(df["customers"], 7, 1, "mean")
+    df["customers_rm14"] = _rolling_shifted(df["customers"], 14, 1, "mean")
+    df["customers_rm28"] = _rolling_shifted(df["customers"], 28, 1, "mean")
+    df["sales_rm7"] = _rolling_shifted(df["sales"], 7, 1, "mean")
+    df["sales_rm14"] = _rolling_shifted(df["sales"], 14, 1, "mean")
+    df["sales_rm28"] = _rolling_shifted(df["sales"], 28, 1, "mean")
+    df["sales_rstd14"] = _rolling_shifted(df["sales"], 14, 1, "std")
+    df["customers_rstd14"] = _rolling_shifted(df["customers"], 14, 1, "std")
 
-def pretty_money(x: float) -> str:
-    try: return f"₱{x:,.2f}"
-    except Exception: return str(x)
+    # Flags
+    df = _add_weekend_payday_flags(df)
+
+    # Events integration (binary)
+    if events_df is not None and not events_df.empty and "date" in events_df.columns:
+        e = events_df.copy()
+        e["date"] = pd.to_datetime(e["date"]).dt.normalize()
+        e = e.drop_duplicates(subset=["date"], keep="first")
+        df = df.merge(e[["date"]], on="date", how="left", indicator=True)
+        df["is_event"] = (df["_merge"] == "both").astype(int)
+        df.drop(columns=["_merge"], inplace=True)
+    else:
+        df["is_event"] = 0
+
+    # Day-type from data if present
+    if "day_type" in df.columns:
+        df["is_not_normal_day"] = (df["day_type"].astype(str) == "Not Normal Day").astype(int)
+    else:
+        df["is_not_normal_day"] = 0
+
+    # Fill NaNs for model stability
+    df = df.fillna(0)
+
+    return df
