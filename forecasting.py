@@ -85,9 +85,10 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
 
     # 1. For 'customers', add more weight to recent data points to follow trends more closely.
     if target == 'customers':
-        print(f"Applying recency weights for CUSTOMERS on day {day_of_week}.")
-        # Create a linear weight array: older data gets 0.5 weight, newest data gets 1.5 weight.
-        time_weights = np.linspace(0.5, 1.5, len(X_train)) 
+        print(f"Applying AGGRESSIVE recency weights for CUSTOMERS on day {day_of_week}.")
+        # --- MORE AGGRESSIVE WEIGHTING ---
+        # The weight range is now 0.25 to 2.0, making the newest data 8x more influential than the oldest.
+        time_weights = np.linspace(0.25, 2.0, len(X_train)) 
         sample_weights = pd.Series(time_weights, index=X_train.index)
 
     # 2. For 'atv', cap outliers at the 95th percentile to create a more conservative forecast.
