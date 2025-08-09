@@ -7,80 +7,70 @@ from data_processing import create_advanced_features
 
 def generate_forecast(historical_df, events_df, periods=15):
     """
-    Generates a forecast using a two-stage, unified LightGBM model
-    with a recursive strategy for multi-step forecasting.
-    
-    // SENIOR DEV NOTE //: Customer model uses linear recency weighting for stability.
-    // ATV model now uses exponential weighting for higher sensitivity to recent trends.
+    Generates a forecast using a two-stage system with dedicated, specialized models.
+    - The Customer Model remains untouched to preserve its excellent performance.
+    - A new, robust Sales Model using Quantile Regression is introduced.
+    - ATV is now a derived metric, calculated from the two primary forecasts.
     """
     # --- 1. Model Training ---
     
-    # Create a rich feature set from all historical data
     df_featured = create_advanced_features(historical_df, events_df)
-    
-    # Drop initial rows where rolling features couldn't be computed
-    # This ensures the model trains on high-quality, complete data
     train_df = df_featured.dropna(subset=['sales_rolling_mean_14']).reset_index(drop=True)
     
-    # Define features and targets
+    # // SENIOR DEV NOTE //: The feature set remains the same, but we will now train two distinct models
+    # on two different targets, allowing each to specialize.
     FEATURES = [col for col in train_df.columns if col not in [
         'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes'
     ]]
     TARGET_CUST = 'customers'
-    TARGET_ATV = 'atv'
+    TARGET_SALES = 'sales' # We now target 'sales' directly.
 
-    lgbm_params = {
-        'objective': 'regression_l1',
-        'metric': 'rmse',
-        'n_estimators': 1000,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 1,
-        'reg_alpha': 0.1,
-        'reg_lambda': 0.1,
-        'num_leaves': 31,
-        'verbose': -1,
-        'n_jobs': -1,
-        'seed': 42,
+    # --- Base LGBM Parameters ---
+    # Parameters for the customer model remain as they were.
+    lgbm_params_cust = {
+        'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 1000,
+        'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8,
+        'bagging_freq': 1, 'reg_alpha': 0.1, 'reg_lambda': 0.1,
+        'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42,
         'boosting_type': 'gbdt',
     }
+
+    # // SENIOR DEV NOTE //: These are the new parameters for our Sales Model.
+    # The key change is 'objective': 'quantile' and 'alpha': 0.5.
+    # This trains the model to predict the MEDIAN sales value, making it
+    # extremely robust to outliers from unusually high or low sales days.
+    lgbm_params_sales = {
+        'objective': 'quantile', # Changed from 'regression_l1' to 'quantile'
+        'alpha': 0.5,            # Set to 0.5 to predict the median
+        'metric': 'quantile',
+        'n_estimators': 1000, 'learning_rate': 0.05, 'feature_fraction': 0.8,
+        'bagging_fraction': 0.8, 'bagging_freq': 1, 'reg_alpha': 0.1,
+        'reg_lambda': 0.1, 'num_leaves': 31, 'verbose': -1,
+        'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt',
+    }
     
-    # --- CUSTOMER MODEL TRAINING (UNCHANGED) ---
-    # // SENIOR DEV NOTE //: Using linear sample weighting for customer forecast.
-    # This provides stable recency bias, which is working well.
+    # Recency weighting remains a powerful tool for both models.
     start_weight = 0.2
     end_weight = 1.0
-    customer_sample_weights = np.linspace(start_weight, end_weight, len(train_df))
+    sample_weights = np.linspace(start_weight, end_weight, len(train_df))
 
-    # Train the Customer Forecasting Model with the original sample weights
-    model_cust = lgb.LGBMRegressor(**lgbm_params)
+    # --- Train the Customer Model (Unchanged) ---
+    model_cust = lgb.LGBMRegressor(**lgbm_params_cust)
     model_cust.fit(
         train_df[FEATURES],
         train_df[TARGET_CUST],
-        [cite_start]sample_weight=customer_sample_weights # [cite: 1]
+        sample_weight=sample_weights
     )
 
-    # --- ATV MODEL TRAINING (MODIFIED) ---
-    # // SENIOR DEV NOTE //: THIS IS THE MODIFIED SECTION.
-    # We are creating a new, more aggressive weighting scheme for the ATV model.
-    # np.logspace creates an array of weights that grow exponentially. This places
-    # a much higher emphasis on the most recent data points, making the ATV
-    # forecast more responsive to recent shifts in spending patterns.
-    # The weights range from ~0.1 (oldest data) to 1.0 (newest data), with a sharp curve.
-    atv_sample_weights = np.logspace(-1, 0, num=len(train_df))
-
-    # Train the ATV Forecasting Model with the new exponential weighting
-    model_atv = lgb.LGBMRegressor(**lgbm_params)
-    model_atv.fit(
+    # --- Train the new, robust Sales Model ---
+    model_sales = lgb.LGBMRegressor(**lgbm_params_sales)
+    model_sales.fit(
         train_df[FEATURES],
-        train_df[TARGET_ATV],
-        sample_weight=atv_sample_weights  # The key change is here
+        train_df[TARGET_SALES], # Fit on TARGET_SALES
+        sample_weight=sample_weights
     )
 
     # --- 2. Recursive Forecasting ---
-    # // SENIOR DEV NOTE //: The recursive strategy is acceptable but be aware that errors can compound.
-    # The sample weighting helps mitigate this by ensuring the initial predictions are based on the most relevant data.
     
     future_predictions = []
     history_df = historical_df.copy()
@@ -94,27 +84,35 @@ def generate_forecast(historical_df, events_df, periods=15):
         featured_for_pred = create_advanced_features(temp_df, events_df)
         X_pred = featured_for_pred[FEATURES].iloc[-1:]
 
+        # Predict customers and sales independently
         pred_cust = model_cust.predict(X_pred)[0]
-        pred_atv = model_atv.predict(X_pred)[0]
+        pred_sales = model_sales.predict(X_pred)[0]
         
-        # Ensure predictions are non-negative
         pred_cust = max(0, pred_cust)
-        pred_atv = max(0, pred_atv)
+        pred_sales = max(0, pred_sales)
 
+        # // SENIOR DEV NOTE //: ATV is now a derived metric, calculated from the two
+        # more reliable primary forecasts. We handle the division-by-zero edge case.
+        if pred_cust > 0:
+            pred_atv = pred_sales / pred_cust
+        else:
+            pred_atv = 0
+
+        # This new row will be used to generate features for the *next* day's forecast.
         new_row = {
             'date': current_pred_date,
             'customers': pred_cust,
-            'atv': pred_atv,
-            'sales': pred_cust * pred_atv,
+            'sales': pred_sales,
+            'atv': pred_atv, # Add the derived atv back into the loop history
             'add_on_sales': 0,
-            'day_type': 'Forecast' # Add a type for clarity in the history
+            'day_type': 'Forecast'
         }
         future_predictions.append(new_row)
         
         history_df = pd.concat([history_df, pd.DataFrame([new_row])], ignore_index=True)
 
     if not future_predictions:
-        return pd.DataFrame(), None, None
+        return pd.DataFrame(), None
 
     # --- 3. Finalize and Return ---
     
@@ -130,5 +128,5 @@ def generate_forecast(historical_df, events_df, periods=15):
     final_forecast['forecast_customers'] = final_forecast['forecast_customers'].clip(lower=0).round().astype(int)
     final_forecast['forecast_atv'] = final_forecast['forecast_atv'].clip(lower=0)
     
-    # Return both models now, in case they are needed for insights
-    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], model_cust, model_atv
+    # We still return model_cust for feature importance analysis as it's the primary driver.
+    return final_forecast[['ds', 'forecast_customers', 'forecast_atv', 'forecast_sales']], model_cust
