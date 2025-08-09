@@ -15,13 +15,13 @@ from forecasting import generate_customer_forecast, generate_atv_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v5.0 (Decoupled)",
+    page_title="Sales Forecaster v5.1 (Patched)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- Custom CSS (your styling is good, no changes needed) ---
+# --- Custom CSS ---
 def apply_custom_styling():
     st.markdown("""
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
@@ -108,23 +108,49 @@ def get_events_data(_db_conn):
 
 def render_historical_record(row, db_client):
     """Renders an editable historical data record."""
-    if 'doc_id' not in row or pd.isna(row['doc_id']): return
+    if 'doc_id' not in row or pd.isna(row['doc_id']):
+        return
+
     date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
+    
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
-        day_type = row.get('day_type', 'Normal Day')
-        st.write(f"**Day Type:** {day_type}")
+
+        # --- THIS IS THE CORRECTED SECTION ---
+        # SENIOR DEV NOTE: This logic now robustly handles bad data from Firestore.
+        # It prevents the app from crashing if 'day_type' is null, empty, or an unexpected value.
+        day_type_options = ["Normal Day", "Not Normal Day"]
+        current_day_type = row.get('day_type', day_type_options[0]) # Default to 'Normal Day' if key is missing
+
+        # Safely determine the index for the selectbox
+        try:
+            current_index = day_type_options.index(current_day_type)
+        except ValueError:
+            # If the value from the DB is invalid (e.g., None, '', 'Holiday'), default to the first option
+            current_index = 0
+            current_day_type = day_type_options[0]
+            st.warning(f"Found an invalid 'day_type' for {date_str}. Defaulting to 'Normal Day'.")
+
+        st.write(f"**Day Type:** {current_day_type}")
+        
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
             st.markdown("**Edit Record**")
-            updated_day_type = st.selectbox("Day Type", ["Normal Day", "Not Normal Day"], 
-                                            index=["Normal Day", "Not Normal Day"].index(day_type), 
-                                            key=f"day_type_{row['doc_id']}")
+            
+            # Use the safely determined index
+            updated_day_type = st.selectbox(
+                "Day Type", 
+                day_type_options, 
+                index=current_index, 
+                key=f"day_type_{row['doc_id']}"
+            )
+            
             if st.form_submit_button("💾 Update Day Type", use_container_width=True):
                 db_client.collection('historical_data').document(row['doc_id']).update({'day_type': updated_day_type})
                 st.success(f"Record for {date_str} updated!")
                 st.cache_data.clear()
-                time.sleep(1); st.rerun()
+                time.sleep(1)
+                st.rerun()
 
 # --- Main Application ---
 apply_custom_styling()
@@ -143,7 +169,7 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.0")
+        st.title("AI Forecaster v5.1")
         st.info("Decoupled Engine: LGBM + Prophet")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
@@ -185,7 +211,7 @@ if db:
         st.subheader("Step 3: Generate Final Forecast")
         is_disabled = st.session_state.customer_forecast_df is None or st.session_state.atv_forecast_df is None
         if st.button("Generate Final Forecast & Save", type="primary", use_container_width=True, disabled=is_disabled):
-            with st.spinner("Combinining forecasts and saving..."):
+            with st.spinner("Combining forecasts and saving..."):
                 cust_df = st.session_state.customer_forecast_df
                 atv_df = st.session_state.atv_forecast_df
                 final_df = pd.merge(cust_df, atv_df, on='ds')
