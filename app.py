@@ -10,12 +10,11 @@ import seaborn as sns
 
 # --- Import from our new, separated modules ---
 from data_processing import load_from_firestore
-# // SENIOR DEV NOTE //: The import itself is correct. The error was in how the function was *called*.
 from forecasting import generate_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v4.2",
+    page_title="Sales Forecaster v4.1",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -61,6 +60,7 @@ def init_firestore():
     try:
         if not firebase_admin._apps:
             creds_dict = st.secrets.firebase_credentials.to_dict()
+            # // SENIOR DEV NOTE //: The replace('\\n', '\n') is crucial for environment variables. Good catch.
             creds_dict['private_key'] = creds_dict['private_key'].replace('\\n', '\n')
             cred = credentials.Certificate(creds_dict)
             firebase_admin.initialize_app(cred)
@@ -123,6 +123,7 @@ def render_historical_record(row, db_client):
                 update_data = {'day_type': updated_day_type}
                 db_client.collection('historical_data').document(row['doc_id']).update(update_data)
                 st.success(f"Record for {date_str} updated!")
+                # // SENIOR DEV NOTE //: Clearing the data cache is essential here so the next run fetches fresh data.
                 st.cache_data.clear()
                 time.sleep(1); st.rerun()
 
@@ -136,15 +137,11 @@ if db:
         st.session_state.forecast_df = pd.DataFrame()
     if 'customer_model' not in st.session_state:
         st.session_state.customer_model = None
-    # // SENIOR DEV NOTE //: Initialize the new atv_model in the session state.
-    if 'atv_model' not in st.session_state:
-        st.session_state.atv_model = None
-
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v4.2")
-        st.info("Unified Engine - Dual Weighting")
+        st.title("AI Forecaster v4.1")
+        st.info("Unified Engine - Recency Weighted")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear()
@@ -160,14 +157,9 @@ if db:
                 st.error("Need at least 30 days of data for a reliable forecast.")
             else:
                 with st.spinner("🧠 Training Adaptive Forecasting Engine..."):
-                    # // SENIOR DEV NOTE //: THIS IS THE FIX.
-                    # Unpack all THREE return values from the updated function.
-                    forecast_df, customer_model, atv_model = generate_forecast(historical_df, events_df, periods=15)
-                    
-                    # Store all results in the session state
+                    forecast_df, customer_model = generate_forecast(historical_df, events_df, periods=15)
                     st.session_state.forecast_df = forecast_df
                     st.session_state.customer_model = customer_model
-                    st.session_state.atv_model = atv_model
                 
                 if not forecast_df.empty:
                     with st.spinner("📡 Logging forecast to database..."):
@@ -202,18 +194,10 @@ if db:
     # --- Forecast Insights Tab ---
     with tabs[1]:
         st.header("💡 Key Forecast Drivers")
-        st.info("This shows the most important factors the AI used to predict outcomes.")
-
-        # // SENIOR DEV NOTE //: Upgraded this tab to show insights for BOTH models.
-        if st.session_state.customer_model and st.session_state.atv_model:
-            model_choice = st.radio(
-                "Select Model to Analyze:",
-                ('Customer Model', 'ATV Model'),
-                horizontal=True
-            )
-
-            model, title_text = (st.session_state.customer_model, 'Top 20 Features Driving Customer Forecast') if model_choice == 'Customer Model' else (st.session_state.atv_model, 'Top 20 Features Driving ATV Forecast')
-
+        st.info("This shows the most important factors the AI model used to predict customer traffic, based on the entire historical dataset.")
+        
+        if st.session_state.customer_model:
+            model = st.session_state.customer_model
             feature_importances = pd.DataFrame({
                 'feature': model.feature_name_,
                 'importance': model.feature_importances_
@@ -223,7 +207,7 @@ if db:
             fig, ax = plt.subplots(figsize=(12, 10))
             
             sns.barplot(x='importance', y='feature', data=feature_importances, ax=ax, palette='viridis')
-            ax.set_title(title_text, fontsize=16)
+            ax.set_title('Top 20 Features Driving Customer Forecast', fontsize=16)
             ax.set_xlabel('Importance', fontsize=12)
             ax.set_ylabel('Feature', fontsize=12)
             
@@ -238,13 +222,15 @@ if db:
             
             st.pyplot(fig)
         else:
-            st.info("Generate a forecast to see the key drivers of customer and spending behavior.")
+            st.info("Generate a forecast to see the key drivers of customer behavior.")
 
     # --- Edit Data Tab ---
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
         st.info("Correct the 'Day Type' for past dates to improve future forecasts.")
         
+        # // SENIOR DEV NOTE //: This caching pattern is correct. The function is cached,
+        # and it will only re-run if its code changes, or the cache is manually cleared.
         @st.cache_data
         def get_historical_data(_db_conn):
             """
