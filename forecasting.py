@@ -9,9 +9,6 @@ from data_processing import create_advanced_features, prepare_data_for_prophet
 def generate_customer_forecast(historical_df, events_df, periods=15):
     """
     Generates a customer forecast using a LightGBM model with recency weighting.
-    // SENIOR DEV NOTE //: This model is specialized for customer traffic, leveraging a complex
-    feature set to capture non-linear relationships. The recursive forecasting is replaced
-    by a more stable batch prediction on a future feature-engineered dataframe.
     """
     # --- 1. Model Training ---
     df_featured = create_advanced_features(historical_df.copy(), events_df)
@@ -40,7 +37,6 @@ def generate_customer_forecast(historical_df, events_df, periods=15):
     future_dates = [last_date + timedelta(days=i) for i in range(1, periods + 1)]
     future_df = pd.DataFrame({'date': future_dates})
     
-    # Create a combined df to generate features for the future dates
     combined_df = pd.concat([historical_df, future_df], ignore_index=True)
     combined_featured = create_advanced_features(combined_df, events_df)
     
@@ -62,11 +58,8 @@ def generate_customer_forecast(historical_df, events_df, periods=15):
 def generate_atv_forecast(historical_df, events_df, periods=15):
     """
     Generates an ATV (Average Transaction Value) forecast using Prophet.
-    // SENIOR DEV NOTE //: Prophet is ideal for this task. It excels at capturing seasonality
-    (yearly, weekly) and holiday/event effects, which are primary drivers of ATV.
-    This provides a more stable and interpretable forecast for this specific metric.
     """
-    # --- 1. Data Preparation ---
+    # --- 1. Data Preparation for Training ---
     prophet_df, regressor_names = prepare_data_for_prophet(historical_df, events_df)
     
     # --- 2. Model Training ---
@@ -74,7 +67,7 @@ def generate_atv_forecast(historical_df, events_df, periods=15):
         yearly_seasonality=True,
         weekly_seasonality=True,
         daily_seasonality=False,
-        seasonality_mode='multiplicative', # Sales often have multiplicative seasonality
+        seasonality_mode='multiplicative',
         growth='linear'
     )
     
@@ -86,10 +79,25 @@ def generate_atv_forecast(historical_df, events_df, periods=15):
     # --- 3. Future Prediction ---
     future = model_atv.make_future_dataframe(periods=periods, freq='D')
     
-    # We must populate the regressor columns for the future dates
-    future_prepared, _ = prepare_data_for_prophet(pd.DataFrame({'date': future['ds']}), events_df)
-    future = pd.merge(future.drop(columns=regressor_names, errors='ignore'), future_prepared, on='ds')
-    
+    # --- THIS IS THE CORRECTED SECTION ---
+    # SENIOR DEV NOTE: This logic now correctly builds the required regressor columns 
+    # directly onto Prophet's future dataframe, avoiding the previous KeyError.
+    future['is_payday_period'] = future['ds'].apply(
+        lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
+    )
+    future['is_weekend'] = (future['ds'].dt.dayofweek >= 5).astype(int)
+
+    if events_df is not None and not events_df.empty:
+        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
+        events_df_unique.rename(columns={'date': 'ds'}, inplace=True)
+        events_df_unique['ds'] = pd.to_datetime(events_df_unique['ds']).dt.normalize()
+        events_df_unique['is_event'] = 1
+        
+        future = pd.merge(future, events_df_unique[['ds', 'is_event']], on='ds', how='left').fillna(0)
+        future['is_event'] = future['is_event'].astype(int)
+    else:
+        future['is_event'] = 0
+
     forecast = model_atv.predict(future)
     
     # --- 4. Finalize and Return ---
