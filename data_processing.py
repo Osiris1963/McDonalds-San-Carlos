@@ -19,11 +19,12 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
+    # // SENIOR DEV NOTE //: Handling potential date column differences.
+    if 'date' not in df.columns and 'event_date' in df.columns:
+        df.rename(columns={'event_date': 'date'}, inplace=True)
+    
     if 'date' not in df.columns:
-        if collection_name == 'future_activities' and 'event_date' in df.columns:
-            df.rename(columns={'event_date': 'date'}, inplace=True)
-        else:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
@@ -45,16 +46,17 @@ def load_from_firestore(db_client, collection_name):
 
 def create_advanced_features(df, events_df):
     """
-    Creates a rich feature set. This function is now resilient and can handle
-    both historical dataframes (with sales/customers) and future dataframes (with only dates).
+    Creates a rich feature set for a unified Gradient Boosting model from the full time series.
+    // SENIOR DEV NOTE //: This function is now dedicated to the LightGBM Customer model.
     """
     df_copy = df.copy()
 
-    if 'customers' in df_copy.columns and 'sales' in df_copy.columns:
-        customers_safe = df_copy['customers'].replace(0, np.nan)
-        df_copy['base_sales'] = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-        df_copy['atv'] = (df_copy['base_sales'] / customers_safe)
+    # --- Foundational Metrics (Cleansed) ---
+    customers_safe = df_copy['customers'].replace(0, np.nan)
+    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+    df_copy['atv'] = (base_sales / customers_safe)
 
+    # --- Time-Based Features ---
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['day'] = df_copy['date'].dt.day
     df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
@@ -63,6 +65,7 @@ def create_advanced_features(df, events_df):
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
 
+    # --- Cyclical & Event Features ---
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
@@ -76,31 +79,26 @@ def create_advanced_features(df, events_df):
         df_copy.drop('weather', axis=1, inplace=True)
 
     # --- Advanced Time Series Features ---
-    if 'customers' in df_copy.columns:
-        target_vars = ['sales', 'customers', 'atv', 'base_sales']
-        
-        # // SENIOR DEV NOTE //: THE FIX IS HERE. Restoring the nested loops.
-        lag_days = [1, 2, 7, 14] 
-        for var in target_vars:
-            if var in df_copy:
-                # This 'for' loop was missing, causing the NameError on 'lag'. It is now restored.
-                for lag in lag_days:
-                     df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+    target_vars = ['sales', 'customers', 'atv']
+    lag_days = [1, 2, 7, 14] 
+    for var in target_vars:
+        for lag in lag_days:
+            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
-        windows = [3, 7, 14]
-        for var in target_vars:
-            if var in df_copy:
-                series_shifted = df_copy[var].shift(1)
-                # This 'for' loop was also missing, which would cause a NameError on 'w'. It is now restored.
-                for w in windows:
-                    df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-                    df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+    windows = [3, 7, 14]
+    for var in target_vars:
+        for w in windows:
+            series_shifted = df_copy[var].shift(1)
+            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
+    # --- Cyclical Features (Continued) ---
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
     df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
     
+    # --- External Regressors (Events & Holidays) ---
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         if 'date' in events_df_unique.columns:
@@ -118,3 +116,40 @@ def create_advanced_features(df, events_df):
         df_copy['is_not_normal_day'] = 0
         
     return df_copy.fillna(0)
+
+def prepare_data_for_prophet(df, events_df):
+    """
+    Prepares data specifically for the Prophet model.
+    // SENIOR DEV NOTE //: This function isolates the logic for Prophet, which needs
+    a 'ds' and 'y' column, and handles adding external regressors cleanly.
+    """
+    df_prophet = df[['date', 'sales', 'customers', 'add_on_sales']].copy()
+    
+    # Calculate ATV (Average Transaction Value)
+    customers_safe = df_prophet['customers'].replace(0, np.nan)
+    base_sales = df_prophet['sales'] - df_prophet.get('add_on_sales', 0)
+    df_prophet['atv'] = (base_sales / customers_safe).fillna(0)
+
+    # Rename columns for Prophet
+    df_prophet.rename(columns={'date': 'ds', 'atv': 'y'}, inplace=True)
+    
+    # Add external regressors for Prophet
+    df_prophet['is_payday_period'] = df_prophet['ds'].apply(
+        lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
+    )
+    df_prophet['is_weekend'] = (df_prophet['ds'].dt.dayofweek >= 5).astype(int)
+    
+    # Handle event data
+    if events_df is not None and not events_df.empty:
+        events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
+        events_df_unique['date'] = pd.to_datetime(events_df_unique['date']).dt.normalize()
+        events_df_unique.rename(columns={'date': 'ds'}, inplace=True)
+        
+        df_prophet = pd.merge(df_prophet, events_df_unique[['ds']], on='ds', how='left', indicator='is_event')
+        df_prophet['is_event'] = (df_prophet['is_event'] == 'both').astype(int)
+    else:
+        df_prophet['is_event'] = 0
+        
+    regressors = ['is_payday_period', 'is_weekend', 'is_event']
+    
+    return df_prophet[['ds', 'y'] + regressors], regressors
