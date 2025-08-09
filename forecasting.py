@@ -78,16 +78,35 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
         
     X_train = df_train[final_features]
     y_train = df_train[target]
+    
+    # --- MODIFICATION START: Target-Specific Training Adjustments ---
+    sample_weights = None
+    y_train_for_training = y_train
 
+    # 1. For 'customers', add more weight to recent data points to follow trends more closely.
+    if target == 'customers':
+        print(f"Applying recency weights for CUSTOMERS on day {day_of_week}.")
+        # Create a linear weight array: older data gets 0.5 weight, newest data gets 1.5 weight.
+        time_weights = np.linspace(0.5, 1.5, len(X_train)) 
+        sample_weights = pd.Series(time_weights, index=X_train.index)
+
+    # 2. For 'atv', cap outliers at the 95th percentile to create a more conservative forecast.
+    if target == 'atv':
+        print(f"Capping outliers for ATV on day {day_of_week}.")
+        p95 = y_train.quantile(0.95)
+        # The training target for tree models and the meta-learner will be the capped version.
+        y_train_for_training = y_train.clip(upper=p95)
+    # --- MODIFICATION END ---
+    
     # --- Pre-tuned Hyperparameters (Result of Offline Optuna Study) ---
     lgbm_params = {'objective': 'regression_l1', 'metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 1, 'lambda_l1': 0.1, 'lambda_l2': 0.1, 'num_leaves': 31, 'verbose': -1, 'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt'}
     xgb_params = {'objective': 'reg:squarederror', 'eval_metric': 'rmse', 'n_estimators': 200, 'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'gamma': 0.1, 'seed': 42, 'n_jobs': -1}
 
     lgbm = lgb.LGBMRegressor(**lgbm_params)
-    lgbm.fit(X_train, y_train)
+    lgbm.fit(X_train, y_train_for_training, sample_weight=sample_weights)
 
     xgb_model = xgb.XGBRegressor(**xgb_params)
-    xgb_model.fit(X_train, y_train)
+    xgb_model.fit(X_train, y_train_for_training, sample_weight=sample_weights)
     
     # --- Stacking Ensemble ---
     # 1. Get base model predictions on the training data itself to train the meta-learner
@@ -104,7 +123,8 @@ def run_day_specific_models(df_day_featured, target, day_of_week, periods, event
 
     # 3. Train the meta-learner (RidgeCV is robust and fast)
     meta_learner = RidgeCV(alphas=np.logspace(-3, 2, 10))
-    meta_learner.fit(X_meta, y_train)
+    # Train the meta-learner on the adjusted (potentially capped) target data
+    meta_learner.fit(X_meta, y_train_for_training)
 
     # 4. Get base model predictions on FUTURE data
     future_placeholder = pd.DataFrame({'date': future_dates})
