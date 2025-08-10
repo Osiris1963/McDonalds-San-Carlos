@@ -8,15 +8,14 @@ from data_processing import create_advanced_features, prepare_data_for_prophet
 
 def generate_customer_forecast(historical_df, events_df, periods=15):
     """
-    Generates a customer forecast using a LightGBM model.
-    // SENIOR DEV NOTE //: Reverted to the recursive forecasting strategy as per user request.
-    This method predicts one step at a time and uses that prediction as a feature for the
-    next step, which can better capture evolving trends but is sensitive to error compounding.
+    Generates a customer forecast using a LightGBM model with a recursive strategy and sample weighting.
+    // SENIOR DEV NOTE //: This logic is restored from your original 'forecasting (4).py' file.
+    It predicts one step at a time and uses that prediction as a feature for the next step.
     """
     # --- 1. Model Training ---
-    df_featured = create_advanced_features(historical_df.copy(), events_df)
+    df_featured = create_advanced_features(historical_df, events_df)
     train_df = df_featured.dropna(subset=['sales_rolling_mean_14']).reset_index(drop=True)
-
+    
     FEATURES = [col for col in train_df.columns if col not in [
         'date', 'sales', 'customers', 'atv', 'doc_id', 'day_type', 'day_type_notes'
     ]]
@@ -28,63 +27,57 @@ def generate_customer_forecast(historical_df, events_df, periods=15):
         'bagging_freq': 1, 'reg_alpha': 0.1, 'reg_lambda': 0.1, 'num_leaves': 31,
         'verbose': -1, 'n_jobs': -1, 'seed': 42, 'boosting_type': 'gbdt',
     }
-
+    
     start_weight = 0.2
-    sample_weights = np.linspace(start_weight, 1.0, len(train_df))
+    end_weight = 1.0
+    sample_weights = np.linspace(start_weight, end_weight, len(train_df))
 
     model_cust = lgb.LGBMRegressor(**lgbm_params)
     model_cust.fit(train_df[FEATURES], train_df[TARGET_CUST], sample_weight=sample_weights)
 
-    # --- 2. Recursive Forecasting (Reverted Logic) ---
+    # --- 2. Recursive Forecasting ---
     future_predictions_list = []
     history_for_recursion = historical_df.copy()
-    
-    last_known_atv = 0
-    if not history_for_recursion.empty and 'atv' in history_for_recursion.columns:
-        last_known_atv = history_for_recursion['atv'].iloc[-1]
-    if last_known_atv == 0: # Fallback if last ATV is zero
-        last_known_atv = history_for_recursion[history_for_recursion['atv'] > 0]['atv'].mean()
-
-
     last_date = history_for_recursion['date'].max()
+
+    # Hold the last known ATV constant for generating features inside the loop
+    last_known_atv = history_for_recursion['atv'].iloc[-1] if 'atv' in history_for_recursion and not history_for_recursion.empty else 0
+    if last_known_atv == 0: # Fallback if last ATV is zero or missing
+        atv_fallback = history_for_recursion[history_for_recursion['atv'] > 0]['atv'].mean()
+        last_known_atv = atv_fallback if not pd.isna(atv_fallback) else 250 # Ultimate fallback
 
     for i in range(periods):
         current_pred_date = last_date + timedelta(days=i + 1)
         
         future_placeholder = pd.DataFrame([{'date': current_pred_date}])
-        temp_df_for_features = pd.concat([history_for_recursion, future_placeholder], ignore_index=True)
-        featured_for_pred = create_advanced_features(temp_df_for_features, events_df)
-        
+        temp_df = pd.concat([history_for_recursion, future_placeholder], ignore_index=True)
+        featured_for_pred = create_advanced_features(temp_df, events_df)
         X_pred = featured_for_pred[FEATURES].iloc[-1:]
-        
+
         pred_cust = model_cust.predict(X_pred)[0]
         pred_cust = max(0, pred_cust)
 
         new_row = {
             'date': current_pred_date,
             'customers': pred_cust,
-            'sales': pred_cust * last_known_atv,
-            'atv': last_known_atv,
-            'add_on_sales': 0
+            'atv': last_known_atv, # Use placeholder ATV for feature generation
+            'sales': pred_cust * last_known_atv, # Use placeholder sales
+            'add_on_sales': 0,
         }
-        
-        future_predictions_list.append({
-            'ds': current_pred_date,
-            'forecast_customers': pred_cust
-        })
-        
+        future_predictions_list.append(new_row)
         history_for_recursion = pd.concat([history_for_recursion, pd.DataFrame([new_row])], ignore_index=True)
 
     # --- 3. Finalize and Return ---
     forecast_df = pd.DataFrame(future_predictions_list)
+    forecast_df.rename(columns={'date': 'ds', 'customers': 'forecast_customers'}, inplace=True)
     forecast_df['forecast_customers'] = forecast_df['forecast_customers'].clip(lower=0).round().astype(int)
     
-    return forecast_df, model_cust
+    return forecast_df[['ds', 'forecast_customers']], model_cust
 
 
 def generate_atv_forecast(historical_df, events_df, periods=15):
     """
-    Generates an ATV (Average Transaction Value) forecast using Prophet.
+    Generates an ATV forecast using Prophet. This logic remains unchanged.
     """
     # --- 1. Data Preparation for Training ---
     prophet_df, regressor_names = prepare_data_for_prophet(historical_df, events_df)
