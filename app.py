@@ -15,7 +15,7 @@ from forecasting import generate_customer_forecast, generate_atv_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v5.2 (Patched)",
+    page_title="Sales Forecaster v5.3 (Recursive Cust.)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -162,8 +162,8 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.2")
-        st.info("Decoupled Engine: LGBM + Prophet")
+        st.title("AI Forecaster v5.3")
+        st.info("Recursive Cust. + Prophet ATV")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear(); st.cache_resource.clear()
@@ -179,7 +179,7 @@ if db:
             if len(historical_df) < 30: 
                 st.error("Need at least 30 days of data.")
             else:
-                with st.spinner("🧠 Training Customer Model (LGBM)..."):
+                with st.spinner("🧠 Training Customer Model (Recursive LGBM)..."):
                     cust_df, cust_model = generate_customer_forecast(historical_df, events_df)
                     st.session_state.customer_forecast_df = cust_df
                     st.session_state.customer_model = cust_model
@@ -240,11 +240,11 @@ if db:
             if st.session_state.customer_forecast_df is not None:
                 with c1:
                     st.subheader("Customer Forecast (LGBM)")
-                    st.dataframe(st.session_state.customer_forecast_df, use_container_width=True)
+                    st.dataframe(st.session_state.customer_forecast_df.set_index('ds'), use_container_width=True)
             if st.session_state.atv_forecast_df is not None:
                 with c2:
                     st.subheader("ATV Forecast (Prophet)")
-                    st.dataframe(st.session_state.atv_forecast_df, use_container_width=True)
+                    st.dataframe(st.session_state.atv_forecast_df.set_index('ds'), use_container_width=True)
 
     with tabs[1]:
         st.header("💡 Key Customer Drivers (LGBM)")
