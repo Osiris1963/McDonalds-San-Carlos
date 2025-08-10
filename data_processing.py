@@ -19,11 +19,11 @@ def load_from_firestore(db_client, collection_name):
     
     df = pd.DataFrame(records)
     
-    if 'date' not in df.columns and 'event_date' in df.columns:
-        df.rename(columns={'event_date': 'date'}, inplace=True)
-    
     if 'date' not in df.columns:
-        return pd.DataFrame()
+        if collection_name == 'future_activities' and 'event_date' in df.columns:
+            df.rename(columns={'event_date': 'date'}, inplace=True)
+        else:
+            return pd.DataFrame()
 
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
     df.dropna(subset=['date'], inplace=True)
@@ -40,7 +40,7 @@ def load_from_firestore(db_client, collection_name):
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
+    
     # Calculate ATV here after cleaning other numerics
     if 'sales' in df.columns and 'customers' in df.columns:
         customers_safe = df['customers'].replace(0, np.nan)
@@ -51,10 +51,16 @@ def load_from_firestore(db_client, collection_name):
 def create_advanced_features(df, events_df):
     """
     Creates a rich feature set for a unified Gradient Boosting model from the full time series.
-    This function is dedicated to the LightGBM Customer model.
     """
     df_copy = df.copy()
 
+    # --- Foundational Metrics (Cleansed) ---
+    if 'customers' in df_copy.columns and 'sales' in df_copy.columns:
+        customers_safe = df_copy['customers'].replace(0, np.nan)
+        base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
+        df_copy['atv'] = (base_sales / customers_safe)
+
+    # --- Time-Based Features ---
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['day'] = df_copy['date'].dt.day
     df_copy['dayofweek'] = df_copy['date'].dt.dayofweek
@@ -63,6 +69,7 @@ def create_advanced_features(df, events_df):
     df_copy['year'] = df_copy['date'].dt.year
     df_copy['time_idx'] = (df_copy['date'] - df_copy['date'].min()).dt.days
 
+    # --- Cyclical & Event Features ---
     df_copy['is_payday_period'] = df_copy['date'].apply(
         lambda x: 1 if x.day in [14, 15, 16, 29, 30, 31, 1, 2] else 0
     ).astype(int)
@@ -75,7 +82,9 @@ def create_advanced_features(df, events_df):
         df_copy = pd.concat([df_copy, weather_dummies], axis=1)
         df_copy.drop('weather', axis=1, inplace=True)
 
+    # --- Advanced Time Series Features ---
     target_vars = ['sales', 'customers', 'atv']
+    
     lag_days = [1, 2, 7, 14] 
     for var in target_vars:
         if var in df_copy.columns:
@@ -84,17 +93,19 @@ def create_advanced_features(df, events_df):
 
     windows = [3, 7, 14]
     for var in target_vars:
-         if var in df_copy.columns:
+        if var in df_copy.columns:
             for w in windows:
                 series_shifted = df_copy[var].shift(1)
                 df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
                 df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
+    # --- Cyclical & Event Features (Continued) ---
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['weekofyear_sin'] = np.sin(2 * np.pi * df_copy['weekofyear'] / 52)
     df_copy['weekofyear_cos'] = np.cos(2 * np.pi * df_copy['weekofyear'] / 52)
     
+    # --- External Regressors (Events & Holidays) ---
     if events_df is not None and not events_df.empty:
         events_df_unique = events_df.drop_duplicates(subset=['date'], keep='first').copy()
         if 'date' in events_df_unique.columns:
@@ -112,6 +123,7 @@ def create_advanced_features(df, events_df):
         df_copy['is_not_normal_day'] = 0
         
     return df_copy.fillna(0)
+
 
 def prepare_data_for_prophet(df, events_df):
     """
