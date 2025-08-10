@@ -41,6 +41,11 @@ def load_from_firestore(db_client, collection_name):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+    # Calculate ATV here after cleaning other numerics
+    if 'sales' in df.columns and 'customers' in df.columns:
+        customers_safe = df['customers'].replace(0, np.nan)
+        df['atv'] = (df['sales'] / customers_safe).fillna(0)
+
     return df.sort_values(by='date').reset_index(drop=True)
 
 def create_advanced_features(df, events_df):
@@ -49,10 +54,6 @@ def create_advanced_features(df, events_df):
     This function is dedicated to the LightGBM Customer model.
     """
     df_copy = df.copy()
-
-    customers_safe = df_copy['customers'].replace(0, np.nan)
-    base_sales = df_copy['sales'] - df_copy.get('add_on_sales', 0)
-    df_copy['atv'] = (base_sales / customers_safe)
 
     df_copy['month'] = df_copy['date'].dt.month
     df_copy['day'] = df_copy['date'].dt.day
@@ -77,15 +78,17 @@ def create_advanced_features(df, events_df):
     target_vars = ['sales', 'customers', 'atv']
     lag_days = [1, 2, 7, 14] 
     for var in target_vars:
-        for lag in lag_days:
-            df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
+        if var in df_copy.columns:
+            for lag in lag_days:
+                df_copy[f'{var}_lag_{lag}'] = df_copy[var].shift(lag)
 
     windows = [3, 7, 14]
     for var in target_vars:
-        for w in windows:
-            series_shifted = df_copy[var].shift(1)
-            df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
-            df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
+         if var in df_copy.columns:
+            for w in windows:
+                series_shifted = df_copy[var].shift(1)
+                df_copy[f'{var}_rolling_mean_{w}'] = series_shifted.rolling(window=w, min_periods=1).mean()
+                df_copy[f'{var}_rolling_std_{w}'] = series_shifted.rolling(window=w, min_periods=1).std()
 
     df_copy['dayofyear_sin'] = np.sin(2 * np.pi * df_copy['dayofyear'] / 365.25)
     df_copy['dayofyear_cos'] = np.cos(2 * np.pi * df_copy['dayofyear'] / 365.25)
@@ -113,8 +116,6 @@ def create_advanced_features(df, events_df):
 def prepare_data_for_prophet(df, events_df):
     """
     Prepares historical data for the Prophet model.
-    This function isolates the logic for Prophet, which needs
-    a 'ds' and 'y' column, and handles adding external regressors cleanly.
     """
     df_prophet = df[['date', 'sales', 'customers', 'add_on_sales']].copy()
     
