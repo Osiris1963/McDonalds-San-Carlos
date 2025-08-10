@@ -7,15 +7,14 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import matplotlib.pyplot as plt
 import seaborn as sns
-import plotly.graph_objects as go
 
-# --- Import from our re-architected modules ---
+# --- Import from our hybrid model modules ---
 from data_processing import load_from_firestore
 from forecasting import generate_customer_forecast, generate_atv_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v5.3 (Recursive Cust.)",
+    page_title="Sales Forecaster v6.0 (Hybrid)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -162,8 +161,8 @@ if db:
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v5.3")
-        st.info("Recursive Cust. + Prophet ATV")
+        st.title("AI Forecaster v6.0")
+        st.info("Hybrid Engine: Recursive LGBM + Prophet")
 
         if st.button("🔄 Refresh Data & Clear Cache"):
             st.cache_data.clear(); st.cache_resource.clear()
@@ -239,7 +238,7 @@ if db:
             c1, c2 = st.columns(2)
             if st.session_state.customer_forecast_df is not None:
                 with c1:
-                    st.subheader("Customer Forecast (LGBM)")
+                    st.subheader("Customer Forecast (Recursive LGBM)")
                     st.dataframe(st.session_state.customer_forecast_df.set_index('ds'), use_container_width=True)
             if st.session_state.atv_forecast_df is not None:
                 with c2:
@@ -252,7 +251,8 @@ if db:
         if st.session_state.customer_model:
             model = st.session_state.customer_model
             feature_importances = pd.DataFrame({
-                'feature': model.feature_name_, 'importance': model.feature_importances_
+                'feature': model.feature_name_,
+                'importance': model.feature_importances_
             }).sort_values('importance', ascending=False).head(20)
             plt.style.use('dark_background')
             fig, ax = plt.subplots(figsize=(12, 10))
@@ -264,7 +264,7 @@ if db:
             fig.tight_layout()
             st.pyplot(fig)
         else:
-            st.info("Generate the customer forecast to see the key drivers.")
+            st.info("Generate a forecast to see the key drivers.")
 
     with tabs[2]:
         st.header("✍️ Edit Historical Data")
