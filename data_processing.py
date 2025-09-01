@@ -131,9 +131,17 @@ def prepare_data_for_prophet(df, events_df):
     """
     df_prophet = df[['date', 'sales', 'customers', 'add_on_sales']].copy()
     
+    # --- START OF FIX ---
+    # Calculate ATV but DO NOT fill missing values with 0.
+    # Instead, we will replace 0s with NaN so Prophet ignores these dates.
     customers_safe = df_prophet['customers'].replace(0, np.nan)
     base_sales = df_prophet['sales'] - df_prophet.get('add_on_sales', 0)
-    df_prophet['atv'] = (base_sales / customers_safe).fillna(0)
+    df_prophet['atv'] = (base_sales / customers_safe)
+    
+    # Explicitly set any resulting 0 or undefined ATV values to NaN.
+    # This correctly marks the renovation period as "missing data" for Prophet.
+    df_prophet['atv'] = df_prophet['atv'].replace(0, np.nan)
+    # --- END OF FIX ---
 
     df_prophet.rename(columns={'date': 'ds', 'atv': 'y'}, inplace=True)
     
