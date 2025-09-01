@@ -81,20 +81,35 @@ def generate_atv_forecast(historical_df, events_df, periods=15):
     """
     # --- 1. Data Preparation for Training ---
     prophet_df, regressor_names = prepare_data_for_prophet(historical_df, events_df)
+
+    # --- START OF ROBUST FIX ---
+    # 1. Surgically remove the renovation period from the training data.
+    # This is a more robust solution than relying on NaN handling alone.
+    renovation_start = pd.to_datetime('2024-08-20') # <-- CORRECTED DATE
+    renovation_end = pd.to_datetime('2024-10-18')
+    prophet_df_filtered = prophet_df[~prophet_df['ds'].between(renovation_start, renovation_end)].copy()
     
-    # --- 2. Model Training ---
+    # Keep NaN handling as a good practice for other potential zero-sales days
+    prophet_df_filtered['y'] = prophet_df_filtered['y'].replace(0, np.nan)
+    prophet_df_filtered.dropna(subset=['y'], inplace=True)
+
+
+    # --- 2. Model Training with Stabilized Parameters ---
+    # 2. Change seasonality_mode to 'additive' for better stability with data gaps.
     model_atv = Prophet(
         yearly_seasonality=True,
         weekly_seasonality=True,
         daily_seasonality=False,
-        seasonality_mode='multiplicative',
+        seasonality_mode='additive', # CHANGED from 'multiplicative'
         growth='linear'
     )
+    # --- END OF ROBUST FIX ---
     
     for regressor in regressor_names:
-        model_atv.add_regressor(regressor, mode='multiplicative')
+        model_atv.add_regressor(regressor, mode='additive') # Use additive mode for regressors as well
 
-    model_atv.fit(prophet_df)
+    # Fit the model on the FILTERED data
+    model_atv.fit(prophet_df_filtered)
 
     # --- 3. Future Prediction ---
     future = model_atv.make_future_dataframe(periods=periods, freq='D')
