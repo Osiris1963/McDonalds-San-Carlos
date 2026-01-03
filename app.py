@@ -1,31 +1,26 @@
-# app.py (Modified Sidebar Section)
-with st.sidebar:
-    # ... [Keep Steps 1 and 2] ...
-    
-    st.subheader("Step 3: AI Optimizer")
-    if st.button("🚀 Run Optimized Forecast", type="primary", use_container_width=True):
+# Inside app.py (Step 3 Button Logic)
+
+if st.button("Generate Final Forecast & Save", type="primary", use_container_width=True, disabled=is_disabled):
+    with st.spinner("🤖 Applying Self-Learning Bias and Combining Models..."):
         historical_df = get_historical_data(db)
         events_df = get_events_data(db)
         
-        if len(historical_df) < 30:
-            st.error("Insufficient data.")
-        else:
-            with st.spinner("Self-correcting and learning from past mistakes..."):
-                # Call the optimizer orchestrator
-                final_df, metrics, model = run_optimized_forecast(db, historical_df, events_df)
-                
-                st.session_state.final_forecast_df = final_df
-                st.session_state.customer_model = model
-                st.session_state.optimizer_metrics = metrics
-                
-                # Save to database
-                save_forecast_to_log(db, final_df)
-                st.success(f"Optimized! System Accuracy: {metrics['accuracy']}%")
+        # 1. Forecast Customers (Now with Bias Correction)
+        cust_df, cust_model = generate_customer_forecast(historical_df, events_df, db)
+        
+        # 2. Forecast ATV
+        atv_df, _ = generate_atv_forecast(historical_df, events_df)
+        
+        # 3. Merge
+        final_df = pd.merge(cust_df, atv_df, on='ds')
+        final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
+        
+        # Store in session
+        st.session_state.customer_forecast_df = cust_df
+        st.session_state.atv_forecast_df = atv_df
+        st.session_state.final_forecast_df = final_df
+        st.session_state.customer_model = cust_model
 
-# [Optional: Add a Metric Display to the Dashboard tab]
-if 'optimizer_metrics' in st.session_state:
-    m = st.session_state.optimizer_metrics
-    cols = st.columns(3)
-    cols[0].metric("Model Accuracy", f"{m['accuracy']}%")
-    cols[1].metric("Bias Correction", f"{m['bias_adjustment']}x")
-    cols[2].metric("Status", m['status'])
+        if save_forecast_to_log(db, final_df):
+            st.success("✅ Forecast Successful! Bias correction applied.")
+        st.rerun()
