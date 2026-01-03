@@ -1,50 +1,67 @@
 # optimizer.py
 import pandas as pd
 import numpy as np
+from datetime import timedelta
 
-def get_self_learning_bias(historical_df, forecast_log_df):
-    """
-    Independent auditor that calculates how much the AI missed.
-    Uses 'Strict Coercion' to fix the Merge Error once and for all.
-    """
-    if forecast_log_df is None or forecast_log_df.empty or historical_df.empty:
-        return 1.0
+class ForecastOptimizer:
+    def __init__(self, historical_df, forecast_log_df):
+        self.history = historical_df
+        self.log = forecast_log_df
+        self.bias_factor = 1.0
+        self.error_metrics = {}
 
-    try:
-        # FORCE everything to strings first, then back to datetime to strip hidden metadata
-        hist = historical_df.copy()
-        hist['merge_date'] = pd.to_datetime(hist['date'].astype(str)).dt.strftime('%Y-%m-%d')
+    def calculate_self_effectiveness(self):
+        """Compares past predictions to actual results to find the Bias."""
+        if self.log.empty or self.history.empty:
+            return 1.0, {"status": "Insufficient data for self-correction"}
 
-        logs = forecast_log_df.copy()
-        # Find the date column regardless of what it was named in Firestore
-        log_date_col = 'forecast_for_date' if 'forecast_for_date' in logs.columns else 'ds'
-        logs['merge_date'] = pd.to_datetime(logs[log_date_col].astype(str)).dt.strftime('%Y-%m-%d')
-
-        # Merge on strictly formatted string dates to avoid the ValueError
+        # Merge past forecasts with actual results based on date
         comparison = pd.merge(
-            logs[['merge_date', 'predicted_customers']], 
-            hist[['merge_date', 'customers']], 
-            on='merge_date',
-            how='inner'
+            self.log, 
+            self.history[['date', 'customers', 'sales']], 
+            left_on='forecast_for_date', 
+            right_on='date'
         )
 
         if comparison.empty:
-            return 1.0
+            return 1.0, {"status": "No overlapping dates found for backtesting"}
 
-        # Calculate performance of the last 7 entries
-        comparison = comparison.tail(7)
-        # Avoid division by zero
-        valid_comparison = comparison[comparison['predicted_customers'] > 0]
+        # Calculate Mean Bias (Actual / Predicted)
+        # If > 1, we are under-predicting. If < 1, we are over-predicting.
+        comparison['customer_bias'] = comparison['customers'] / comparison['predicted_customers'].replace(0, np.nan)
         
-        if valid_comparison.empty:
-            return 1.0
+        # We focus on the last 7 to 14 days for a 'human-like' recent memory
+        recent_bias = comparison.tail(14)['customer_bias'].mean()
+        
+        # Calculate Accuracy (MAPE)
+        mape = np.mean(np.abs((comparison['customers'] - comparison['predicted_customers']) / comparison['customers'])) * 100
+        
+        self.bias_factor = recent_bias if not pd.isna(recent_bias) else 1.0
+        self.error_metrics = {
+            "mape": mape,
+            "accuracy": max(0, 100 - mape),
+            "bias_adjustment": self.bias_factor,
+            "sample_size": len(comparison)
+        }
+        
+        return self.bias_factor, self.error_metrics
 
-        # BIAS = (What actually happened / What AI predicted)
-        actual_performance_ratio = (valid_comparison['customers'] / valid_comparison['predicted_customers']).mean()
+    def apply_smart_adjustment(self, forecast_df):
+        """Applies the calculated bias to the future forecast."""
+        if self.bias_factor == 1.0:
+            return forecast_df
+
+        adjusted_df = forecast_df.copy()
         
-        # Human-like limit: Don't let the AI swing more than 20% in one go
-        return np.clip(actual_performance_ratio, 0.8, 1.2)
+        # Apply the nudge
+        # We use a dampened adjustment (0.5 weight) to prevent over-correction/oscillation
+        dampened_bias = 1 + ((self.bias_factor - 1) * 0.5)
         
-    except Exception as e:
-        print(f"Auditor Error: {e}")
-        return 1.0
+        if 'forecast_customers' in adjusted_df.columns:
+            adjusted_df['forecast_customers'] = (adjusted_df['forecast_customers'] * dampened_bias).round().astype(int)
+        
+        if 'forecast_sales' in adjusted_df.columns:
+            # Sales are recalculated based on adjusted customers
+            adjusted_df['forecast_sales'] = adjusted_df['forecast_customers'] * adjusted_df['forecast_atv']
+            
+        return adjusted_df
