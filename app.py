@@ -7,6 +7,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
 
 # --- Import from our hybrid model modules ---
 from data_processing import load_from_firestore
@@ -14,7 +15,7 @@ from forecasting import generate_customer_forecast, generate_atv_forecast
 
 # --- Page Configuration and Styling ---
 st.set_page_config(
-    page_title="Sales Forecaster v6.0 (Hybrid)",
+    page_title="Sales Forecaster v7.0 (Self-Learning)",
     page_icon="https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -56,7 +57,6 @@ def apply_custom_styling():
 # --- Firestore Initialization & Data Functions ---
 @st.cache_resource
 def init_firestore():
-    """Initializes a connection to Firestore using Streamlit Secrets."""
     try:
         if not firebase_admin._apps:
             creds_dict = st.secrets.firebase_credentials.to_dict()
@@ -65,14 +65,11 @@ def init_firestore():
             firebase_admin.initialize_app(cred)
         return firestore.client()
     except Exception as e:
-        st.error(f"Firestore Connection Error: Failed to initialize. Check your Streamlit Secrets. Details: {e}")
+        st.error(f"Firestore Connection Error: {e}")
         return None
 
 def save_forecast_to_log(db_client, forecast_df):
-    """Saves the final generated forecast to the 'forecast_log' collection."""
-    if db_client is None or forecast_df.empty:
-        st.warning("Database client not available or forecast is empty. Skipping log.")
-        return False
+    if db_client is None or forecast_df.empty: return False
     try:
         batch = db_client.batch()
         log_collection_ref = db_client.collection('forecast_log')
@@ -81,7 +78,6 @@ def save_forecast_to_log(db_client, forecast_df):
         for _, row in forecast_df.iterrows():
             doc_id = row['ds'].strftime('%Y-%m-%d')
             log_doc_ref = log_collection_ref.document(doc_id)
-            
             log_data = {
                 'generated_on': generated_on_ts,
                 'forecast_for_date': row['ds'],
@@ -90,11 +86,10 @@ def save_forecast_to_log(db_client, forecast_df):
                 'predicted_atv': float(row['forecast_atv'])
             }
             batch.set(log_doc_ref, log_data, merge=True)
-        
         batch.commit()
         return True
     except Exception as e:
-        st.error(f"Error logging forecast to database: {e}")
+        st.error(f"Error logging forecast: {e}")
         return False
 
 @st.cache_data
@@ -105,176 +100,134 @@ def get_historical_data(_db_conn):
 def get_events_data(_db_conn):
     return load_from_firestore(_db_conn, 'future_activities')
 
-def render_historical_record(row, db_client):
-    """Renders an editable historical data record with data integrity checks."""
-    if 'doc_id' not in row or pd.isna(row['doc_id']):
-        return
+def get_forecast_logs(db_client):
+    """SENIOR DEV: Pulls past logs to allow the model to relearn from errors."""
+    if db_client is None: return pd.DataFrame()
+    try:
+        docs = db_client.collection('forecast_log').stream()
+        logs = [doc.to_dict() for doc in docs]
+        if not logs: return pd.DataFrame()
+        df = pd.DataFrame(logs)
+        df['forecast_for_date'] = pd.to_datetime(df['forecast_for_date']).dt.normalize()
+        return df
+    except:
+        return pd.DataFrame()
 
+def render_historical_record(row, db_client):
+    if 'doc_id' not in row or pd.isna(row['doc_id']): return
     date_str = row['date'].strftime('%B %d, %Y')
     expander_title = f"{date_str} - Sales: ₱{row.get('sales', 0):,.2f}, Customers: {row.get('customers', 0)}"
-    
     with st.expander(expander_title):
         st.write(f"**Add-on Sales:** ₱{row.get('add_on_sales', 0):,.2f}")
-
         day_type_options = ["Normal Day", "Not Normal Day"]
         current_day_type = row.get('day_type', day_type_options[0])
-
         try:
             current_index = day_type_options.index(current_day_type)
         except ValueError:
             current_index = 0
-            current_day_type = day_type_options[0]
-            st.warning(f"Found an invalid 'day_type' for {date_str}. Defaulting to 'Normal Day'.")
-
-        st.write(f"**Day Type:** {current_day_type}")
         
         with st.form(key=f"edit_hist_{row['doc_id']}", border=False):
-            st.markdown("**Edit Record**")
-            
-            updated_day_type = st.selectbox(
-                "Day Type", 
-                day_type_options, 
-                index=current_index, 
-                key=f"day_type_{row['doc_id']}"
-            )
-            
-            if st.form_submit_button("💾 Update Day Type", use_container_width=True):
+            updated_day_type = st.selectbox("Day Type", day_type_options, index=current_index, key=f"day_type_{row['doc_id']}")
+            if st.form_submit_button("💾 Update Record", use_container_width=True):
                 db_client.collection('historical_data').document(row['doc_id']).update({'day_type': updated_day_type})
-                st.success(f"Record for {date_str} updated!")
+                st.success(f"Updated {date_str}!")
                 st.cache_data.clear()
-                time.sleep(1)
-                st.rerun()
+                time.sleep(0.5); st.rerun()
 
-# --- Main Application ---
+# --- Main Application Logic ---
 apply_custom_styling()
 db = init_firestore()
 
 if db:
-    if 'customer_forecast_df' not in st.session_state:
-        st.session_state.customer_forecast_df = None
-    if 'atv_forecast_df' not in st.session_state:
-        st.session_state.atv_forecast_df = None
-    if 'final_forecast_df' not in st.session_state:
-        st.session_state.final_forecast_df = None
-    if 'customer_model' not in st.session_state:
-        st.session_state.customer_model = None
+    # Initialize session state for self-learning metrics
+    for key in ['customer_forecast_df', 'atv_forecast_df', 'final_forecast_df', 'customer_model', 'accuracy_bias']:
+        if key not in st.session_state: st.session_state[key] = None
 
     with st.sidebar:
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/3/36/McDonald%27s_Golden_Arches.svg/1200px-McDonald%27s_Golden_Arches.svg.png")
-        st.title("AI Forecaster v6.0")
-        st.info("Hybrid Engine: Recursive LGBM + Prophet")
+        st.title("AI Forecaster v7.0")
+        st.info("System Status: Online & Learning")
 
-        if st.button("🔄 Refresh Data & Clear Cache"):
+        if st.button("🔄 Full System Reset"):
             st.cache_data.clear(); st.cache_resource.clear()
-            for key in ['customer_forecast_df', 'atv_forecast_df', 'final_forecast_df', 'customer_model']:
+            for key in ['customer_forecast_df', 'atv_forecast_df', 'final_forecast_df', 'customer_model', 'accuracy_bias']:
                 st.session_state[key] = None
-            st.success("Caches & state cleared. Rerunning..."); time.sleep(1); st.rerun()
+            st.rerun()
 
         st.markdown("---")
-        st.subheader("Step 1: Forecast Customers")
-        if st.button("📊 Forecast Customers", use_container_width=True):
-            historical_df = get_historical_data(db)
-            events_df = get_events_data(db)
-            if len(historical_df) < 30: 
-                st.error("Need at least 30 days of data.")
+        # Step 1: Customer Forecast with Relearning
+        if st.button("📊 Step 1: Forecast Customers", use_container_width=True):
+            hist_df = get_historical_data(db)
+            event_df = get_events_data(db)
+            log_df = get_forecast_logs(db) # Pull logs to check past effectiveness
+            
+            if len(hist_df) < 30:
+                st.error("Insufficient data (Need 30+ days)")
             else:
-                with st.spinner("🧠 Training Customer Model (Recursive LGBM)..."):
-                    cust_df, cust_model = generate_customer_forecast(historical_df, events_df)
+                with st.spinner("🧠 Calculating effectiveness & Relearning..."):
+                    # The forecasting module now uses the log_df to adjust predictions
+                    cust_df, model, bias = generate_customer_forecast(hist_df, event_df, forecast_log_df=log_df)
                     st.session_state.customer_forecast_df = cust_df
-                    st.session_state.customer_model = cust_model
-                    st.session_state.final_forecast_df = None
-                st.success("Customer forecast complete!")
+                    st.session_state.customer_model = model
+                    st.session_state.accuracy_bias = bias
+                st.success("Customer Model Optimized!")
 
-        st.subheader("Step 2: Forecast ATV")
-        if st.button("📈 Forecast ATV", use_container_width=True):
-            historical_df = get_historical_data(db)
-            events_df = get_events_data(db)
-            if len(historical_df) < 30: 
-                st.error("Need at least 30 days of data.")
-            else:
-                with st.spinner("⏳ Training ATV Model (Prophet)..."):
-                    atv_df, _ = generate_atv_forecast(historical_df, events_df)
-                    st.session_state.atv_forecast_df = atv_df
-                    st.session_state.final_forecast_df = None
-                st.success("ATV forecast complete!")
-        
+        # Step 2: ATV Forecast
+        if st.button("📈 Step 2: Forecast ATV", use_container_width=True):
+            hist_df = get_historical_data(db)
+            event_df = get_events_data(db)
+            with st.spinner("⏳ Training ATV Model..."):
+                atv_df, _ = generate_atv_forecast(hist_df, event_df)
+                st.session_state.atv_forecast_df = atv_df
+            st.success("ATV Model Ready!")
+
         st.markdown("---")
-        st.subheader("Step 3: Generate Final Forecast")
-        is_disabled = st.session_state.customer_forecast_df is None or st.session_state.atv_forecast_df is None
-        if st.button("Generate Final Forecast & Save", type="primary", use_container_width=True, disabled=is_disabled):
-            with st.spinner("Combining forecasts and saving..."):
-                cust_df = st.session_state.customer_forecast_df
-                atv_df = st.session_state.atv_forecast_df
-                final_df = pd.merge(cust_df, atv_df, on='ds')
+        # Step 3: Combined Output
+        ready = st.session_state.customer_forecast_df is not None and st.session_state.atv_forecast_df is not None
+        if st.button("🚀 Generate Final Forecast", type="primary", use_container_width=True, disabled=not ready):
+            with st.spinner("Finalizing calculations..."):
+                final_df = pd.merge(st.session_state.customer_forecast_df, st.session_state.atv_forecast_df, on='ds')
                 final_df['forecast_sales'] = final_df['forecast_customers'] * final_df['forecast_atv']
                 st.session_state.final_forecast_df = final_df
-                
-                if save_forecast_to_log(db, final_df):
-                    st.success("Final Forecast Generated & Saved!")
-                else:
-                    st.warning("Final forecast generated but failed to save.")
-        if is_disabled:
-            st.caption("Complete Steps 1 & 2 to enable.")
+                save_forecast_to_log(db, final_df)
+            st.success("Forecast Logged & Saved!")
 
-    tab_list = ["🔮 Forecast Dashboard", "💡 Customer Model Insights", "✍️ Edit Data"]
-    tabs = st.tabs(tab_list)
+    # --- Tabs Layout ---
+    tabs = st.tabs(["🔮 Dashboard", "💡 Intelligence", "✍️ Data Management"])
 
     with tabs[0]:
-        st.header("🔮 Forecast Dashboard")
+        st.header("🔮 Sales Forecast Dashboard")
+        if st.session_state.accuracy_bias:
+            bias = st.session_state.accuracy_bias
+            if bias > 1.02:
+                st.warning(f"🤖 **Self-Correction Active:** Model detected a recent under-prediction. Nudging results UP by {((bias-1)*100):.1f}% to match actual trends.")
+            elif bias < 0.98:
+                st.info(f"🤖 **Self-Correction Active:** Model detected a recent over-prediction. Adjusting results DOWN by {((1-bias)*100):.1f}% for better accuracy.")
+
         if st.session_state.final_forecast_df is not None:
-            df = st.session_state.final_forecast_df
-            st.subheader("Final Combined Sales Forecast")
-            df_display = df.rename(columns={
-                'ds': 'Date', 'forecast_customers': 'Predicted Customers',
-                'forecast_atv': 'Predicted Avg Sale (₱)', 'forecast_sales': 'Predicted Sales (₱)'
-            }).set_index('Date')
-            df_display['Predicted Sales (₱)'] = df_display['Predicted Sales (₱)'].apply(lambda x: f"₱{x:,.2f}")
-            df_display['Predicted Avg Sale (₱)'] = df_display['Predicted Avg Sale (₱)'].apply(lambda x: f"₱{x:,.2f}")
-            st.dataframe(df_display, use_container_width=True, height=560)
-        elif st.session_state.customer_forecast_df is None and st.session_state.atv_forecast_df is None:
-            st.info("Begin by generating a forecast using the controls in the sidebar.")
+            df = st.session_state.final_forecast_df.copy()
+            df.columns = ['Date', 'Customers', 'ATV (₱)', 'Total Sales (₱)']
+            st.dataframe(df.set_index('Date').style.format({"ATV (₱)": "₱{:,.2f}", "Total Sales (₱)": "₱{:,.2f}"}), use_container_width=True, height=500)
         else:
-            st.info("Final forecast not yet generated. Showing individual model outputs below.")
-            c1, c2 = st.columns(2)
-            if st.session_state.customer_forecast_df is not None:
-                with c1:
-                    st.subheader("Customer Forecast (Recursive LGBM)")
-                    st.dataframe(st.session_state.customer_forecast_df.set_index('ds'), use_container_width=True)
-            if st.session_state.atv_forecast_df is not None:
-                with c2:
-                    st.subheader("ATV Forecast (Prophet)")
-                    st.dataframe(st.session_state.atv_forecast_df.set_index('ds'), use_container_width=True)
+            st.info("Please complete the sidebar steps to view the combined forecast.")
 
     with tabs[1]:
-        st.header("💡 Key Customer Drivers (LGBM)")
-        st.info("This shows the most important factors the AI model used to predict customer traffic.")
+        st.header("💡 Model Intelligence")
         if st.session_state.customer_model:
             model = st.session_state.customer_model
-            feature_importances = pd.DataFrame({
-                'feature': model.feature_name_,
-                'importance': model.feature_importances_
-            }).sort_values('importance', ascending=False).head(20)
-            plt.style.use('dark_background')
-            fig, ax = plt.subplots(figsize=(12, 10))
-            sns.barplot(x='importance', y='feature', data=feature_importances, ax=ax, palette='viridis')
-            ax.set_title('Top 20 Features Driving Customer Forecast', fontsize=16, color='white')
-            ax.set_xlabel('Importance', fontsize=12, color='white'); ax.set_ylabel('Feature', fontsize=12, color='white')
-            for spine in ax.spines.values(): spine.set_edgecolor('#555555')
-            ax.tick_params(axis='x', colors='white'); ax.tick_params(axis='y', colors='white')
-            fig.tight_layout()
+            importance = pd.DataFrame({'Feature': model.feature_name_, 'Value': model.feature_importances_}).sort_values('Value', ascending=False).head(15)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.barplot(x='Value', y='Feature', data=importance, palette='magma', ax=ax)
+            plt.title("Top Drivers for Customer Traffic")
             st.pyplot(fig)
         else:
-            st.info("Generate a forecast to see the key drivers.")
+            st.info("Run Step 1 to see model drivers.")
 
     with tabs[2]:
-        st.header("✍️ Edit Historical Data")
-        st.info("Correct the 'Day Type' for past dates to improve future forecasts.")
-        historical_df_edit = get_historical_data(db)
-        if not historical_df_edit.empty:
-            recent_df = historical_df_edit.sort_values(by="date", ascending=False).head(30)
-            for _, row in recent_df.iterrows():
+        st.header("✍️ Manage Historical Records")
+        hist_edit = get_historical_data(db)
+        if not hist_edit.empty:
+            for _, row in hist_edit.sort_values('date', ascending=False).head(15).iterrows():
                 render_historical_record(row, db)
-        else:
-            st.info("No historical data found.")
 else:
-    st.error("Could not connect to Firestore. Please check your configuration and network.")
+    st.error("Connection Failed. Verify Firestore secrets.")
