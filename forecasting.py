@@ -1,4 +1,4 @@
-# forecasting.py - COGNITIVE FORECASTING ENGINE v11.0
+# forecasting.py - COGNITIVE FORECASTING ENGINE v11.1
 # Key enhancements:
 # 1. Self-Correcting AI - learns from past forecast errors
 # 2. Contextual Window Analysis (SDLY ± 14 days)  
@@ -8,6 +8,7 @@
 # 6. Intelligent Anomaly Handling
 # 7. Multi-Scenario Forecasting
 # 8. Confidence Scoring & Explanations
+# 9. TREND-AWARE BLENDING - Respects momentum and confirms trends (v11.1)
 
 import pandas as pd
 import numpy as np
@@ -49,6 +50,20 @@ try:
 except ImportError:
     INTELLIGENT_MODE = False
     print("Warning: Intelligent components not available. Running in basic mode.")
+
+# Import trend intelligence (v11.1)
+try:
+    from trend_intelligence import (
+        TrendAnalyzer,
+        TrendAwareBlender,
+        MomentumDampener,
+        ConservativeEstimator,
+        apply_trend_intelligence
+    )
+    TREND_AWARE_MODE = True
+except ImportError:
+    TREND_AWARE_MODE = False
+    print("Warning: Trend intelligence not available.")
 
 
 class SelfCorrectingForecaster:
@@ -284,15 +299,13 @@ class EnhancedCustomerForecaster:
     
     def predict_recursive(self, periods=15):
         """
-        Generate forecasts using BLENDED recursive prediction.
+        Generate forecasts using TREND-AWARE recursive prediction.
         
-        For each day:
-        1. Get LightGBM model prediction
-        2. Get SDLY contextual prediction (last year same period ± 14 days)
-        3. Get recent trend prediction (8-week weighted)
-        4. Blend all three
-        5. Apply self-correction
-        6. Apply special date multipliers
+        v11.1 Enhancement: Now properly respects downward momentum by:
+        1. Analyzing trends from multiple sources
+        2. Confirming trends when SDLY and Recent agree
+        3. Applying momentum dampening when weakness detected
+        4. Using conservative estimates during downtrends
         """
         predictions = []
         
@@ -320,19 +333,13 @@ class EnhancedCustomerForecaster:
             
             # === COMPONENT 2: SDLY Contextual Prediction ===
             ctx_features = calculate_contextual_window_features(working_df, target_date)
-            
-            # Use SDLY with YoY growth adjustment
             yoy = calculate_yoy_comparison(working_df, target_date)
             
             if not np.isnan(ctx_features['sdly_customers']) and ctx_features['sdly_customers'] > 0:
-                # Adjust SDLY by YoY growth rate
                 sdly_pred = ctx_features['sdly_customers'] * yoy['yoy_customer_growth']
-                
-                # Also consider the trend from the contextual window
                 if ctx_features['sdly_momentum'] > 0:
                     sdly_pred *= (1 + ctx_features['sdly_trend_after'] * 0.3)
             else:
-                # Fallback to window mean
                 sdly_pred = ctx_features.get('sdly_window_cust_mean', model_pred)
                 if np.isnan(sdly_pred):
                     sdly_pred = model_pred
@@ -344,12 +351,10 @@ class EnhancedCustomerForecaster:
             if np.isnan(recent_base):
                 recent_base = model_pred
             
-            # Apply day-of-week factor from recent data
             dow_factor = recent_features.get('recent_dow_factor', 1.0)
             if np.isnan(dow_factor):
                 dow_factor = 1.0
             
-            # Apply momentum
             momentum = recent_features.get('recent_momentum_2w', 1.0)
             if np.isnan(momentum):
                 momentum = 1.0
@@ -357,23 +362,42 @@ class EnhancedCustomerForecaster:
             
             recent_pred = recent_base * dow_factor * momentum
             
-            # === BLEND THE THREE PREDICTIONS ===
-            w_model = self.blend_weights['model']
-            w_sdly = self.blend_weights['sdly_contextual']
-            w_recent = self.blend_weights['recent_trend']
-            
-            # If SDLY is unavailable, redistribute weight
-            if np.isnan(sdly_pred) or sdly_pred <= 0:
-                sdly_pred = model_pred
-                w_model += w_sdly * 0.5
-                w_recent += w_sdly * 0.5
-                w_sdly = 0
-            
-            blended_pred = (
-                w_model * model_pred +
-                w_sdly * sdly_pred +
-                w_recent * recent_pred
-            )
+            # === NEW v11.1: TREND-AWARE BLENDING ===
+            if TREND_AWARE_MODE:
+                # Use the intelligent trend-aware system
+                trend_result = apply_trend_intelligence(
+                    working_df, target_date,
+                    model_pred, sdly_pred, recent_pred
+                )
+                
+                blended_pred = trend_result['final_prediction']
+                trend_analysis = trend_result['trend_analysis']
+                
+                # Store trend info for diagnostics
+                trend_direction = trend_analysis['overall_direction']
+                trend_confidence = trend_analysis['confidence']
+                trend_adjustment = trend_analysis['recommended_adjustment']
+            else:
+                # Fallback to simple blending
+                w_model = self.blend_weights['model']
+                w_sdly = self.blend_weights['sdly_contextual']
+                w_recent = self.blend_weights['recent_trend']
+                
+                if np.isnan(sdly_pred) or sdly_pred <= 0:
+                    sdly_pred = model_pred
+                    w_model += w_sdly * 0.5
+                    w_recent += w_sdly * 0.5
+                    w_sdly = 0
+                
+                blended_pred = (
+                    w_model * model_pred +
+                    w_sdly * sdly_pred +
+                    w_recent * recent_pred
+                )
+                
+                trend_direction = 'unknown'
+                trend_confidence = 0
+                trend_adjustment = 1.0
             
             # === APPLY SELF-CORRECTION ===
             corrected_pred = self.self_corrector.apply_correction(blended_pred, target_date)
@@ -393,7 +417,10 @@ class EnhancedCustomerForecaster:
                 'blended_prediction': blended_pred,
                 'corrected_prediction': corrected_pred,
                 'yoy_growth': yoy['yoy_customer_growth'],
-                'recent_momentum': momentum
+                'recent_momentum': momentum,
+                'trend_direction': trend_direction,
+                'trend_confidence': trend_confidence,
+                'trend_adjustment': trend_adjustment
             })
             
             # Update working_df with prediction for next iteration
