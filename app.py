@@ -1,9 +1,5 @@
-# app.py - ENHANCED VERSION v10.0
-# Key enhancements:
-# 1. Self-Correction Dashboard - shows learned biases
-# 2. Prediction Component Analysis - shows SDLY vs Recent vs Model
-# 3. Contextual Window Visualization
-# 4. 8-Week Trend Analysis Display
+# app.py - COGNITIVE FORECASTING ENGINE v11.1
+# Complete Streamlit Dashboard with all pages implemented
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +10,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from data_processing import (
     load_from_firestore, 
@@ -26,12 +22,27 @@ from forecasting import (
     generate_full_forecast, 
     backtest_model,
     calculate_accuracy_metrics,
-    EnsembleForecaster
+    EnsembleForecaster,
+    TREND_AWARE_MODE
 )
+
+# Check for intelligent mode
+try:
+    from intelligent_engine import CognitiveForecaster
+    INTELLIGENT_MODE = True
+except ImportError:
+    INTELLIGENT_MODE = False
+
+# Check for trend intelligence
+try:
+    from trend_intelligence import TrendAnalyzer, apply_trend_intelligence
+    TREND_MODE = True
+except ImportError:
+    TREND_MODE = False
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="AI Sales Forecaster v11.0", 
+    page_title="Cognitive Forecaster v11.1", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -49,19 +60,12 @@ st.markdown("""
     .accuracy-good { color: #10B981; font-weight: bold; }
     .accuracy-medium { color: #F59E0B; font-weight: bold; }
     .accuracy-poor { color: #EF4444; font-weight: bold; }
-    .component-card {
-        background: #f8f9fa;
-        padding: 15px;
-        border-radius: 8px;
-        border-left: 4px solid #3B82F6;
-        margin: 10px 0;
-    }
-    .self-correct-positive { color: #10B981; }
-    .self-correct-negative { color: #EF4444; }
-    .confidence-a { background: #10B981; color: white; padding: 2px 8px; border-radius: 4px; }
-    .confidence-b { background: #3B82F6; color: white; padding: 2px 8px; border-radius: 4px; }
-    .confidence-c { background: #F59E0B; color: white; padding: 2px 8px; border-radius: 4px; }
-    .confidence-d { background: #EF4444; color: white; padding: 2px 8px; border-radius: 4px; }
+    .trend-down { color: #EF4444; font-weight: bold; }
+    .trend-up { color: #10B981; font-weight: bold; }
+    .trend-neutral { color: #6B7280; }
+    .confidence-high { background: #10B981; color: white; padding: 2px 8px; border-radius: 4px; }
+    .confidence-medium { background: #F59E0B; color: white; padding: 2px 8px; border-radius: 4px; }
+    .confidence-low { background: #EF4444; color: white; padding: 2px 8px; border-radius: 4px; }
     .briefing-box {
         background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
         color: white;
@@ -69,9 +73,27 @@ st.markdown("""
         border-radius: 10px;
         margin: 10px 0;
     }
-    .scenario-optimistic { border-left: 4px solid #10B981; }
-    .scenario-realistic { border-left: 4px solid #3B82F6; }
-    .scenario-pessimistic { border-left: 4px solid #EF4444; }
+    .signal-down { 
+        background: #FEE2E2; 
+        border-left: 4px solid #EF4444; 
+        padding: 10px; 
+        margin: 5px 0;
+        border-radius: 4px;
+    }
+    .signal-up { 
+        background: #D1FAE5; 
+        border-left: 4px solid #10B981; 
+        padding: 10px; 
+        margin: 5px 0;
+        border-radius: 4px;
+    }
+    .signal-neutral { 
+        background: #F3F4F6; 
+        border-left: 4px solid #6B7280; 
+        padding: 10px; 
+        margin: 5px 0;
+        border-radius: 4px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -93,7 +115,7 @@ def save_forecast_to_log(db_client, forecast_df):
     try:
         batch = db_client.batch()
         log_col = db_client.collection('forecast_log')
-        gen_time = pd.to_datetime('now')
+        gen_time = datetime.now()
 
         for _, row in forecast_df.iterrows():
             doc_id = row['ds'].strftime('%Y-%m-%d')
@@ -107,11 +129,11 @@ def save_forecast_to_log(db_client, forecast_df):
                 'predicted_atv': float(row['forecast_atv']),
                 'sales_lower': float(row.get('sales_lower', row['forecast_sales'] * 0.9)),
                 'sales_upper': float(row.get('sales_upper', row['forecast_sales'] * 1.1)),
-                # Store component predictions for analysis
                 'model_prediction': float(row.get('model_prediction', 0)),
                 'sdly_prediction': float(row.get('sdly_prediction', 0)),
                 'recent_prediction': float(row.get('recent_prediction', 0)),
-                'yoy_growth': float(row.get('yoy_growth', 1.0))
+                'trend_direction': str(row.get('trend_direction', 'unknown')),
+                'trend_confidence': float(row.get('trend_confidence', 0))
             }
             batch.set(doc_ref, data, merge=True)
         
@@ -122,11 +144,11 @@ def save_forecast_to_log(db_client, forecast_df):
         return False
 
 
-def create_forecast_chart(forecast_df, hist_df=None, show_confidence=True):
-    """Create interactive forecast visualization with component breakdown."""
+def create_forecast_chart(forecast_df, hist_df=None):
+    """Create interactive forecast visualization."""
     fig = make_subplots(
         rows=2, cols=1,
-        subplot_titles=('Sales Forecast', 'Customer Forecast - Component Breakdown'),
+        subplot_titles=('Sales Forecast', 'Customer Forecast'),
         vertical_spacing=0.12
     )
     
@@ -134,252 +156,59 @@ def create_forecast_chart(forecast_df, hist_df=None, show_confidence=True):
     if hist_df is not None and len(hist_df) > 0:
         recent_hist = hist_df.tail(30)
         
-        fig.add_trace(
-            go.Scatter(
-                x=recent_hist['date'], 
-                y=recent_hist['sales'],
-                mode='lines+markers',
-                name='Actual Sales',
-                line=dict(color='#EF4444', width=2),
-                marker=dict(size=6)
-            ),
-            row=1, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=recent_hist['date'], y=recent_hist['sales'],
+            mode='lines+markers', name='Actual Sales',
+            line=dict(color='#EF4444', width=2), marker=dict(size=6)
+        ), row=1, col=1)
         
-        fig.add_trace(
-            go.Scatter(
-                x=recent_hist['date'], 
-                y=recent_hist['customers'],
-                mode='lines+markers',
-                name='Actual Customers',
-                line=dict(color='#EF4444', width=2),
-                marker=dict(size=6)
-            ),
-            row=2, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=recent_hist['date'], y=recent_hist['customers'],
+            mode='lines+markers', name='Actual Customers',
+            line=dict(color='#EF4444', width=2), marker=dict(size=6)
+        ), row=2, col=1)
     
     # Confidence interval
-    if show_confidence and 'sales_lower' in forecast_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=pd.concat([forecast_df['ds'], forecast_df['ds'][::-1]]),
-                y=pd.concat([forecast_df['sales_upper'], forecast_df['sales_lower'][::-1]]),
-                fill='toself',
-                fillcolor='rgba(251, 191, 36, 0.2)',
-                line=dict(color='rgba(255,255,255,0)'),
-                name='Sales 80% CI',
-                showlegend=True
-            ),
-            row=1, col=1
-        )
+    if 'sales_lower' in forecast_df.columns:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([forecast_df['ds'], forecast_df['ds'][::-1]]),
+            y=pd.concat([forecast_df['sales_upper'], forecast_df['sales_lower'][::-1]]),
+            fill='toself', fillcolor='rgba(251, 191, 36, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'), name='Sales CI', showlegend=True
+        ), row=1, col=1)
     
-    # Sales forecast
-    fig.add_trace(
-        go.Scatter(
-            x=forecast_df['ds'], 
-            y=forecast_df['forecast_sales'],
-            mode='lines+markers',
-            name='Forecast Sales',
-            line=dict(color='#FBBF24', width=3, dash='dash'),
-            marker=dict(size=8, symbol='diamond')
-        ),
-        row=1, col=1
-    )
+    # Forecasts
+    fig.add_trace(go.Scatter(
+        x=forecast_df['ds'], y=forecast_df['forecast_sales'],
+        mode='lines+markers', name='Forecast Sales',
+        line=dict(color='#FBBF24', width=3, dash='dash'),
+        marker=dict(size=8, symbol='diamond')
+    ), row=1, col=1)
     
-    # Customer forecast with components
-    fig.add_trace(
-        go.Scatter(
-            x=forecast_df['ds'], 
-            y=forecast_df['forecast_customers'],
-            mode='lines+markers',
-            name='Final Forecast',
-            line=dict(color='#FBBF24', width=3),
-            marker=dict(size=10, symbol='diamond')
-        ),
-        row=2, col=1
-    )
+    fig.add_trace(go.Scatter(
+        x=forecast_df['ds'], y=forecast_df['forecast_customers'],
+        mode='lines+markers', name='Forecast Customers',
+        line=dict(color='#FBBF24', width=3, dash='dash'),
+        marker=dict(size=8, symbol='diamond')
+    ), row=2, col=1)
     
-    # Show component predictions if available
+    # Component predictions
     if 'model_prediction' in forecast_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=forecast_df['ds'],
-                y=forecast_df['model_prediction'],
-                mode='lines',
-                name='Model Component',
-                line=dict(color='#3B82F6', width=1, dash='dot'),
-                opacity=0.6
-            ),
-            row=2, col=1
-        )
-    
-    if 'sdly_prediction' in forecast_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=forecast_df['ds'],
-                y=forecast_df['sdly_prediction'],
-                mode='lines',
-                name='SDLY Component',
-                line=dict(color='#10B981', width=1, dash='dot'),
-                opacity=0.6
-            ),
-            row=2, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=forecast_df['ds'], y=forecast_df['model_prediction'],
+            mode='lines', name='Model', line=dict(color='#3B82F6', width=1, dash='dot'), opacity=0.5
+        ), row=2, col=1)
     
     if 'recent_prediction' in forecast_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=forecast_df['ds'],
-                y=forecast_df['recent_prediction'],
-                mode='lines',
-                name='Recent Trend Component',
-                line=dict(color='#8B5CF6', width=1, dash='dot'),
-                opacity=0.6
-            ),
-            row=2, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=forecast_df['ds'], y=forecast_df['recent_prediction'],
+            mode='lines', name='Recent Trend', line=dict(color='#8B5CF6', width=1, dash='dot'), opacity=0.5
+        ), row=2, col=1)
     
-    fig.update_layout(
-        height=700,
-        hovermode='x unified',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5)
-    )
-    
-    fig.update_xaxes(title_text="Date", row=2, col=1)
+    fig.update_layout(height=600, hovermode='x unified',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5))
     fig.update_yaxes(title_text="Sales (₱)", row=1, col=1)
     fig.update_yaxes(title_text="Customers", row=2, col=1)
-    
-    return fig
-
-
-def create_contextual_window_chart(hist_df, target_date):
-    """Visualize the SDLY ± 14 day contextual window."""
-    sdly_date = target_date - timedelta(days=364)
-    window_start = sdly_date - timedelta(days=14)
-    window_end = sdly_date + timedelta(days=14)
-    
-    window_data = hist_df[(hist_df['date'] >= window_start) & (hist_df['date'] <= window_end)]
-    
-    if window_data.empty:
-        return None
-    
-    fig = go.Figure()
-    
-    # Window data
-    fig.add_trace(go.Scatter(
-        x=window_data['date'],
-        y=window_data['customers'],
-        mode='lines+markers',
-        name='Last Year Data',
-        line=dict(color='#3B82F6', width=2)
-    ))
-    
-    # Highlight SDLY date
-    sdly_data = window_data[window_data['date'] == sdly_date]
-    if len(sdly_data) > 0:
-        fig.add_trace(go.Scatter(
-            x=[sdly_date],
-            y=[sdly_data['customers'].values[0]],
-            mode='markers',
-            name='SDLY (Same Day Last Year)',
-            marker=dict(color='#EF4444', size=15, symbol='star')
-        ))
-    
-    # Add vertical line for SDLY
-    fig.add_vline(x=sdly_date, line_dash="dash", line_color="red", opacity=0.5)
-    
-    fig.update_layout(
-        title=f"Contextual Window: {window_start.strftime('%b %d')} - {window_end.strftime('%b %d, %Y')}",
-        xaxis_title="Date (Last Year)",
-        yaxis_title="Customers",
-        height=350
-    )
-    
-    return fig
-
-
-def create_recent_trend_chart(hist_df, weeks=8):
-    """Visualize the 8-week recent trend with week-over-week comparison."""
-    end_date = hist_df['date'].max()
-    start_date = end_date - timedelta(weeks=weeks)
-    
-    recent_data = hist_df[(hist_df['date'] > start_date) & (hist_df['date'] <= end_date)].copy()
-    
-    if recent_data.empty:
-        return None
-    
-    recent_data['weeks_ago'] = ((end_date - recent_data['date']).dt.days // 7) + 1
-    weekly_agg = recent_data.groupby('weeks_ago').agg({
-        'customers': 'mean',
-        'sales': 'mean'
-    }).reset_index().sort_values('weeks_ago', ascending=False)
-    
-    fig = make_subplots(rows=1, cols=2, subplot_titles=('Weekly Customer Average', 'Trend Direction'))
-    
-    # Bar chart of weekly averages
-    colors = ['#10B981' if i <= 2 else '#3B82F6' if i <= 4 else '#9CA3AF' 
-              for i in weekly_agg['weeks_ago']]
-    
-    fig.add_trace(
-        go.Bar(
-            x=[f"Week {int(w)}" for w in weekly_agg['weeks_ago']],
-            y=weekly_agg['customers'],
-            marker_color=colors,
-            name='Avg Customers'
-        ),
-        row=1, col=1
-    )
-    
-    # Trend line
-    fig.add_trace(
-        go.Scatter(
-            x=[f"Week {int(w)}" for w in weekly_agg['weeks_ago']],
-            y=weekly_agg['customers'],
-            mode='lines+markers',
-            name='Trend',
-            line=dict(color='#EF4444', width=2)
-        ),
-        row=1, col=2
-    )
-    
-    fig.update_layout(
-        height=300,
-        showlegend=False,
-        title_text="8-Week Recent Performance (Week 1 = Most Recent)"
-    )
-    
-    return fig
-
-
-def create_backtest_chart(backtest_df, metric='customers'):
-    """Create chart comparing predictions vs actuals from backtesting."""
-    fig = go.Figure()
-    
-    actual_col = f'actual_{metric}'
-    pred_col = f'predicted_{metric}'
-    
-    fig.add_trace(go.Scatter(
-        x=backtest_df['date'],
-        y=backtest_df[actual_col],
-        mode='lines+markers',
-        name='Actual',
-        line=dict(color='#EF4444', width=2)
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=backtest_df['date'],
-        y=backtest_df[pred_col],
-        mode='lines+markers',
-        name='Predicted',
-        line=dict(color='#FBBF24', width=2, dash='dash')
-    ))
-    
-    fig.update_layout(
-        title=f'{metric.title()} - Backtest Results',
-        xaxis_title='Date',
-        yaxis_title=metric.title(),
-        hovermode='x unified'
-    )
     
     return fig
 
@@ -389,8 +218,8 @@ db = init_db()
 
 # Sidebar
 with st.sidebar:
-    st.title("🧠 Cognitive Forecaster v11.0")
-    st.caption("Self-Learning AI with Reasoning")
+    st.title("🧠 Cognitive Forecaster v11.1")
+    st.caption("Self-Learning AI with Trend Intelligence")
     
     st.divider()
     
@@ -408,17 +237,21 @@ with st.sidebar:
     
     st.divider()
     
-    # Intelligent Status
+    # AI Status
     st.subheader("🤖 AI Status")
-    try:
-        from intelligent_engine import CognitiveForecaster
-        st.success("✅ Cognitive Mode Active")
-    except:
-        st.warning("⚠️ Basic Mode Only")
+    if INTELLIGENT_MODE:
+        st.success("✅ Cognitive Mode")
+    else:
+        st.warning("⚠️ Basic Mode")
+    
+    if TREND_MODE:
+        st.success("✅ Trend Intelligence")
+    else:
+        st.warning("⚠️ No Trend Module")
     
     st.divider()
     
-    # Data info
+    # Data Status
     st.subheader("📁 Data Status")
     hist_df = load_from_firestore(db, 'historical_data')
     ev_df = load_from_firestore(db, 'future_activities')
@@ -427,103 +260,213 @@ with st.sidebar:
         st.success(f"✅ {len(hist_df)} days of data")
         st.caption(f"From: {hist_df['date'].min().strftime('%Y-%m-%d')}")
         st.caption(f"To: {hist_df['date'].max().strftime('%Y-%m-%d')}")
-        
         if len(hist_df) >= 365:
             st.info("✅ SDLY data available")
-        else:
-            st.warning(f"⚠️ Need {365 - len(hist_df)} more days for SDLY")
     else:
-        st.error("❌ No historical data found")
+        st.error("❌ No historical data")
 
 
-# === PAGE: Forecast Dashboard ===
+# ============================================================
+# PAGE: Forecast Dashboard
+# ============================================================
 if page == "📊 Forecast Dashboard":
     st.header("🔮 15-Day Sales Projections")
-    st.caption("Blended Prediction: 50% Model + 25% SDLY Context + 25% Recent Trend")
+    st.caption("Trend-Aware Blending with Self-Correction")
     
     col1, col2 = st.columns([3, 1])
     
     with col2:
         if st.button("🚀 Generate Forecast", type="primary", use_container_width=True):
             if len(hist_df) > 364:
-                with st.spinner("Training self-correcting ensemble model..."):
-                    progress = st.progress(0, text="Preparing data...")
+                with st.spinner("Training cognitive model..."):
+                    progress = st.progress(0, text="Analyzing trends...")
                     
                     try:
-                        progress.progress(20, text="Calibrating self-correction...")
+                        progress.progress(30, text="Training model...")
                         forecast_df, forecaster, diagnostics = generate_full_forecast(
                             hist_df, ev_df, periods=15, db_client=db
                         )
                         
-                        progress.progress(70, text="Saving to Firestore...")
-                        success = save_forecast_to_log(db, forecast_df)
+                        progress.progress(70, text="Saving to database...")
+                        save_forecast_to_log(db, forecast_df)
                         
                         progress.progress(100, text="Done!")
                         
-                        if success:
-                            st.session_state.forecast_df = forecast_df
-                            st.session_state.diagnostics = diagnostics
-                            st.success("✅ Forecast generated and saved!")
-                            time.sleep(1)
-                            st.rerun()
+                        st.session_state.forecast_df = forecast_df
+                        st.session_state.diagnostics = diagnostics
+                        st.success("✅ Forecast generated!")
+                        time.sleep(1)
+                        st.rerun()
                     except Exception as e:
-                        st.error(f"Forecast Error: {e}")
+                        st.error(f"Error: {e}")
                         st.exception(e)
             else:
-                st.error(f"Need at least 365 days of data. Current: {len(hist_df)} days.")
+                st.error(f"Need 365+ days. Current: {len(hist_df)}")
     
     # Display forecast
     if 'forecast_df' in st.session_state:
         forecast_df = st.session_state.forecast_df
         
         # Summary metrics
-        st.subheader("📋 Forecast Summary")
-        
         col1, col2, col3, col4 = st.columns(4)
         
-        total_sales = forecast_df['forecast_sales'].sum()
-        total_customers = forecast_df['forecast_customers'].sum()
-        avg_atv = forecast_df['forecast_atv'].mean()
-        peak_day = forecast_df.loc[forecast_df['forecast_sales'].idxmax()]
-        
         with col1:
-            st.metric("Total Projected Sales", f"₱{total_sales:,.0f}")
+            st.metric("Total Sales", f"₱{forecast_df['forecast_sales'].sum():,.0f}")
         with col2:
-            st.metric("Total Projected Customers", f"{total_customers:,}")
+            st.metric("Total Customers", f"{forecast_df['forecast_customers'].sum():,}")
         with col3:
-            st.metric("Average ATV", f"₱{avg_atv:,.2f}")
+            st.metric("Avg ATV", f"₱{forecast_df['forecast_atv'].mean():,.2f}")
         with col4:
-            st.metric("Peak Day", peak_day['ds'].strftime('%b %d'))
+            peak = forecast_df.loc[forecast_df['forecast_sales'].idxmax()]
+            st.metric("Peak Day", peak['ds'].strftime('%b %d'))
+        
+        # Trend indicator
+        if 'trend_direction' in forecast_df.columns:
+            trend = forecast_df['trend_direction'].iloc[0]
+            conf = forecast_df.get('trend_confidence', pd.Series([0])).iloc[0]
+            
+            if trend == 'down':
+                st.warning(f"📉 **Downtrend Detected** (Confidence: {conf:.0f}%) - Forecasts adjusted lower")
+            elif trend == 'up':
+                st.success(f"📈 **Uptrend Detected** (Confidence: {conf:.0f}%) - Positive momentum")
+            else:
+                st.info("➡️ **Neutral Trend** - Stable forecast")
         
         # Chart
-        st.subheader("📈 Forecast Visualization")
-        fig = create_forecast_chart(forecast_df, hist_df, show_confidence=True)
+        fig = create_forecast_chart(forecast_df, hist_df)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Component breakdown
-        st.subheader("🔍 Prediction Component Breakdown")
-        
+        # Detailed table
+        st.subheader("📊 Daily Breakdown")
         display_df = forecast_df.copy()
         display_df['Date'] = display_df['ds'].dt.strftime('%a, %b %d')
-        display_df['Final Forecast'] = display_df['forecast_customers']
-        display_df['Model (50%)'] = display_df['model_prediction'].round(0).astype(int)
-        display_df['SDLY (25%)'] = display_df['sdly_prediction'].round(0).astype(int)
-        display_df['Recent (25%)'] = display_df['recent_prediction'].round(0).astype(int)
-        display_df['YoY Growth'] = display_df['yoy_growth'].map("{:.1%}".format)
         display_df['Sales'] = display_df['forecast_sales'].map("₱{:,.0f}".format)
+        display_df['Customers'] = display_df['forecast_customers']
+        display_df['ATV'] = display_df['forecast_atv'].map("₱{:,.2f}".format)
         
-        st.dataframe(
-            display_df[['Date', 'Final Forecast', 'Model (50%)', 'SDLY (25%)', 'Recent (25%)', 'YoY Growth', 'Sales']].set_index('Date'),
-            use_container_width=True
-        )
+        if 'trend_direction' in display_df.columns:
+            display_df['Trend'] = display_df['trend_direction'].apply(
+                lambda x: '📉' if x == 'down' else ('📈' if x == 'up' else '➡️')
+            )
+            st.dataframe(
+                display_df[['Date', 'Sales', 'Customers', 'ATV', 'Trend']].set_index('Date'),
+                use_container_width=True
+            )
+        else:
+            st.dataframe(
+                display_df[['Date', 'Sales', 'Customers', 'ATV']].set_index('Date'),
+                use_container_width=True
+            )
     else:
-        st.info("👈 Click 'Generate Forecast' to create your 15-day outlook")
+        st.info("👈 Click 'Generate Forecast' to start")
 
 
-# === PAGE: Self-Correction Analysis ===
+# ============================================================
+# PAGE: Scenarios & Confidence
+# ============================================================
+elif page == "🎯 Scenarios & Confidence":
+    st.header("🎯 Multi-Scenario Forecasts")
+    st.caption("See optimistic, realistic, and pessimistic scenarios")
+    
+    if 'forecast_df' in st.session_state:
+        forecast_df = st.session_state.forecast_df
+        
+        # Calculate scenarios based on component predictions
+        st.subheader("📊 Scenario Analysis")
+        
+        scenarios_data = []
+        for _, row in forecast_df.iterrows():
+            model = row.get('model_prediction', row['forecast_customers'])
+            sdly = row.get('sdly_prediction', row['forecast_customers'])
+            recent = row.get('recent_prediction', row['forecast_customers'])
+            final = row['forecast_customers']
+            
+            values = [v for v in [model, sdly, recent] if v > 0]
+            if values:
+                optimistic = int(max(values))
+                pessimistic = int(min(values))
+                realistic = final
+            else:
+                optimistic = realistic = pessimistic = final
+            
+            scenarios_data.append({
+                'Date': row['ds'].strftime('%a, %b %d'),
+                'Pessimistic': pessimistic,
+                'Realistic': realistic,
+                'Optimistic': optimistic,
+                'Range': f"{pessimistic:,} - {optimistic:,}"
+            })
+        
+        scenarios_df = pd.DataFrame(scenarios_data)
+        
+        # Scenario chart
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=forecast_df['ds'], y=[s['Pessimistic'] for s in scenarios_data],
+            mode='lines', name='Pessimistic', line=dict(color='#EF4444', dash='dot')
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=forecast_df['ds'], y=[s['Realistic'] for s in scenarios_data],
+            mode='lines+markers', name='Realistic', line=dict(color='#3B82F6', width=3)
+        ))
+        
+        fig.add_trace(go.Scatter(
+            x=forecast_df['ds'], y=[s['Optimistic'] for s in scenarios_data],
+            mode='lines', name='Optimistic', line=dict(color='#10B981', dash='dot'),
+            fill='tonexty', fillcolor='rgba(16, 185, 129, 0.1)'
+        ))
+        
+        fig.update_layout(title='Customer Forecast Scenarios', height=400, hovermode='x unified')
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Confidence scoring
+        st.subheader("🎯 Confidence Scores")
+        
+        confidence_data = []
+        for _, row in forecast_df.iterrows():
+            model = row.get('model_prediction', 0)
+            sdly = row.get('sdly_prediction', 0)
+            recent = row.get('recent_prediction', 0)
+            final = row['forecast_customers']
+            
+            # Calculate agreement between components
+            values = [v for v in [model, sdly, recent] if v > 0]
+            if len(values) >= 2:
+                max_diff = max(values) - min(values)
+                mean_val = np.mean(values)
+                agreement = 1 - (max_diff / mean_val) if mean_val > 0 else 0
+                confidence = min(100, int(agreement * 100 + 20))
+            else:
+                confidence = 50
+            
+            grade = 'A' if confidence >= 80 else 'B' if confidence >= 65 else 'C' if confidence >= 50 else 'D'
+            
+            confidence_data.append({
+                'Date': row['ds'].strftime('%a, %b %d'),
+                'Forecast': f"{final:,}",
+                'Confidence': f"{confidence}%",
+                'Grade': grade
+            })
+        
+        conf_df = pd.DataFrame(confidence_data)
+        st.dataframe(conf_df.set_index('Date'), use_container_width=True)
+        
+        # Summary
+        avg_conf = np.mean([int(c['Confidence'].replace('%', '')) for c in confidence_data])
+        st.metric("Average Confidence", f"{avg_conf:.0f}%")
+        
+    else:
+        st.info("Generate a forecast first to see scenarios")
+
+
+# ============================================================
+# PAGE: Self-Correction Analysis
+# ============================================================
 elif page == "🧠 Self-Correction Analysis":
     st.header("🧠 Self-Correction Learning")
-    st.caption("The AI learns from past forecast errors and adjusts future predictions")
+    st.caption("See what the AI has learned from past mistakes")
     
     if 'diagnostics' in st.session_state:
         diag = st.session_state.diagnostics
@@ -531,298 +474,368 @@ elif page == "🧠 Self-Correction Analysis":
         self_corr = blend_diag.get('self_correction', {})
         
         if self_corr.get('is_calibrated', False):
-            st.success("✅ Self-correction is ACTIVE and calibrated")
+            st.success("✅ Self-correction is ACTIVE")
             
             correction_factors = self_corr.get('correction_factors', {})
             error_patterns = self_corr.get('error_patterns', {})
             
-            # Overall stats
             col1, col2, col3 = st.columns(3)
-            
             with col1:
-                n_samples = error_patterns.get('n_samples', 0)
-                st.metric("Training Samples", n_samples)
-            
+                st.metric("Training Samples", error_patterns.get('n_samples', 0))
             with col2:
-                overall_mape = error_patterns.get('overall_mape', 0)
-                st.metric("Historical MAPE", f"{overall_mape:.1f}%")
-            
+                st.metric("Historical MAPE", f"{error_patterns.get('overall_mape', 0):.1f}%")
             with col3:
-                overall_corr = correction_factors.get('overall', 1.0)
-                bias_dir = "Under-predicting" if overall_corr > 1 else "Over-predicting"
-                st.metric("Detected Bias", bias_dir)
+                overall = correction_factors.get('overall', 1.0)
+                bias = "Under" if overall > 1 else "Over"
+                st.metric("Detected Bias", f"{bias}-predicting")
             
             # Day-of-week corrections
-            st.subheader("📅 Day-of-Week Correction Factors")
-            
+            st.subheader("📅 Day-of-Week Corrections")
             dow_corr = correction_factors.get('dow', {})
             dow_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
             
             if dow_corr:
-                dow_df = pd.DataFrame([
-                    {
-                        'Day': dow_names[dow],
-                        'Correction Factor': f"{corr:.3f}",
-                        'Adjustment': f"{(corr - 1) * 100:+.1f}%",
-                        'Direction': '📈 Increase' if corr > 1.01 else ('📉 Decrease' if corr < 0.99 else '➡️ No change')
-                    }
-                    for dow, corr in sorted(dow_corr.items())
-                ])
-                st.dataframe(dow_df.set_index('Day'), use_container_width=True)
-            
-            # Month corrections
-            st.subheader("📆 Monthly Correction Factors")
-            
-            month_corr = correction_factors.get('month', {})
-            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
-                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            
-            if month_corr:
-                month_data = []
-                for month, corr in sorted(month_corr.items()):
-                    month_data.append({
-                        'Month': month_names[month - 1],
-                        'Correction': corr,
-                        'Adjustment': f"{(corr - 1) * 100:+.1f}%"
+                dow_data = []
+                for dow, corr in sorted(dow_corr.items()):
+                    dow_data.append({
+                        'Day': dow_names[int(dow)],
+                        'Factor': f"{corr:.3f}",
+                        'Adjustment': f"{(corr-1)*100:+.1f}%",
+                        'Direction': '📈 Increase' if corr > 1.01 else ('📉 Decrease' if corr < 0.99 else '➡️ None')
                     })
-                
-                fig = px.bar(
-                    month_data, x='Month', y='Correction',
-                    title='Monthly Correction Factors (1.0 = no adjustment)',
-                    color='Correction',
-                    color_continuous_scale='RdYlGn',
-                    color_continuous_midpoint=1.0
-                )
-                fig.add_hline(y=1.0, line_dash="dash", line_color="gray")
-                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(pd.DataFrame(dow_data).set_index('Day'), use_container_width=True)
             
             # Payday correction
-            st.subheader("💰 Special Date Corrections")
-            
-            payday_corr = correction_factors.get('payday', 1.0)
-            st.markdown(f"""
-            - **Payday Correction**: {payday_corr:.3f} ({(payday_corr - 1) * 100:+.1f}%)
-            - **Overall Bias Correction**: {correction_factors.get('overall', 1.0):.3f}
-            """)
+            st.subheader("💰 Special Corrections")
+            payday = correction_factors.get('payday', 1.0)
+            st.write(f"**Payday Adjustment:** {(payday-1)*100:+.1f}%")
             
         else:
             st.warning("⚠️ Self-correction not yet calibrated")
             st.info("""
-            Self-correction requires historical forecast vs actual comparisons.
-            
             **How to enable:**
             1. Generate forecasts regularly
             2. Wait for actual data to come in
-            3. The system automatically compares and learns
+            3. System compares and learns automatically
             4. After 7+ comparisons, self-correction activates
             """)
     else:
-        st.info("👈 Generate a forecast first to see self-correction analysis")
+        st.info("Generate a forecast first to see self-correction data")
 
 
-# === PAGE: Backtest & Validate ===
-elif page == "🔬 Backtest & Validate":
-    st.header("🔬 Model Validation & Backtesting")
-    st.caption("Test model accuracy on historical data before deploying")
+# ============================================================
+# PAGE: Auto-Learning Status
+# ============================================================
+elif page == "📚 Auto-Learning Status":
+    st.header("📚 Automatic Learning System")
+    st.caption("Monitor AI's continuous learning")
     
     col1, col2 = st.columns([3, 1])
     
     with col2:
-        test_days = st.slider("Test Period (days)", 14, 90, 30)
+        if st.button("🔄 Run Learning Cycle", type="primary", use_container_width=True):
+            with st.spinner("Running learning cycle..."):
+                try:
+                    # Load forecast log
+                    forecast_docs = db.collection('forecast_log').stream()
+                    forecasts = [{'date': doc.id, **doc.to_dict()} for doc in forecast_docs]
+                    
+                    if len(forecasts) < 7:
+                        st.warning(f"Need 7+ forecasts. Current: {len(forecasts)}")
+                    else:
+                        forecast_df = pd.DataFrame(forecasts)
+                        
+                        # Compare to actuals
+                        matches = 0
+                        total_error = 0
+                        
+                        for _, fc in forecast_df.iterrows():
+                            fc_date = pd.to_datetime(fc['date'])
+                            actual = hist_df[hist_df['date'] == fc_date]
+                            
+                            if len(actual) > 0:
+                                pred = fc.get('predicted_customers', 0)
+                                act = actual.iloc[0]['customers']
+                                if act > 0 and pred > 0:
+                                    error = abs(act - pred) / act * 100
+                                    total_error += error
+                                    matches += 1
+                        
+                        if matches > 0:
+                            avg_mape = total_error / matches
+                            accuracy = 100 - avg_mape
+                            
+                            st.session_state.learning_result = {
+                                'matches': matches,
+                                'mape': avg_mape,
+                                'accuracy': accuracy
+                            }
+                            st.success(f"✅ Analyzed {matches} predictions")
+                        else:
+                            st.warning("No matching actual data found")
+                            
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    
+    # Display results
+    if 'learning_result' in st.session_state:
+        result = st.session_state.learning_result
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Predictions Analyzed", result['matches'])
+        with col2:
+            st.metric("Average MAPE", f"{result['mape']:.1f}%")
+        with col3:
+            st.metric("Accuracy", f"{result['accuracy']:.1f}%")
+        
+        if result['accuracy'] >= 90:
+            st.success("🎉 Excellent accuracy!")
+        elif result['accuracy'] >= 85:
+            st.info("👍 Good accuracy")
+        else:
+            st.warning("⚠️ Accuracy needs improvement")
+    
+    # Show learning history from Firestore
+    st.subheader("📜 Stored Learning Data")
+    
+    try:
+        learning_docs = db.collection('ai_learning').stream()
+        learning_data = {doc.id: doc.to_dict() for doc in learning_docs}
+        
+        if learning_data:
+            for doc_name, data in learning_data.items():
+                with st.expander(f"📄 {doc_name}"):
+                    st.json(data)
+        else:
+            st.info("No learning data stored yet")
+    except Exception as e:
+        st.info("Run a learning cycle to populate data")
+
+
+# ============================================================
+# PAGE: Backtest & Validate
+# ============================================================
+elif page == "🔬 Backtest & Validate":
+    st.header("🔬 Model Validation")
+    st.caption("Test accuracy on historical data")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col2:
+        test_days = st.slider("Test Days", 14, 60, 30)
         
         if st.button("🧪 Run Backtest", type="primary", use_container_width=True):
             if len(hist_df) > 400:
-                with st.spinner(f"Running walk-forward backtest on last {test_days} days..."):
+                with st.spinner(f"Backtesting {test_days} days..."):
                     try:
-                        backtest_results = backtest_model(
-                            hist_df, ev_df, 
-                            db_client=None,  # No self-correction during backtest
-                            test_days=test_days, 
-                            step_size=7
-                        )
+                        results = backtest_model(hist_df, ev_df, test_days=test_days, step_size=7)
                         
-                        if len(backtest_results) > 0:
-                            st.session_state.backtest_results = backtest_results
-                            st.session_state.accuracy_metrics = calculate_accuracy_metrics(backtest_results)
-                            st.success(f"✅ Backtest complete! {len(backtest_results)} predictions evaluated.")
+                        if len(results) > 0:
+                            st.session_state.backtest_results = results
+                            metrics = calculate_accuracy_metrics(results)
+                            st.session_state.backtest_metrics = metrics
+                            st.success(f"✅ Tested {len(results)} predictions")
                         else:
-                            st.warning("No backtest results generated.")
+                            st.warning("No results generated")
                     except Exception as e:
-                        st.error(f"Backtest Error: {e}")
-                        st.exception(e)
+                        st.error(f"Error: {e}")
             else:
-                st.error(f"Need at least 400 days for backtesting. Current: {len(hist_df)} days.")
+                st.error("Need 400+ days of data")
     
     if 'backtest_results' in st.session_state:
         results = st.session_state.backtest_results
-        metrics = st.session_state.accuracy_metrics
-        
-        # Accuracy metrics
-        st.subheader("🎯 Accuracy Metrics")
-        
-        col1, col2, col3, col4 = st.columns(4)
+        metrics = st.session_state.backtest_metrics
         
         overall = metrics.get('overall', {})
         
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            acc = overall.get('customer_accuracy', 0)
-            st.metric("Customer Accuracy", f"{acc:.1f}%")
-        
+            st.metric("Customer Accuracy", f"{overall.get('customer_accuracy', 0):.1f}%")
         with col2:
-            acc = overall.get('sales_accuracy', 0)
-            st.metric("Sales Accuracy", f"{acc:.1f}%")
-        
+            st.metric("Sales Accuracy", f"{overall.get('sales_accuracy', 0):.1f}%")
         with col3:
-            bias = overall.get('customer_bias', 0)
-            bias_dir = "Under" if bias < 0 else "Over"
-            st.metric("Customer Bias", f"{bias_dir} {abs(bias):.1f}%")
-        
+            st.metric("Bias", f"{overall.get('customer_bias', 0):+.1f}%")
         with col4:
-            st.metric("Predictions Tested", f"{overall.get('n_predictions', 0)}")
+            st.metric("Samples", overall.get('n_predictions', 0))
         
-        # By horizon
-        st.subheader("📏 Accuracy by Forecast Horizon")
-        
-        horizon_data = []
-        for h in [1, 3, 7, 14]:
-            h_metrics = metrics.get(f'horizon_{h}d', {})
-            if h_metrics:
-                horizon_data.append({
-                    'Horizon': f'{h} day{"s" if h > 1 else ""}',
-                    'Customer Accuracy': f"{h_metrics.get('customer_accuracy', 0):.1f}%",
-                    'Sales Accuracy': f"{h_metrics.get('sales_accuracy', 0):.1f}%",
-                    'Bias': f"{h_metrics.get('customer_bias', 0):+.1f}%",
-                    'Samples': h_metrics.get('n_predictions', 0)
-                })
-        
-        if horizon_data:
-            st.dataframe(pd.DataFrame(horizon_data).set_index('Horizon'), use_container_width=True)
-        
-        # Charts
-        tab1, tab2 = st.tabs(["Customers", "Sales"])
-        
-        with tab1:
-            fig = create_backtest_chart(results, 'customers')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with tab2:
-            fig = create_backtest_chart(results, 'sales')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        # By day of week
-        st.subheader("📅 Accuracy by Day of Week")
-        
-        dow_metrics = metrics.get('by_dow', {})
-        if dow_metrics:
-            dow_df = pd.DataFrame([
-                {
-                    'Day': day,
-                    'Accuracy': f"{data['accuracy']:.1f}%",
-                    'Bias': f"{data['bias']:+.1f}%",
-                    'Samples': data['n']
-                }
-                for day, data in dow_metrics.items()
-            ])
-            st.dataframe(dow_df.set_index('Day'), use_container_width=True)
-    
+        # Chart
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=results['date'], y=results['actual_customers'],
+            mode='lines+markers', name='Actual', line=dict(color='#EF4444')
+        ))
+        fig.add_trace(go.Scatter(
+            x=results['date'], y=results['predicted_customers'],
+            mode='lines+markers', name='Predicted', line=dict(color='#FBBF24', dash='dash')
+        ))
+        fig.update_layout(title='Backtest: Actual vs Predicted', hovermode='x unified')
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("👈 Click 'Run Backtest' to evaluate model accuracy")
+        st.info("Click 'Run Backtest' to test model accuracy")
 
 
-# === PAGE: Trend Analysis ===
+# ============================================================
+# PAGE: Trend Analysis
+# ============================================================
 elif page == "📈 Trend Analysis":
-    st.header("📈 Trend & Contextual Analysis")
+    st.header("📈 Trend Intelligence Analysis")
+    st.caption("Deep analysis of trend signals")
+    
+    if not hist_df.empty and TREND_MODE:
+        target_date = hist_df['date'].max() + timedelta(days=1)
+        
+        st.subheader("🔍 Trend Signal Analysis")
+        st.write(f"**Analyzing trends for:** {target_date.strftime('%A, %B %d, %Y')}")
+        
+        # Run trend analysis
+        try:
+            analyzer = TrendAnalyzer()
+            analysis = analyzer.analyze_comprehensive_trend(hist_df, target_date)
+            
+            # Overall trend
+            direction = analysis['overall_direction']
+            confidence = analysis['confidence']
+            
+            if direction == 'down':
+                st.error(f"📉 **Overall Trend: DOWN** (Confidence: {confidence:.0f}%)")
+            elif direction == 'up':
+                st.success(f"📈 **Overall Trend: UP** (Confidence: {confidence:.0f}%)")
+            else:
+                st.info(f"➡️ **Overall Trend: NEUTRAL** (Confidence: {confidence:.0f}%)")
+            
+            # Individual signals
+            st.subheader("📊 Individual Signals")
+            
+            signals = analysis['signals']
+            
+            for signal_name, signal_data in signals.items():
+                if signal_data.get('data_available', False):
+                    direction = signal_data.get('direction', 'neutral')
+                    strength = signal_data.get('strength', 0)
+                    
+                    css_class = f"signal-{direction}"
+                    icon = '📉' if direction == 'down' else ('📈' if direction == 'up' else '➡️')
+                    
+                    st.markdown(f"""
+                    <div class="{css_class}">
+                        <strong>{icon} {signal_name.replace('_', ' ').title()}</strong><br>
+                        Direction: {direction.upper()} | Strength: {strength:.2f}
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Recommended adjustment
+            st.subheader("🎯 Recommended Adjustment")
+            adj = analysis.get('recommended_adjustment', 1.0)
+            if adj < 1:
+                st.warning(f"Reduce forecasts by **{(1-adj)*100:.1f}%**")
+            elif adj > 1:
+                st.success(f"Increase forecasts by **{(adj-1)*100:.1f}%**")
+            else:
+                st.info("No adjustment needed")
+                
+        except Exception as e:
+            st.error(f"Trend analysis error: {e}")
+    
+    elif not TREND_MODE:
+        st.warning("Trend Intelligence module not available")
+    else:
+        st.info("No historical data available")
+    
+    # Recent performance chart
+    st.subheader("📊 Recent 8-Week Performance")
     
     if not hist_df.empty:
-        # 8-Week Recent Trend
-        st.subheader("📊 8-Week Recent Performance")
-        st.caption("Recent weeks get MORE weight in predictions (Week 1 = 8x, Week 8 = 1x)")
+        recent_8w = hist_df.tail(56)
         
-        fig = create_recent_trend_chart(hist_df, weeks=8)
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
+        fig = px.line(recent_8w, x='date', y='customers', 
+                     title='Customer Traffic - Last 8 Weeks')
+        fig.add_hline(y=recent_8w['customers'].mean(), line_dash="dash", 
+                     annotation_text=f"Avg: {recent_8w['customers'].mean():.0f}")
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# PAGE: AI Briefing
+# ============================================================
+elif page == "📋 AI Briefing":
+    st.header("📋 AI Executive Briefing")
+    st.caption("Automated daily briefing")
+    
+    if 'forecast_df' in st.session_state:
+        forecast_df = st.session_state.forecast_df
         
-        # Calculate recent trend features for display
-        target_date = hist_df['date'].max() + timedelta(days=1)
-        recent_features = calculate_recent_trend_features(hist_df, target_date, weeks=8)
+        # Generate briefing
+        total_sales = forecast_df['forecast_sales'].sum()
+        total_customers = forecast_df['forecast_customers'].sum()
+        avg_daily_sales = total_sales / len(forecast_df)
+        peak_day = forecast_df.loc[forecast_df['forecast_sales'].idxmax()]
         
-        col1, col2, col3, col4 = st.columns(4)
+        st.markdown(f"""
+        <div class="briefing-box">
+        <h2>📊 15-Day Forecast Summary</h2>
+        <table style="width:100%; color:white;">
+            <tr><td><strong>Total Projected Sales</strong></td><td style="text-align:right">₱{total_sales:,.0f}</td></tr>
+            <tr><td><strong>Total Projected Customers</strong></td><td style="text-align:right">{total_customers:,}</td></tr>
+            <tr><td><strong>Average Daily Sales</strong></td><td style="text-align:right">₱{avg_daily_sales:,.0f}</td></tr>
+            <tr><td><strong>Peak Day</strong></td><td style="text-align:right">{peak_day['ds'].strftime('%A, %B %d')}</td></tr>
+            <tr><td><strong>Peak Day Sales</strong></td><td style="text-align:right">₱{peak_day['forecast_sales']:,.0f}</td></tr>
+        </table>
+        </div>
+        """, unsafe_allow_html=True)
         
-        with col1:
-            val = recent_features.get('recent_weighted_cust_mean', 0)
-            st.metric("Weighted Avg Customers", f"{val:.0f}" if not np.isnan(val) else "N/A")
+        # Trend insight
+        st.subheader("📈 Trend Insight")
         
-        with col2:
-            val = recent_features.get('recent_momentum_2w', 1)
-            if not np.isnan(val):
-                delta = f"{(val - 1) * 100:+.1f}%"
-                st.metric("2-Week Momentum", f"{val:.2f}", delta=delta)
-            else:
-                st.metric("2-Week Momentum", "N/A")
+        first_week = forecast_df.head(7)['forecast_sales'].mean()
+        second_week = forecast_df.tail(8)['forecast_sales'].mean()
+        week_change = (second_week - first_week) / first_week * 100
         
-        with col3:
-            val = recent_features.get('recent_momentum_4w', 1)
-            if not np.isnan(val):
-                delta = f"{(val - 1) * 100:+.1f}%"
-                st.metric("4-Week Momentum", f"{val:.2f}", delta=delta)
-            else:
-                st.metric("4-Week Momentum", "N/A")
+        if week_change > 5:
+            st.success(f"📈 **Growing Trend:** Week 2 projected {week_change:.1f}% higher than Week 1")
+        elif week_change < -5:
+            st.warning(f"📉 **Declining Trend:** Week 2 projected {abs(week_change):.1f}% lower than Week 1")
+        else:
+            st.info(f"➡️ **Stable Trend:** Relatively flat ({week_change:+.1f}%)")
         
-        with col4:
-            val = recent_features.get('recent_volatility', 0)
-            st.metric("Volatility (CV)", f"{val:.2%}" if not np.isnan(val) else "N/A")
+        # Key alerts
+        st.subheader("🔔 Key Alerts")
         
-        # SDLY Contextual Window
-        st.divider()
-        st.subheader("🗓️ SDLY Contextual Window")
-        st.caption("Same Day Last Year ± 14 days - captures seasonal patterns")
+        if 'trend_direction' in forecast_df.columns:
+            downs = (forecast_df['trend_direction'] == 'down').sum()
+            if downs > 10:
+                st.warning(f"⚠️ {downs} of 15 days show downtrend signals")
         
-        # Let user select a date to analyze
-        forecast_date = st.date_input(
-            "Select date to analyze",
-            value=hist_df['date'].max() + timedelta(days=1),
-            min_value=hist_df['date'].min() + timedelta(days=365)
-        )
+        # Low days
+        avg_cust = forecast_df['forecast_customers'].mean()
+        low_days = forecast_df[forecast_df['forecast_customers'] < avg_cust * 0.9]
+        if len(low_days) > 0:
+            st.info(f"📉 {len(low_days)} days below average expected")
         
-        fig = create_contextual_window_chart(hist_df, pd.to_datetime(forecast_date))
-        if fig:
-            st.plotly_chart(fig, use_container_width=True)
+        # Recommendations
+        st.subheader("💡 Recommendations")
         
-        # Contextual features
-        ctx_features = calculate_contextual_window_features(hist_df, pd.to_datetime(forecast_date))
+        recommendations = []
         
-        col1, col2, col3 = st.columns(3)
+        if week_change < -5:
+            recommendations.append("Consider promotional activities to counter declining trend")
         
-        with col1:
-            val = ctx_features.get('sdly_customers', np.nan)
-            st.metric("SDLY Customers", f"{val:.0f}" if not np.isnan(val) else "N/A")
+        if 'trend_direction' in forecast_df.columns and forecast_df['trend_direction'].iloc[0] == 'down':
+            recommendations.append("Conservative staffing recommended due to detected weakness")
         
-        with col2:
-            val = ctx_features.get('sdly_window_cust_mean', np.nan)
-            st.metric("Window Average", f"{val:.0f}" if not np.isnan(val) else "N/A")
+        if peak_day['ds'].weekday() >= 5:
+            recommendations.append(f"Ensure adequate weekend staffing for {peak_day['ds'].strftime('%A')}")
         
-        with col3:
-            val = ctx_features.get('sdly_momentum', np.nan)
-            if not np.isnan(val):
-                delta = f"{(val - 1) * 100:+.1f}%"
-                st.metric("Window Momentum", f"{val:.2f}", delta=delta)
-            else:
-                st.metric("Window Momentum", "N/A")
+        if not recommendations:
+            recommendations.append("No special actions needed - forecast looks stable")
         
-        # Trend analysis
-        st.markdown("**Trend Analysis:**")
-        trend_before = ctx_features.get('sdly_trend_before', 0)
-        trend_after = ctx_features.get('sdly_trend_after', 0)
-        
-        if not np.isnan(trend_before) and not np.isnan(trend_after):
-            st.markdown(f"""
-            - **14 days BEFORE SDLY**: {"📈 Increasing" if trend_before > 0.02 else "📉 Decreasing" if trend_before < -0.02 else "➡️ Stable"} ({trend_before*100:+.1f}%)
-            - **14 days AFTER SDLY**: {"📈 Increasing" if trend_after > 0.02 else "📉 Decreasing" if trend_after < -0.02 else "➡️ Stable"} ({trend_after*100:+.1f}%)
-            """)
+        for rec in recommendations:
+            st.write(f"• {rec}")
+            
     else:
-        st.info("No historical data available for trend analysis")
+        st.info("Generate a forecast first to see the AI briefing")
 
 
 # Footer
 st.divider()
-st.caption("AI Sales Forecaster v10.0 | Self-Correcting Ensemble with Contextual Window Analysis")
+st.caption("Cognitive Forecasting Engine v11.1 | Trend-Aware Self-Learning AI")
