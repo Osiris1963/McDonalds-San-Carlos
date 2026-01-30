@@ -31,7 +31,7 @@ from forecasting import (
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="AI Sales Forecaster v10.0", 
+    page_title="AI Sales Forecaster v11.0", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -58,6 +58,20 @@ st.markdown("""
     }
     .self-correct-positive { color: #10B981; }
     .self-correct-negative { color: #EF4444; }
+    .confidence-a { background: #10B981; color: white; padding: 2px 8px; border-radius: 4px; }
+    .confidence-b { background: #3B82F6; color: white; padding: 2px 8px; border-radius: 4px; }
+    .confidence-c { background: #F59E0B; color: white; padding: 2px 8px; border-radius: 4px; }
+    .confidence-d { background: #EF4444; color: white; padding: 2px 8px; border-radius: 4px; }
+    .briefing-box {
+        background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 100%);
+        color: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .scenario-optimistic { border-left: 4px solid #10B981; }
+    .scenario-realistic { border-left: 4px solid #3B82F6; }
+    .scenario-pessimistic { border-left: 4px solid #EF4444; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -375,16 +389,32 @@ db = init_db()
 
 # Sidebar
 with st.sidebar:
-    st.title("🚀 Smart Forecaster v10.0")
-    st.caption("Self-Correcting AI with Contextual Analysis")
+    st.title("🧠 Cognitive Forecaster v11.0")
+    st.caption("Self-Learning AI with Reasoning")
     
     st.divider()
     
     page = st.radio(
         "Navigation",
-        ["📊 Forecast Dashboard", "🧠 Self-Correction Analysis", "🔬 Backtest & Validate", "📈 Trend Analysis"],
+        ["📊 Forecast Dashboard", 
+         "🎯 Scenarios & Confidence",
+         "🧠 Self-Correction Analysis", 
+         "📚 Auto-Learning Status",
+         "🔬 Backtest & Validate", 
+         "📈 Trend Analysis",
+         "📋 AI Briefing"],
         label_visibility="collapsed"
     )
+    
+    st.divider()
+    
+    # Intelligent Status
+    st.subheader("🤖 AI Status")
+    try:
+        from intelligent_engine import CognitiveForecaster
+        st.success("✅ Cognitive Mode Active")
+    except:
+        st.warning("⚠️ Basic Mode Only")
     
     st.divider()
     
