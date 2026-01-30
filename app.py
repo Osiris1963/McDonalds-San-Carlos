@@ -538,63 +538,152 @@ elif page == "📚 Auto-Learning Status":
                 try:
                     # Load forecast log
                     forecast_docs = db.collection('forecast_log').stream()
-                    forecasts = [{'date': doc.id, **doc.to_dict()} for doc in forecast_docs]
+                    forecasts = []
+                    
+                    for doc in forecast_docs:
+                        data = doc.to_dict()
+                        doc_id = doc.id
+                        
+                        # Try to get date from the document data first
+                        fc_date = None
+                        
+                        # Option 1: Use 'forecast_for_date' field if available
+                        if 'forecast_for_date' in data and data['forecast_for_date']:
+                            try:
+                                fc_date = pd.to_datetime(data['forecast_for_date'])
+                            except:
+                                pass
+                        
+                        # Option 2: Use 'date' field if available
+                        if fc_date is None and 'date' in data and data['date']:
+                            try:
+                                fc_date = pd.to_datetime(data['date'])
+                            except:
+                                pass
+                        
+                        # Option 3: Try to parse document ID
+                        if fc_date is None:
+                            try:
+                                # Handle format like "2025-07-14" (standard)
+                                fc_date = pd.to_datetime(doc_id)
+                            except:
+                                try:
+                                    # Handle format like "2025-07-14_2025-07-15" (date range)
+                                    if '_' in doc_id:
+                                        date_part = doc_id.split('_')[0]
+                                        fc_date = pd.to_datetime(date_part)
+                                except:
+                                    # Skip this document if we can't parse the date
+                                    continue
+                        
+                        if fc_date is not None:
+                            data['parsed_date'] = fc_date
+                            forecasts.append(data)
                     
                     if len(forecasts) < 7:
-                        st.warning(f"Need 7+ forecasts. Current: {len(forecasts)}")
+                        st.warning(f"Need 7+ forecasts with valid dates. Found: {len(forecasts)}")
                     else:
                         forecast_df = pd.DataFrame(forecasts)
                         
                         # Compare to actuals
                         matches = 0
                         total_error = 0
+                        errors_list = []
                         
                         for _, fc in forecast_df.iterrows():
-                            fc_date = pd.to_datetime(fc['date'])
-                            actual = hist_df[hist_df['date'] == fc_date]
+                            fc_date = fc['parsed_date']
+                            
+                            # Normalize to date only (remove time component)
+                            if hasattr(fc_date, 'normalize'):
+                                fc_date = fc_date.normalize()
+                            
+                            actual = hist_df[hist_df['date'].dt.normalize() == fc_date]
                             
                             if len(actual) > 0:
                                 pred = fc.get('predicted_customers', 0)
                                 act = actual.iloc[0]['customers']
+                                
                                 if act > 0 and pred > 0:
                                     error = abs(act - pred) / act * 100
+                                    signed_error = (act - pred) / act * 100
                                     total_error += error
                                     matches += 1
+                                    
+                                    errors_list.append({
+                                        'date': fc_date,
+                                        'predicted': pred,
+                                        'actual': act,
+                                        'error_pct': error,
+                                        'signed_error': signed_error
+                                    })
                         
                         if matches > 0:
                             avg_mape = total_error / matches
                             accuracy = 100 - avg_mape
+                            avg_bias = np.mean([e['signed_error'] for e in errors_list])
                             
                             st.session_state.learning_result = {
                                 'matches': matches,
                                 'mape': avg_mape,
-                                'accuracy': accuracy
+                                'accuracy': accuracy,
+                                'bias': avg_bias,
+                                'errors': errors_list
                             }
                             st.success(f"✅ Analyzed {matches} predictions")
+                            st.rerun()
                         else:
-                            st.warning("No matching actual data found")
+                            st.warning("No matching actual data found. Make sure forecasts have corresponding actual data.")
                             
                 except Exception as e:
                     st.error(f"Error: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
     
     # Display results
     if 'learning_result' in st.session_state:
         result = st.session_state.learning_result
         
-        col1, col2, col3 = st.columns(3)
+        st.subheader("📊 Learning Results")
+        
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Predictions Analyzed", result['matches'])
         with col2:
             st.metric("Average MAPE", f"{result['mape']:.1f}%")
         with col3:
             st.metric("Accuracy", f"{result['accuracy']:.1f}%")
+        with col4:
+            bias = result.get('bias', 0)
+            bias_dir = "Under" if bias > 0 else "Over"
+            st.metric("Bias", f"{bias_dir} {abs(bias):.1f}%")
         
-        if result['accuracy'] >= 90:
-            st.success("🎉 Excellent accuracy!")
+        # Accuracy assessment
+        if result['accuracy'] >= 92:
+            st.success("🎉 Excellent accuracy! Model is performing very well.")
+        elif result['accuracy'] >= 88:
+            st.info("👍 Good accuracy. Minor improvements possible.")
         elif result['accuracy'] >= 85:
-            st.info("👍 Good accuracy")
+            st.warning("⚠️ Moderate accuracy. Consider reviewing model parameters.")
         else:
-            st.warning("⚠️ Accuracy needs improvement")
+            st.error("🔴 Accuracy needs improvement. Recommend investigation.")
+        
+        # Show error details
+        if 'errors' in result and len(result['errors']) > 0:
+            st.subheader("📋 Recent Prediction Details")
+            
+            errors_df = pd.DataFrame(result['errors'])
+            errors_df['Date'] = pd.to_datetime(errors_df['date']).dt.strftime('%Y-%m-%d')
+            errors_df['Predicted'] = errors_df['predicted'].astype(int)
+            errors_df['Actual'] = errors_df['actual'].astype(int)
+            errors_df['Error'] = errors_df['error_pct'].apply(lambda x: f"{x:.1f}%")
+            errors_df['Direction'] = errors_df['signed_error'].apply(
+                lambda x: '📉 Under' if x > 2 else ('📈 Over' if x < -2 else '✅ Good')
+            )
+            
+            st.dataframe(
+                errors_df[['Date', 'Predicted', 'Actual', 'Error', 'Direction']].tail(15).set_index('Date'),
+                use_container_width=True
+            )
     
     # Show learning history from Firestore
     st.subheader("📜 Stored Learning Data")
@@ -608,9 +697,9 @@ elif page == "📚 Auto-Learning Status":
                 with st.expander(f"📄 {doc_name}"):
                     st.json(data)
         else:
-            st.info("No learning data stored yet")
+            st.info("No learning data stored yet. Run a learning cycle to populate.")
     except Exception as e:
-        st.info("Run a learning cycle to populate data")
+        st.info("Run a learning cycle to populate learning data.")
 
 
 # ============================================================
