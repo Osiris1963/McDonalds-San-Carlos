@@ -1,14 +1,20 @@
-# forecasting.py - COGNITIVE FORECASTING ENGINE v11.1
-# Key enhancements:
+# forecasting.py - COGNITIVE FORECASTING ENGINE v12.0
+# Key enhancements over v11.1:
 # 1. Self-Correcting AI - learns from past forecast errors
 # 2. Contextual Window Analysis (SDLY ± 14 days)  
 # 3. 8-Week Weighted Recent Trends (more weight to recent data)
 # 4. Blended prediction combining historical patterns + current trends
 # 5. Automatic Learning - calibrates when new data arrives
-# 6. Intelligent Anomaly Handling
+# 6. Intelligent Anomaly Handling - NOW WIRED INTO TRAINING PIPELINE
 # 7. Multi-Scenario Forecasting
-# 8. Confidence Scoring & Explanations
-# 9. TREND-AWARE BLENDING - Respects momentum and confirms trends (v11.1)
+# 8. Confidence Scoring with REAL validation MAPE (not hardcoded)
+# 9. TREND-AWARE BLENDING - Respects momentum and confirms trends
+# 10. O(N²) ELIMINATED - Fast single-row feature computation
+# 11. NaN propagation FIXED - Populates estimated sales/atv in recursive loop
+# 12. Early stopping on LightGBM - Prevents overfitting
+# 13. Proper customer confidence intervals from residual distribution
+# 14. Philippine holiday calendar as external regressors
+# 15. Compound self-correction clipping to prevent extreme adjustments
 
 import pandas as pd
 import numpy as np
@@ -28,7 +34,8 @@ from data_processing import (
     load_forecast_errors,
     calculate_contextual_window_features,
     calculate_recent_trend_features,
-    calculate_yoy_comparison
+    calculate_yoy_comparison,
+    compute_single_row_features
 )
 
 # Import intelligent components (with fallback if not available)
@@ -47,11 +54,11 @@ try:
         AdaptiveWeightManager
     )
     INTELLIGENT_MODE = True
-except ImportError:
+except ImportError as e:
     INTELLIGENT_MODE = False
-    print("Warning: Intelligent components not available. Running in basic mode.")
+    print(f"⚠️ Intelligent components not available: {e}")
 
-# Import trend intelligence (v11.1)
+# Import trend intelligence (v12.0)
 try:
     from trend_intelligence import (
         TrendAnalyzer,
@@ -61,9 +68,9 @@ try:
         apply_trend_intelligence
     )
     TREND_AWARE_MODE = True
-except ImportError:
+except ImportError as e:
     TREND_AWARE_MODE = False
-    print("Warning: Trend intelligence not available.")
+    print(f"⚠️ Trend intelligence not available: {e}")
 
 
 class SelfCorrectingForecaster:
@@ -156,6 +163,7 @@ class SelfCorrectingForecaster:
     def apply_correction(self, base_prediction, target_date):
         """
         Apply learned correction factors to a base prediction.
+        FIXED: Clips the FINAL compound correction to prevent extreme adjustments.
         """
         if not self.is_calibrated:
             return base_prediction
@@ -166,7 +174,6 @@ class SelfCorrectingForecaster:
         dow = target_date.weekday()
         if dow in self.correction_factors.get('dow', {}):
             dow_corr = self.correction_factors['dow'][dow]
-            # Limit correction to ±20% to avoid wild swings
             dow_corr = np.clip(dow_corr, 0.8, 1.2)
             correction *= dow_corr
         
@@ -186,7 +193,10 @@ class SelfCorrectingForecaster:
         # Apply overall bias correction (weighted less)
         overall_corr = self.correction_factors.get('overall', 1.0)
         overall_corr = np.clip(overall_corr, 0.95, 1.05)
-        correction *= (overall_corr ** 0.5)  # Square root to reduce impact
+        correction *= (overall_corr ** 0.5)
+        
+        # FIXED: Clip the FINAL compound correction to prevent extreme adjustments
+        correction = np.clip(correction, 0.80, 1.25)
         
         return base_prediction * correction
     
@@ -267,8 +277,14 @@ class EnhancedCustomerForecaster:
         X = train_clean[self.feature_cols].fillna(0)
         y = train_clean['customers']
         
-        # Step 7: Train LightGBM with enhanced parameters
-        print("Training LightGBM model...")
+        # Step 7: Train LightGBM with early stopping on time-series validation
+        print("Training LightGBM model with early stopping...")
+        
+        # Time-series split: use last 20% as validation (preserving temporal order)
+        split_idx = int(len(X) * 0.80)
+        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+        
         self.model = lgb.LGBMRegressor(
             objective='tweedie',
             tweedie_variance_power=1.5,
@@ -286,7 +302,21 @@ class EnhancedCustomerForecaster:
             importance_type='gain'
         )
         
-        self.model.fit(X, y)
+        # Early stopping prevents overfitting
+        self.model.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(period=0)
+            ]
+        )
+        
+        # Store validation MAPE for diagnostics
+        val_pred = self.model.predict(X_val)
+        val_mape = np.mean(np.abs(y_val - val_pred) / y_val.replace(0, np.nan).dropna()) * 100
+        self.validation_mape = val_mape
+        print(f"  Validation MAPE: {val_mape:.1f}%  (used {self.model.best_iteration_} trees)")
         
         # Store for recursive prediction
         self.last_train_data = train_data.copy()
@@ -301,34 +331,45 @@ class EnhancedCustomerForecaster:
         """
         Generate forecasts using TREND-AWARE recursive prediction.
         
-        v11.1 Enhancement: Now properly respects downward momentum by:
-        1. Analyzing trends from multiple sources
-        2. Confirming trends when SDLY and Recent agree
-        3. Applying momentum dampening when weakness detected
-        4. Using conservative estimates during downtrends
+        v12.0 Fixes:
+        1. O(N²) eliminated — uses compute_single_row_features() per target date
+        2. NaN propagation fixed — populates estimated sales/atv for recursive steps
+        3. sdly_momentum comparison fixed (> 1.0, not > 0)
+        4. Trend intelligence computed ONCE before loop (not per-day)
+        5. Quantile-based confidence intervals added
         """
         predictions = []
         
         working_df = self.historical_df.copy()
         last_date = working_df['date'].max()
         
+        # Get recent ATV median for filling recursive predictions
+        recent_atv_median = working_df.tail(30)['atv'].median()
+        if np.isnan(recent_atv_median) or recent_atv_median <= 0:
+            recent_atv_median = working_df['atv'].median()
+        
+        # === COMPUTE TREND INTELLIGENCE ONCE (not per-day) ===
+        trend_analysis_global = None
+        if TREND_AWARE_MODE:
+            try:
+                from trend_intelligence import TrendAnalyzer
+                analyzer = TrendAnalyzer()
+                trend_analysis_global = analyzer.analyze_comprehensive_trend(working_df, last_date + timedelta(days=1))
+            except Exception as e:
+                print(f"Trend analysis failed: {e}")
+        
+        # === COMPUTE CUSTOMER PREDICTION QUANTILES FOR CI ===
+        # Use residuals from validation to estimate prediction intervals
+        customer_residual_std = self._estimate_residual_std(working_df)
+        
         for h in range(1, periods + 1):
             target_date = last_date + timedelta(days=h)
             
             # === COMPONENT 1: LightGBM Model Prediction ===
-            new_row = pd.DataFrame({
-                'date': [target_date],
-                'customers': [np.nan],
-                'sales': [np.nan],
-                'atv': [np.nan]
-            })
+            # FIXED: Use fast single-row feature computation instead of re-featurizing all data
+            features = compute_single_row_features(working_df, target_date, self.events_df)
             
-            temp_df = pd.concat([working_df, new_row], ignore_index=True)
-            featured_df = create_advanced_features(temp_df, self.events_df)
-            
-            target_row = featured_df[featured_df['date'] == target_date].iloc[0]
-            
-            X_pred = pd.DataFrame([target_row[self.feature_cols].fillna(0)])
+            X_pred = pd.DataFrame([{col: features.get(col, 0) for col in self.feature_cols}])
             model_pred = max(0, self.model.predict(X_pred)[0])
             
             # === COMPONENT 2: SDLY Contextual Prediction ===
@@ -337,7 +378,8 @@ class EnhancedCustomerForecaster:
             
             if not np.isnan(ctx_features['sdly_customers']) and ctx_features['sdly_customers'] > 0:
                 sdly_pred = ctx_features['sdly_customers'] * yoy['yoy_customer_growth']
-                if ctx_features['sdly_momentum'] > 0:
+                # FIXED: sdly_momentum is a ratio near 1.0, check > 1.0 not > 0
+                if ctx_features['sdly_momentum'] > 1.0:
                     sdly_pred *= (1 + ctx_features['sdly_trend_after'] * 0.3)
             else:
                 sdly_pred = ctx_features.get('sdly_window_cust_mean', model_pred)
@@ -362,21 +404,37 @@ class EnhancedCustomerForecaster:
             
             recent_pred = recent_base * dow_factor * momentum
             
-            # === NEW v11.1: TREND-AWARE BLENDING ===
-            if TREND_AWARE_MODE:
-                # Use the intelligent trend-aware system
-                trend_result = apply_trend_intelligence(
-                    working_df, target_date,
-                    model_pred, sdly_pred, recent_pred
+            # === TREND-AWARE BLENDING ===
+            if TREND_AWARE_MODE and trend_analysis_global is not None:
+                # Re-use global trend analysis (computed once) with per-day blending
+                from trend_intelligence import TrendAwareBlender, MomentumDampener, ConservativeEstimator
+                
+                blender = TrendAwareBlender()
+                dampener = MomentumDampener()
+                estimator = ConservativeEstimator()
+                
+                blended = blender.blend_with_trend_awareness(
+                    model_pred, sdly_pred, recent_pred, trend_analysis_global
                 )
                 
-                blended_pred = trend_result['final_prediction']
-                trend_analysis = trend_result['trend_analysis']
+                dampened, dampening_factor, dampening_reason = dampener.calculate_dampening(
+                    working_df, target_date, blended['trend_adjusted']
+                )
                 
-                # Store trend info for diagnostics
-                trend_direction = trend_analysis['overall_direction']
-                trend_confidence = trend_analysis['confidence']
-                trend_adjustment = trend_analysis['recommended_adjustment']
+                conservative = estimator.get_conservative_estimate(
+                    {'model': model_pred, 'sdly': sdly_pred, 'recent': recent_pred},
+                    trend_analysis_global
+                )
+                
+                # Final selection
+                if trend_analysis_global['overall_direction'] == 'down' and trend_analysis_global['confidence'] > 50:
+                    blended_pred = min(dampened, conservative['conservative_estimate'])
+                else:
+                    blended_pred = dampened
+                
+                trend_direction = trend_analysis_global['overall_direction']
+                trend_confidence = trend_analysis_global['confidence']
+                trend_adjustment = trend_analysis_global['recommended_adjustment']
             else:
                 # Fallback to simple blending
                 w_model = self.blend_weights['model']
@@ -403,14 +461,25 @@ class EnhancedCustomerForecaster:
             corrected_pred = self.self_corrector.apply_correction(blended_pred, target_date)
             
             # === APPLY SPECIAL DATE MULTIPLIERS ===
-            final_pred = self._apply_multipliers(corrected_pred, target_date, target_row)
+            final_pred = self._apply_multipliers(corrected_pred, target_date, features)
             
             # Ensure non-negative
             final_pred = max(0, final_pred)
             
+            # === CONFIDENCE INTERVALS (based on residual distribution) ===
+            ci_margin = customer_residual_std * 1.645  # 90% CI
+            ci_lower = max(0, final_pred - ci_margin)
+            ci_upper = final_pred + ci_margin
+            # Wider CI for further horizons
+            horizon_factor = 1 + (h - 1) * 0.03
+            ci_lower = max(0, final_pred - ci_margin * horizon_factor)
+            ci_upper = final_pred + ci_margin * horizon_factor
+            
             predictions.append({
                 'ds': target_date,
                 'forecast_customers': int(round(final_pred)),
+                'customers_lower': int(round(ci_lower)),
+                'customers_upper': int(round(ci_upper)),
                 'model_prediction': model_pred,
                 'sdly_prediction': sdly_pred,
                 'recent_prediction': recent_pred,
@@ -423,22 +492,59 @@ class EnhancedCustomerForecaster:
                 'trend_adjustment': trend_adjustment
             })
             
-            # Update working_df with prediction for next iteration
+            # FIXED: Populate estimated sales/atv to prevent NaN propagation
+            estimated_atv = recent_atv_median
+            estimated_sales = final_pred * estimated_atv
+            
             working_df = pd.concat([
                 working_df,
                 pd.DataFrame({
                     'date': [target_date],
                     'customers': [final_pred],
-                    'sales': [np.nan],
-                    'atv': [np.nan]
+                    'sales': [estimated_sales],
+                    'atv': [estimated_atv]
                 })
             ], ignore_index=True)
         
         return pd.DataFrame(predictions)
     
+    def _estimate_residual_std(self, historical_df):
+        """
+        Estimate prediction residual standard deviation for confidence intervals.
+        Uses recent data holdout to compute empirical residuals.
+        """
+        try:
+            # Hold out last 30 days, predict, measure residuals
+            if len(historical_df) < 90:
+                return historical_df['customers'].std() * 0.15
+            
+            holdout_size = 30
+            train_part = historical_df.iloc[:-holdout_size]
+            test_part = historical_df.iloc[-holdout_size:]
+            
+            # Quick prediction using rolling means as proxy
+            recent_mean = train_part.tail(14)['customers'].mean()
+            dow_means = train_part.groupby(train_part['date'].dt.dayofweek)['customers'].mean()
+            
+            residuals = []
+            for _, row in test_part.iterrows():
+                dow = row['date'].weekday()
+                pred = dow_means.get(dow, recent_mean)
+                residuals.append(row['customers'] - pred)
+            
+            return np.std(residuals)
+        except Exception:
+            return historical_df['customers'].std() * 0.15
+    
     def _apply_multipliers(self, base_pred, date, features_row):
-        """Apply learned multipliers for special dates."""
+        """Apply learned multipliers for special dates. Accepts dict or Series."""
         multiplier = 1.0
+        
+        # Handle both dict and Series
+        def _get(key, default=0):
+            if isinstance(features_row, dict):
+                return features_row.get(key, default)
+            return features_row.get(key, default) if hasattr(features_row, 'get') else default
         
         # New Year
         if date.month == 1 and date.day <= 2:
@@ -449,7 +555,7 @@ class EnhancedCustomerForecaster:
             multiplier *= self.multipliers.get('christmas', 1.15)
         
         # Event day
-        if features_row.get('is_event', 0) == 1:
+        if _get('is_event', 0) == 1:
             multiplier *= self.multipliers.get('event', 1.1)
         
         return base_pred * multiplier
@@ -551,7 +657,7 @@ class EnsembleForecaster:
     
     def fit(self, historical_df, events_df=None):
         print("=" * 60)
-        print("COGNITIVE FORECASTING ENGINE v11.0")
+        print("COGNITIVE FORECASTING ENGINE v12.0")
         print("=" * 60)
         
         # Step 0: Intelligent pre-analysis (if available)
@@ -564,10 +670,43 @@ class EnsembleForecaster:
                 print("⚠️  REGIME CHANGE DETECTED!")
                 print(f"    {self.analysis['regime'].get('recommendation')}")
             
-            # Check for anomalies
-            n_anomalies = len(self.analysis['anomalies'])
+            # Check for anomalies and APPLY handling decisions
+            anomalies = self.analysis['anomalies']
+            n_anomalies = len(anomalies)
             if n_anomalies > 0:
                 print(f"📊 Detected {n_anomalies} anomalies in historical data")
+                
+                # Actually apply anomaly handling to clean training data
+                dates_to_exclude = []
+                dates_to_cap = []
+                for _, anom in anomalies.iterrows():
+                    decision, reason = self.cognitive.anomaly_intel.decide_anomaly_handling(
+                        anom, events_df
+                    )
+                    if decision == 'exclude':
+                        dates_to_exclude.append(anom['date'])
+                        print(f"    Excluding {anom['date'].strftime('%Y-%m-%d')}: {reason}")
+                    elif decision == 'adjust':
+                        dates_to_cap.append(anom['date'])
+                        print(f"    Capping {anom['date'].strftime('%Y-%m-%d')}: {reason}")
+                
+                # Apply exclusions
+                if dates_to_exclude:
+                    historical_df = historical_df[~historical_df['date'].isin(dates_to_exclude)].copy()
+                    print(f"    Removed {len(dates_to_exclude)} anomalous records from training")
+                
+                # Apply caps (cap at 3 std from rolling mean)
+                if dates_to_cap:
+                    rolling_mean = historical_df['customers'].rolling(30, min_periods=7).mean()
+                    rolling_std = historical_df['customers'].rolling(30, min_periods=7).std()
+                    upper_cap = rolling_mean + 3 * rolling_std
+                    lower_cap = rolling_mean - 3 * rolling_std
+                    
+                    cap_mask = historical_df['date'].isin(dates_to_cap)
+                    historical_df.loc[cap_mask, 'customers'] = historical_df.loc[cap_mask, 'customers'].clip(
+                        lower=lower_cap[cap_mask], upper=upper_cap[cap_mask]
+                    )
+                    print(f"    Capped {len(dates_to_cap)} anomalous values")
             
             # Check if auto-learning should run
             if self.analysis['learning_status'].get('should_recalibrate'):
@@ -582,6 +721,10 @@ class EnsembleForecaster:
         # Step 2: Train Customer Forecaster
         print("\n[2/3] Training Customer Forecaster with Self-Correction...")
         self.customer_forecaster.fit(historical_df, events_df)
+        
+        # Pass validation MAPE to cognitive for real confidence scoring
+        if self.cognitive and hasattr(self.customer_forecaster, 'validation_mape'):
+            self.cognitive._validation_mape = self.customer_forecaster.validation_mape
         
         # Step 3: Train ATV Forecaster
         print("\n[3/3] Training ATV Forecaster...")
@@ -608,10 +751,17 @@ class EnsembleForecaster:
         # Merge
         result = pd.merge(cust_forecast, atv_forecast, on='ds')
         
-        # Calculate sales
+        # Calculate sales with PROPER confidence intervals
+        # FIXED: Propagate uncertainty from BOTH customer and ATV forecasts
         result['forecast_sales'] = result['forecast_customers'] * result['forecast_atv']
-        result['sales_lower'] = result['forecast_customers'] * result['atv_lower']
-        result['sales_upper'] = result['forecast_customers'] * result['atv_upper']
+        
+        # Sales CI: combine customer CI with ATV CI
+        if 'customers_lower' in result.columns:
+            result['sales_lower'] = result['customers_lower'] * result['atv_lower']
+            result['sales_upper'] = result['customers_upper'] * result['atv_upper']
+        else:
+            result['sales_lower'] = result['forecast_customers'] * result['atv_lower']
+            result['sales_upper'] = result['forecast_customers'] * result['atv_upper']
         
         # Add intelligent enhancements if available
         if self.cognitive and include_scenarios:
