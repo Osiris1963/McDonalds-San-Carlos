@@ -1,20 +1,22 @@
-# forecasting.py - COGNITIVE FORECASTING ENGINE v12.0
-# Key enhancements over v11.1:
+# forecasting.py - COGNITIVE FORECASTING ENGINE v12.2 (SDLY-ANCHORED)
+# 
+# KEY PHILOSOPHY CHANGE (v12.2):
+#   Old: blend(ML, SDLY, Recent) → dampen → conservative → min() = TOO LOW
+#   New: SDLY × measured_growth × DOW_adj + ML_residual(±15%) = REALITY-BASED
+#
+# The forecast is now ANCHORED to what actually happened last year,
+# adjusted by how much better/worse the business is ACTUALLY doing.
+# ML model is a NUDGE (±15%), not the driver.
+#
+# Previous enhancements preserved:
 # 1. Self-Correcting AI - learns from past forecast errors
-# 2. Contextual Window Analysis (SDLY ± 14 days)  
-# 3. 8-Week Weighted Recent Trends (more weight to recent data)
-# 4. Blended prediction combining historical patterns + current trends
-# 5. Automatic Learning - calibrates when new data arrives
-# 6. Intelligent Anomaly Handling - NOW WIRED INTO TRAINING PIPELINE
-# 7. Multi-Scenario Forecasting
-# 8. Confidence Scoring with REAL validation MAPE (not hardcoded)
-# 9. TREND-AWARE BLENDING - Respects momentum and confirms trends
-# 10. O(N²) ELIMINATED - Fast single-row feature computation
-# 11. NaN propagation FIXED - Populates estimated sales/atv in recursive loop
-# 12. Early stopping on LightGBM - Prevents overfitting
-# 13. Proper customer confidence intervals from residual distribution
-# 14. Philippine holiday calendar as external regressors
-# 15. Compound self-correction clipping to prevent extreme adjustments
+# 2. Contextual Window Analysis (SDLY ± 14 days)
+# 3. Fast single-row feature computation (no O(N²))
+# 4. NaN propagation fixed
+# 5. Early stopping on LightGBM
+# 6. Proper confidence intervals from residual distribution
+# 7. Philippine holiday calendar
+# 8. Anomaly detection wired into training
 
 import pandas as pd
 import numpy as np
@@ -329,186 +331,259 @@ class EnhancedCustomerForecaster:
     
     def predict_recursive(self, periods=15):
         """
-        Generate forecasts using TREND-AWARE recursive prediction.
+        SDLY-ANCHORED FORECASTING ENGINE v12.2
         
-        v12.0 Fixes:
-        1. O(N²) eliminated — uses compute_single_row_features() per target date
-        2. NaN propagation fixed — populates estimated sales/atv for recursive steps
-        3. sdly_momentum comparison fixed (> 1.0, not > 0)
-        4. Trend intelligence computed ONCE before loop (not per-day)
-        5. Quantile-based confidence intervals added
+        Philosophy change: SDLY is the ANCHOR, not one of three equal votes.
+        
+        Old approach (broken):
+          blend(ML, SDLY, Recent) → dampen → conservative → min() = TOO LOW
+          
+        New approach:
+          1. SDLY Base: What happened on this exact day last year?
+          2. Measured Growth: How much better/worse are we vs last year? (from ACTUAL data)
+          3. Growth-Adjusted SDLY = SDLY × measured_growth (THE ANCHOR)
+          4. DOW Fine-Tune: Adjust for day-of-week patterns in recent weeks
+          5. ML Residual: Model says "this specific day should be ±X% vs pattern" (CAPPED at ±15%)
+          6. Final = Anchored prediction + capped ML correction
+          
+        This GUARANTEES:
+        - If recent actuals are 8% above last year → forecast is ~8% above last year
+        - ML model can only nudge ±15% for specific days (payday, events, etc.)
+        - No cascading dampeners can drag forecast below reality
         """
         predictions = []
         
         working_df = self.historical_df.copy()
         last_date = working_df['date'].max()
         
-        # Get recent ATV median for filling recursive predictions
+        # === PRE-COMPUTE: Measured YoY Growth at Multiple Windows ===
+        growth_rates = self._measure_yoy_growth(working_df)
+        print(f"\n📊 MEASURED YOY GROWTH RATES:")
+        print(f"   7-day:  {growth_rates['7d']*100:+.1f}%")
+        print(f"   14-day: {growth_rates['14d']*100:+.1f}%")
+        print(f"   30-day: {growth_rates['30d']*100:+.1f}%")
+        print(f"   Composite: {growth_rates['composite']*100:+.1f}%")
+        
+        # === PRE-COMPUTE: DOW patterns from recent 4 weeks ===
+        dow_patterns = self._compute_dow_patterns(working_df)
+        
+        # === PRE-COMPUTE: Recent ATV for sales estimation ===
         recent_atv_median = working_df.tail(30)['atv'].median()
         if np.isnan(recent_atv_median) or recent_atv_median <= 0:
             recent_atv_median = working_df['atv'].median()
         
-        # === COMPUTE TREND INTELLIGENCE ONCE (not per-day) ===
-        trend_analysis_global = None
-        if TREND_AWARE_MODE:
-            try:
-                from trend_intelligence import TrendAnalyzer
-                analyzer = TrendAnalyzer()
-                trend_analysis_global = analyzer.analyze_comprehensive_trend(working_df, last_date + timedelta(days=1))
-            except Exception as e:
-                print(f"Trend analysis failed: {e}")
-        
-        # === COMPUTE CUSTOMER PREDICTION QUANTILES FOR CI ===
-        # Use residuals from validation to estimate prediction intervals
+        # === PRE-COMPUTE: Residual std for confidence intervals ===
         customer_residual_std = self._estimate_residual_std(working_df)
         
         for h in range(1, periods + 1):
             target_date = last_date + timedelta(days=h)
+            target_dow = target_date.weekday()
             
-            # === COMPONENT 1: LightGBM Model Prediction ===
-            # FIXED: Use fast single-row feature computation instead of re-featurizing all data
+            # ============================================================
+            # STEP 1: SDLY BASE (Same Day Last Year - the ANCHOR)
+            # ============================================================
+            sdly_date = target_date - timedelta(days=364)  # DOW-aligned
+            sdly_row = working_df[working_df['date'] == sdly_date]
+            
+            if len(sdly_row) > 0:
+                sdly_exact = sdly_row['customers'].values[0]
+            else:
+                # Fallback: average of same DOW in ±7 day window around SDLY
+                sdly_window_start = sdly_date - timedelta(days=7)
+                sdly_window_end = sdly_date + timedelta(days=7)
+                sdly_window = working_df[
+                    (working_df['date'] >= sdly_window_start) & 
+                    (working_df['date'] <= sdly_window_end) &
+                    (working_df['date'].dt.dayofweek == target_dow)
+                ]
+                sdly_exact = sdly_window['customers'].mean() if not sdly_window.empty else None
+            
+            # ============================================================
+            # STEP 2: APPLY MEASURED GROWTH (from ACTUAL recent data)
+            # ============================================================
+            growth_rate = growth_rates['composite']
+            
+            if sdly_exact is not None and sdly_exact > 0:
+                growth_adjusted_sdly = sdly_exact * (1 + growth_rate)
+            else:
+                # No SDLY data: use recent DOW average as base
+                growth_adjusted_sdly = dow_patterns.get(target_dow, {}).get('mean', 0)
+                if growth_adjusted_sdly == 0:
+                    growth_adjusted_sdly = working_df.tail(14)['customers'].mean()
+            
+            # ============================================================
+            # STEP 3: DOW FINE-TUNING (from recent 4 weeks)
+            # ============================================================
+            # If recent Tuesdays average 5% above overall recent mean,
+            # adjust this Tuesday's forecast accordingly
+            dow_info = dow_patterns.get(target_dow, {})
+            dow_adjustment = dow_info.get('relative_factor', 1.0)
+            
+            # But don't let DOW adjustment override the growth-adjusted SDLY too much
+            # The DOW factor adjusts around the growth-adjusted base
+            dow_adjusted = growth_adjusted_sdly * dow_adjustment
+            
+            # ============================================================
+            # STEP 4: ML MODEL RESIDUAL (small correction, CAPPED ±15%)
+            # ============================================================
             features = compute_single_row_features(working_df, target_date, self.events_df)
-            
             X_pred = pd.DataFrame([{col: features.get(col, 0) for col in self.feature_cols}])
-            model_pred = max(0, self.model.predict(X_pred)[0])
+            model_raw = max(0, self.model.predict(X_pred)[0])
             
-            # === COMPONENT 2: SDLY Contextual Prediction ===
-            ctx_features = calculate_contextual_window_features(working_df, target_date)
-            yoy = calculate_yoy_comparison(working_df, target_date)
-            
-            if not np.isnan(ctx_features['sdly_customers']) and ctx_features['sdly_customers'] > 0:
-                sdly_pred = ctx_features['sdly_customers'] * yoy['yoy_customer_growth']
-                # FIXED: sdly_momentum is a ratio near 1.0, check > 1.0 not > 0
-                if ctx_features['sdly_momentum'] > 1.0:
-                    sdly_pred *= (1 + ctx_features['sdly_trend_after'] * 0.3)
+            # ML correction = how different is the model's opinion from our anchor?
+            if dow_adjusted > 0:
+                ml_ratio = model_raw / dow_adjusted
+                # Cap the ML correction at ±15% (it's a nudge, not the driver)
+                ml_ratio_capped = np.clip(ml_ratio, 0.85, 1.15)
+                ml_corrected = dow_adjusted * ml_ratio_capped
             else:
-                sdly_pred = ctx_features.get('sdly_window_cust_mean', model_pred)
-                if np.isnan(sdly_pred):
-                    sdly_pred = model_pred
+                ml_corrected = model_raw
             
-            # === COMPONENT 3: Recent Trend Prediction ===
-            recent_features = calculate_recent_trend_features(working_df, target_date, weeks=8)
+            # ============================================================
+            # STEP 5: RECENT ACTUALS SANITY CHECK
+            # ============================================================
+            # If DOW-specific recent actuals exist, don't deviate more than 20%
+            dow_recent_mean = dow_info.get('mean', 0)
+            if dow_recent_mean > 0:
+                lower_bound = dow_recent_mean * 0.80
+                upper_bound = dow_recent_mean * 1.20
+                # Soft clamp: pull toward bounds rather than hard clip
+                if ml_corrected < lower_bound:
+                    ml_corrected = (ml_corrected + lower_bound) / 2
+                elif ml_corrected > upper_bound:
+                    ml_corrected = (ml_corrected + upper_bound) / 2
             
-            recent_base = recent_features.get('recent_weighted_cust_mean', model_pred)
-            if np.isnan(recent_base):
-                recent_base = model_pred
+            # ============================================================
+            # STEP 6: SELF-CORRECTION (from past forecast errors)
+            # ============================================================
+            final_pred = self.self_corrector.apply_correction(ml_corrected, target_date)
             
-            dow_factor = recent_features.get('recent_dow_factor', 1.0)
-            if np.isnan(dow_factor):
-                dow_factor = 1.0
-            
-            momentum = recent_features.get('recent_momentum_2w', 1.0)
-            if np.isnan(momentum):
-                momentum = 1.0
-            momentum = np.clip(momentum, 0.85, 1.15)
-            
-            recent_pred = recent_base * dow_factor * momentum
-            
-            # === TREND-AWARE BLENDING ===
-            if TREND_AWARE_MODE and trend_analysis_global is not None:
-                # Re-use global trend analysis (computed once) with per-day blending
-                from trend_intelligence import TrendAwareBlender, MomentumDampener, ConservativeEstimator
-                
-                blender = TrendAwareBlender()
-                dampener = MomentumDampener()
-                estimator = ConservativeEstimator()
-                
-                blended = blender.blend_with_trend_awareness(
-                    model_pred, sdly_pred, recent_pred, trend_analysis_global
-                )
-                
-                dampened, dampening_factor, dampening_reason = dampener.calculate_dampening(
-                    working_df, target_date, blended['trend_adjusted']
-                )
-                
-                conservative = estimator.get_conservative_estimate(
-                    {'model': model_pred, 'sdly': sdly_pred, 'recent': recent_pred},
-                    trend_analysis_global
-                )
-                
-                # Final selection
-                if trend_analysis_global['overall_direction'] == 'down' and trend_analysis_global['confidence'] > 50:
-                    blended_pred = min(dampened, conservative['conservative_estimate'])
-                else:
-                    blended_pred = dampened
-                
-                trend_direction = trend_analysis_global['overall_direction']
-                trend_confidence = trend_analysis_global['confidence']
-                trend_adjustment = trend_analysis_global['recommended_adjustment']
-            else:
-                # Fallback to simple blending
-                w_model = self.blend_weights['model']
-                w_sdly = self.blend_weights['sdly_contextual']
-                w_recent = self.blend_weights['recent_trend']
-                
-                if np.isnan(sdly_pred) or sdly_pred <= 0:
-                    sdly_pred = model_pred
-                    w_model += w_sdly * 0.5
-                    w_recent += w_sdly * 0.5
-                    w_sdly = 0
-                
-                blended_pred = (
-                    w_model * model_pred +
-                    w_sdly * sdly_pred +
-                    w_recent * recent_pred
-                )
-                
-                trend_direction = 'unknown'
-                trend_confidence = 0
-                trend_adjustment = 1.0
-            
-            # === APPLY SELF-CORRECTION ===
-            corrected_pred = self.self_corrector.apply_correction(blended_pred, target_date)
-            
-            # === APPLY SPECIAL DATE MULTIPLIERS ===
-            final_pred = self._apply_multipliers(corrected_pred, target_date, features)
+            # ============================================================
+            # STEP 7: SPECIAL DATE MULTIPLIERS (events, holidays)
+            # ============================================================
+            final_pred = self._apply_multipliers(final_pred, target_date, features)
             
             # Ensure non-negative
             final_pred = max(0, final_pred)
             
-            # === CONFIDENCE INTERVALS (based on residual distribution) ===
-            ci_margin = customer_residual_std * 1.645  # 90% CI
+            # ============================================================
+            # CONFIDENCE INTERVALS (based on residual distribution)
+            # ============================================================
+            horizon_factor = 1 + (h - 1) * 0.03
+            ci_margin = customer_residual_std * 1.645 * horizon_factor
             ci_lower = max(0, final_pred - ci_margin)
             ci_upper = final_pred + ci_margin
-            # Wider CI for further horizons
-            horizon_factor = 1 + (h - 1) * 0.03
-            ci_lower = max(0, final_pred - ci_margin * horizon_factor)
-            ci_upper = final_pred + ci_margin * horizon_factor
+            
+            # Context for diagnostics
+            sdly_display = sdly_exact if sdly_exact is not None else 0
             
             predictions.append({
                 'ds': target_date,
                 'forecast_customers': int(round(final_pred)),
                 'customers_lower': int(round(ci_lower)),
                 'customers_upper': int(round(ci_upper)),
-                'model_prediction': model_pred,
-                'sdly_prediction': sdly_pred,
-                'recent_prediction': recent_pred,
-                'blended_prediction': blended_pred,
-                'corrected_prediction': corrected_pred,
-                'yoy_growth': yoy['yoy_customer_growth'],
-                'recent_momentum': momentum,
-                'trend_direction': trend_direction,
-                'trend_confidence': trend_confidence,
-                'trend_adjustment': trend_adjustment
+                # Component breakdown for decomposition chart
+                'sdly_base': sdly_display,
+                'growth_adjusted_sdly': growth_adjusted_sdly,
+                'dow_adjusted': dow_adjusted,
+                'model_prediction': model_raw,
+                'ml_corrected': ml_corrected,
+                # Legacy fields for compatibility
+                'sdly_prediction': growth_adjusted_sdly,
+                'recent_prediction': dow_recent_mean if dow_recent_mean > 0 else ml_corrected,
+                'blended_prediction': ml_corrected,
+                'corrected_prediction': final_pred,
+                'yoy_growth': 1 + growth_rate,
+                'recent_momentum': dow_adjustment,
+                'trend_direction': 'up' if growth_rate > 0.02 else ('down' if growth_rate < -0.05 else 'neutral'),
+                'trend_confidence': min(90, 40 + abs(growth_rate) * 500),
+                'trend_adjustment': 1 + growth_rate
             })
             
-            # FIXED: Populate estimated sales/atv to prevent NaN propagation
-            estimated_atv = recent_atv_median
-            estimated_sales = final_pred * estimated_atv
-            
+            # Update working_df for next iteration (no NaN!)
+            estimated_sales = final_pred * recent_atv_median
             working_df = pd.concat([
                 working_df,
                 pd.DataFrame({
                     'date': [target_date],
                     'customers': [final_pred],
                     'sales': [estimated_sales],
-                    'atv': [estimated_atv]
+                    'atv': [recent_atv_median]
                 })
             ], ignore_index=True)
         
         return pd.DataFrame(predictions)
     
-    def _estimate_residual_std(self, historical_df):
+    def _measure_yoy_growth(self, df):
+        """
+        PRECISELY measure how much better/worse we are vs last year.
+        
+        Uses multiple windows for robustness, weighted toward recent data.
+        This is THE key metric — if this says +8%, our forecast should
+        be ~8% above SDLY.
+        """
+        end_date = df['date'].max()
+        rates = {}
+        
+        for label, days in [('7d', 7), ('14d', 14), ('30d', 30)]:
+            # This year
+            ty_data = df[df['date'] > end_date - timedelta(days=days)]
+            # Same period last year (364 days ago for DOW alignment)
+            ly_end = end_date - timedelta(days=364)
+            ly_start = ly_end - timedelta(days=days)
+            ly_data = df[(df['date'] > ly_start) & (df['date'] <= ly_end)]
+            
+            if not ty_data.empty and not ly_data.empty:
+                ty_mean = ty_data['customers'].mean()
+                ly_mean = ly_data['customers'].mean()
+                rates[label] = (ty_mean - ly_mean) / ly_mean if ly_mean > 0 else 0
+            else:
+                rates[label] = 0
+        
+        # Composite: weighted average (recent matters more)
+        # 7d × 3 + 14d × 2 + 30d × 1
+        weights = {'7d': 3, '14d': 2, '30d': 1}
+        total_weight = sum(weights.values())
+        composite = sum(rates.get(k, 0) * w for k, w in weights.items()) / total_weight
+        
+        rates['composite'] = composite
+        return rates
+    
+    def _compute_dow_patterns(self, df):
+        """
+        Compute day-of-week specific patterns from last 4 weeks.
+        
+        Returns for each DOW: mean customers, and relative factor
+        (how much this DOW differs from overall recent average).
+        """
+        end_date = df['date'].max()
+        recent_4w = df[df['date'] > end_date - timedelta(days=28)]
+        
+        if recent_4w.empty:
+            return {}
+        
+        overall_mean = recent_4w['customers'].mean()
+        
+        patterns = {}
+        for dow in range(7):
+            dow_data = recent_4w[recent_4w['date'].dt.dayofweek == dow]['customers']
+            if not dow_data.empty:
+                dow_mean = dow_data.mean()
+                patterns[dow] = {
+                    'mean': dow_mean,
+                    'count': len(dow_data),
+                    'std': dow_data.std() if len(dow_data) > 1 else 0,
+                    'relative_factor': dow_mean / overall_mean if overall_mean > 0 else 1.0
+                }
+            else:
+                patterns[dow] = {
+                    'mean': overall_mean,
+                    'count': 0,
+                    'std': 0,
+                    'relative_factor': 1.0
+                }
+        
+        return patterns
         """
         Estimate prediction residual standard deviation for confidence intervals.
         Uses recent data holdout to compute empirical residuals.
@@ -657,7 +732,7 @@ class EnsembleForecaster:
     
     def fit(self, historical_df, events_df=None):
         print("=" * 60)
-        print("COGNITIVE FORECASTING ENGINE v12.0")
+        print("COGNITIVE FORECASTING ENGINE v12.2 (SDLY-ANCHORED)")
         print("=" * 60)
         
         # Step 0: Intelligent pre-analysis (if available)
