@@ -584,6 +584,8 @@ class EnhancedCustomerForecaster:
                 }
         
         return patterns
+    
+    def _estimate_residual_std(self, historical_df):
         """
         Estimate prediction residual standard deviation for confidence intervals.
         Uses recent data holdout to compute empirical residuals.
