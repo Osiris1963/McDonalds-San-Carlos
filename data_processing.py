@@ -390,7 +390,7 @@ def detect_special_dates(date_series):
     df['is_new_year'] = ((df['date'].dt.month == 1) & (df['date'].dt.day <= 2)).astype(int)
     df['is_christmas_season'] = ((df['date'].dt.month == 12) & (df['date'].dt.day >= 15)).astype(int)
     df['is_valentines'] = ((df['date'].dt.month == 2) & (df['date'].dt.day.isin([13, 14, 15]))).astype(int)
-    df['is_holy_week'] = 0  # Will be filled by events_df
+    df['is_holy_week'] = 0  # Will be filled by events_df or PH holidays below
     
     # Payday patterns
     df['is_payday'] = df['date'].dt.day.isin([14, 15, 16, 29, 30, 31, 1, 2]).astype(int)
@@ -401,6 +401,38 @@ def detect_special_dates(date_series):
     df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
     df['is_friday'] = (df['date'].dt.dayofweek == 4).astype(int)
     df['is_monday'] = (df['date'].dt.dayofweek == 0).astype(int)
+    
+    # === NEW: Philippine Public Holidays (fixed dates) ===
+    df['is_independence_day'] = ((df['date'].dt.month == 6) & (df['date'].dt.day == 12)).astype(int)
+    df['is_rizal_day'] = ((df['date'].dt.month == 12) & (df['date'].dt.day == 30)).astype(int)
+    df['is_bonifacio_day'] = ((df['date'].dt.month == 11) & (df['date'].dt.day == 30)).astype(int)
+    df['is_labor_day'] = ((df['date'].dt.month == 5) & (df['date'].dt.day == 1)).astype(int)
+    df['is_ninoy_aquino'] = ((df['date'].dt.month == 8) & (df['date'].dt.day == 21)).astype(int)
+    df['is_all_saints'] = ((df['date'].dt.month == 11) & (df['date'].dt.day.isin([1, 2]))).astype(int)
+    
+    # Aggregate holiday flag
+    df['is_ph_holiday'] = (
+        df['is_new_year'] | df['is_independence_day'] | df['is_rizal_day'] |
+        df['is_bonifacio_day'] | df['is_labor_day'] | df['is_ninoy_aquino'] |
+        df['is_all_saints']
+    ).astype(int)
+    
+    # === NEW: Pre/Post holiday effects (day before and after holidays often have spill-over) ===
+    df['is_holiday_eve'] = 0
+    df['is_holiday_after'] = 0
+    for idx in df.index:
+        if idx > 0 and df.loc[idx, 'is_ph_holiday'] == 1:
+            df.loc[idx - 1, 'is_holiday_eve'] = 1 if idx - 1 in df.index else 0
+        if idx < len(df) - 1 and df.loc[idx, 'is_ph_holiday'] == 1:
+            df.loc[idx + 1, 'is_holiday_after'] = 1 if idx + 1 in df.index else 0
+    
+    # === NEW: Month-end / Month-start spending pattern ===
+    df['is_month_end'] = (df['date'].dt.day >= 28).astype(int)
+    df['is_month_start'] = (df['date'].dt.day <= 3).astype(int)
+    
+    # === NEW: Fiesta/Summer season (March-May in Philippines = high spending) ===
+    df['is_summer_season'] = (df['date'].dt.month.isin([3, 4, 5])).astype(int)
+    df['is_ber_months'] = (df['date'].dt.month.isin([9, 10, 11, 12])).astype(int)
     
     return df.drop(columns=['date'])
 
@@ -464,28 +496,33 @@ def create_advanced_features(df, events_df, for_prediction=False):
             result[f'customers_roll_std_{window}'] = shifted.rolling(window, min_periods=3).std()
     
     # === CONTEXTUAL WINDOW FEATURES (SDLY ± 14 days) ===
-    # These are calculated per-row for each target date
+    # FIXED: Only use data available up to each row's date to prevent data leakage
     contextual_features = []
     for idx, row in result.iterrows():
-        ctx = calculate_contextual_window_features(result, row['date'])
+        past_data = result.iloc[:idx+1] if not for_prediction else result
+        ctx = calculate_contextual_window_features(past_data, row['date'])
         contextual_features.append(ctx)
     
     ctx_df = pd.DataFrame(contextual_features)
     result = pd.concat([result.reset_index(drop=True), ctx_df], axis=1)
     
     # === 8-WEEK RECENT TREND FEATURES ===
+    # FIXED: Only use data available up to each row's date to prevent data leakage
     recent_features = []
     for idx, row in result.iterrows():
-        recent = calculate_recent_trend_features(result, row['date'], weeks=8)
+        past_data = result.iloc[:idx+1] if not for_prediction else result
+        recent = calculate_recent_trend_features(past_data, row['date'], weeks=8)
         recent_features.append(recent)
     
     recent_df = pd.DataFrame(recent_features)
     result = pd.concat([result.reset_index(drop=True), recent_df], axis=1)
     
     # === YOY COMPARISON ===
+    # FIXED: Only use data available up to each row's date to prevent data leakage
     yoy_features = []
     for idx, row in result.iterrows():
-        yoy = calculate_yoy_comparison(result, row['date'])
+        past_data = result.iloc[:idx+1] if not for_prediction else result
+        yoy = calculate_yoy_comparison(past_data, row['date'])
         yoy_features.append(yoy)
     
     yoy_df = pd.DataFrame(yoy_features)
@@ -573,7 +610,13 @@ def get_feature_list(include_sdly=True, include_contextual=True, include_recent=
         'is_payday', 'is_mid_month_pay', 'is_end_month_pay',
         'is_weekend', 'is_friday', 'is_monday',
         'is_new_year', 'is_christmas_season', 'is_valentines',
-        'is_event', 'days_to_event', 'days_from_event'
+        'is_event', 'days_to_event', 'days_from_event',
+        # NEW: Philippine holidays & seasonal
+        'is_independence_day', 'is_rizal_day', 'is_bonifacio_day',
+        'is_labor_day', 'is_ninoy_aquino', 'is_all_saints',
+        'is_ph_holiday', 'is_holiday_eve', 'is_holiday_after',
+        'is_month_end', 'is_month_start',
+        'is_summer_season', 'is_ber_months'
     ]
     
     lag_features = [
@@ -586,7 +629,6 @@ def get_feature_list(include_sdly=True, include_contextual=True, include_recent=
         'customers_roll_std_7', 'customers_roll_std_14'
     ]
     
-    # NEW: Contextual window features (SDLY ± 14 days)
     contextual_features = [
         'sdly_customers', 'sdly_sales', 'sdly_atv',
         'sdly_window_cust_mean', 'sdly_window_cust_std',
@@ -595,7 +637,6 @@ def get_feature_list(include_sdly=True, include_contextual=True, include_recent=
         'sdly_momentum', 'sdly_cust_growth', 'sdly_sales_growth'
     ] if include_contextual else []
     
-    # NEW: 8-week recent trend features
     recent_features = [
         'recent_weighted_cust_mean', 'recent_weighted_sales_mean', 'recent_weighted_atv_mean',
         'recent_trend_slope', 'recent_acceleration', 'recent_volatility',
@@ -604,7 +645,6 @@ def get_feature_list(include_sdly=True, include_contextual=True, include_recent=
         'week_1_avg_cust', 'week_2_avg_cust', 'week_4_avg_cust', 'week_8_avg_cust'
     ] if include_recent else []
     
-    # NEW: YoY comparison
     yoy_features = [
         'yoy_customer_growth', 'yoy_sales_growth', 'yoy_atv_growth'
     ]
@@ -613,3 +653,120 @@ def get_feature_list(include_sdly=True, include_contextual=True, include_recent=
                    rolling_features + contextual_features + recent_features + yoy_features)
     
     return all_features
+
+
+def compute_single_row_features(historical_df, target_date, events_df=None):
+    """
+    FAST single-row feature computation for the prediction loop.
+    Instead of re-featurizing the entire dataset O(N²), this computes
+    features for ONE target date using the historical data available.
+    
+    Returns a dict of feature values for the target_date.
+    """
+    features = {}
+    
+    # === TEMPORAL FEATURES ===
+    features['year'] = target_date.year
+    features['month'] = target_date.month
+    features['day'] = target_date.day
+    features['dayofweek'] = target_date.weekday()
+    features['weekofyear'] = target_date.isocalendar()[1]
+    features['dayofyear'] = target_date.timetuple().tm_yday
+    features['quarter'] = (target_date.month - 1) // 3 + 1
+    
+    # Cyclical encoding
+    features['dow_sin'] = np.sin(2 * np.pi * features['dayofweek'] / 7)
+    features['dow_cos'] = np.cos(2 * np.pi * features['dayofweek'] / 7)
+    features['month_sin'] = np.sin(2 * np.pi * features['month'] / 12)
+    features['month_cos'] = np.cos(2 * np.pi * features['month'] / 12)
+    
+    # === SPECIAL DATE FLAGS ===
+    features['is_new_year'] = int(target_date.month == 1 and target_date.day <= 2)
+    features['is_christmas_season'] = int(target_date.month == 12 and target_date.day >= 15)
+    features['is_valentines'] = int(target_date.month == 2 and target_date.day in [13, 14, 15])
+    features['is_holy_week'] = 0
+    features['is_payday'] = int(target_date.day in [14, 15, 16, 29, 30, 31, 1, 2])
+    features['is_mid_month_pay'] = int(target_date.day in [14, 15, 16])
+    features['is_end_month_pay'] = int(target_date.day in [29, 30, 31, 1, 2])
+    features['is_weekend'] = int(target_date.weekday() >= 5)
+    features['is_friday'] = int(target_date.weekday() == 4)
+    features['is_monday'] = int(target_date.weekday() == 0)
+    
+    # === NEW: Philippine Public Holidays ===
+    features['is_independence_day'] = int(target_date.month == 6 and target_date.day == 12)
+    features['is_rizal_day'] = int(target_date.month == 12 and target_date.day == 30)
+    features['is_bonifacio_day'] = int(target_date.month == 11 and target_date.day == 30)
+    features['is_labor_day'] = int(target_date.month == 5 and target_date.day == 1)
+    features['is_ninoy_aquino'] = int(target_date.month == 8 and target_date.day == 21)
+    features['is_all_saints'] = int(target_date.month == 11 and target_date.day in [1, 2])
+    features['is_ph_holiday'] = int(any([
+        features['is_new_year'], features['is_independence_day'], features['is_rizal_day'],
+        features['is_bonifacio_day'], features['is_labor_day'], features['is_ninoy_aquino'],
+        features['is_all_saints']
+    ]))
+    features['is_holiday_eve'] = 0  # Would need next-day lookahead; set by training data
+    features['is_holiday_after'] = 0  # Same
+    features['is_month_end'] = int(target_date.day >= 28)
+    features['is_month_start'] = int(target_date.day <= 3)
+    features['is_summer_season'] = int(target_date.month in [3, 4, 5])
+    features['is_ber_months'] = int(target_date.month in [9, 10, 11, 12])
+    
+    # === EVENT FEATURES ===
+    features['is_event'] = 0
+    features['days_to_event'] = 99
+    features['days_from_event'] = 99
+    
+    if events_df is not None and not events_df.empty:
+        ev_dates = pd.to_datetime(events_df['date']).dt.normalize()
+        if target_date in ev_dates.values:
+            features['is_event'] = 1
+        
+        future_events = ev_dates[ev_dates > target_date]
+        past_events = ev_dates[ev_dates <= target_date]
+        
+        if len(future_events) > 0:
+            features['days_to_event'] = (future_events.min() - target_date).days
+        if len(past_events) > 0:
+            features['days_from_event'] = (target_date - past_events.max()).days
+    
+    # === LAG FEATURES (from historical_df) ===
+    sorted_df = historical_df.sort_values('date')
+    
+    if 'customers' in sorted_df.columns and sorted_df['customers'].notna().any():
+        for lag in [1, 7, 14, 21, 28]:
+            lag_date = target_date - pd.Timedelta(days=lag)
+            lag_row = sorted_df[sorted_df['date'] == lag_date]
+            features[f'customers_lag_{lag}'] = lag_row['customers'].values[0] if len(lag_row) > 0 else 0
+        
+        # Rolling statistics (use data before target_date)
+        past_data = sorted_df[sorted_df['date'] < target_date]['customers']
+        for window in [7, 14, 30]:
+            if len(past_data) >= window:
+                features[f'customers_roll_mean_{window}'] = past_data.tail(window).mean()
+                features[f'customers_roll_std_{window}'] = past_data.tail(window).std() if window >= 3 else 0
+            elif len(past_data) > 0:
+                features[f'customers_roll_mean_{window}'] = past_data.mean()
+                features[f'customers_roll_std_{window}'] = past_data.std() if len(past_data) >= 3 else 0
+            else:
+                features[f'customers_roll_mean_{window}'] = 0
+                features[f'customers_roll_std_{window}'] = 0
+    
+    # === CONTEXTUAL WINDOW FEATURES ===
+    ctx = calculate_contextual_window_features(historical_df, target_date)
+    features.update(ctx)
+    
+    # === RECENT TREND FEATURES ===
+    recent = calculate_recent_trend_features(historical_df, target_date, weeks=8)
+    features.update(recent)
+    
+    # === YOY COMPARISON ===
+    yoy = calculate_yoy_comparison(historical_df, target_date)
+    features.update(yoy)
+    
+    # Fill NaN with 0
+    for key in features:
+        if features[key] is None or (isinstance(features[key], float) and np.isnan(features[key])):
+            features[key] = 0
+    
+    return features
+
