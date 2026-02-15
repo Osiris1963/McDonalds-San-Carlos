@@ -95,11 +95,11 @@ class AutoLearningSystem:
                         'error': actual_cust - pred_cust,
                         'pct_error': (actual_cust - pred_cust) / actual_cust * 100,
                         'abs_pct_error': abs(actual_cust - pred_cust) / actual_cust * 100,
-                        'dayofweek': forecast_date.dayofweek(),
+                        'dayofweek': forecast_date.dayofweek,
                         'month': forecast_date.month,
                         'day': forecast_date.day,
                         'is_payday': forecast_date.day in [14, 15, 16, 29, 30, 31, 1, 2],
-                        'is_weekend': forecast_date.dayofweek() >= 5,
+                        'is_weekend': forecast_date.dayofweek >= 5,
                         # Component predictions if available
                         'model_pred': forecast.get('model_prediction'),
                         'sdly_pred': forecast.get('sdly_prediction'),
