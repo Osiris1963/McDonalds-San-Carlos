@@ -1,6 +1,6 @@
-# app.py - COGNITIVE FORECASTING ENGINE v12.0
+# app.py - COGNITIVE FORECASTING ENGINE v12.2
 # Complete Streamlit Dashboard with all pages implemented
-# v12.0 Improvements: Bug fixes, performance optimization, Philippine holidays,
+# v12.2 Improvements: Bug fixes, performance optimization, Philippine holidays,
 # proper CI, forecast decomposition, anomaly handling, and real confidence scoring
 
 import streamlit as st
@@ -46,7 +46,7 @@ except ImportError as e:
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Cognitive Forecaster v12.0", 
+    page_title="Cognitive Forecaster v12.2", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -231,7 +231,7 @@ db = init_db()
 
 # Sidebar
 with st.sidebar:
-    st.title("🧠 Cognitive Forecaster v12.0")
+    st.title("🧠 Cognitive Forecaster v12.2")
     st.caption("Self-Learning AI with Trend Intelligence + CI")
     
     st.divider()
@@ -377,8 +377,75 @@ if page == "📊 Forecast Dashboard":
                 use_container_width=True
             )
         
-        # === NEW: Forecast Component Decomposition ===
-        if 'model_prediction' in forecast_df.columns and 'sdly_prediction' in forecast_df.columns:
+        # === Forecast Component Decomposition ===
+        if 'sdly_base' in forecast_df.columns:
+            st.subheader("🔍 Forecast Decomposition (SDLY-Anchored)")
+            st.caption("How each step builds the final forecast: SDLY → Growth → DOW → ML Correction → Final")
+            
+            decomp_fig = go.Figure()
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['sdly_base'],
+                mode='lines+markers', name='① SDLY Base (Last Year)',
+                line=dict(color='#9CA3AF', width=2, dash='dot'), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['growth_adjusted_sdly'],
+                mode='lines+markers', name='② + YoY Growth',
+                line=dict(color='#8B5CF6', width=2), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['dow_adjusted'],
+                mode='lines+markers', name='③ + DOW Pattern',
+                line=dict(color='#3B82F6', width=2), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['model_prediction'],
+                mode='lines+markers', name='ML Model (raw)',
+                line=dict(color='#6B7280', width=1, dash='dash'), marker=dict(size=3),
+                opacity=0.5
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['forecast_customers'],
+                mode='lines+markers', name='④ FINAL Forecast',
+                line=dict(color='#FBBF24', width=3), marker=dict(size=8, symbol='diamond')
+            ))
+            
+            decomp_fig.update_layout(
+                title='SDLY-Anchored Forecast Pipeline',
+                height=400, hovermode='x unified',
+                yaxis_title='Customers',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02)
+            )
+            st.plotly_chart(decomp_fig, use_container_width=True)
+            
+            # Growth & component metrics
+            if len(forecast_df) > 0:
+                avg_sdly = forecast_df['sdly_base'].mean()
+                avg_final = forecast_df['forecast_customers'].mean()
+                avg_growth = forecast_df['growth_adjusted_sdly'].mean()
+                avg_model = forecast_df['model_prediction'].mean()
+                
+                col_a, col_b, col_c, col_d = st.columns(4)
+                with col_a:
+                    st.metric("SDLY Base Avg", f"{avg_sdly:,.0f}")
+                with col_b:
+                    yoy_pct = ((avg_growth / avg_sdly) - 1) * 100 if avg_sdly > 0 else 0
+                    st.metric("After YoY Growth", f"{avg_growth:,.0f}", delta=f"{yoy_pct:+.1f}%")
+                with col_c:
+                    ml_pct = ((avg_final / avg_growth) - 1) * 100 if avg_growth > 0 else 0
+                    st.metric("Final Forecast Avg", f"{avg_final:,.0f}", delta=f"{ml_pct:+.1f}% ML adj")
+                with col_d:
+                    vs_ly = ((avg_final / avg_sdly) - 1) * 100 if avg_sdly > 0 else 0
+                    st.metric("vs Last Year", f"{vs_ly:+.1f}%", 
+                              delta="Growing" if vs_ly > 0 else "Declining",
+                              delta_color="normal" if vs_ly > 0 else "inverse")
+        
+        elif 'model_prediction' in forecast_df.columns and 'sdly_prediction' in forecast_df.columns:
             st.subheader("🔍 Forecast Decomposition")
             st.caption("How each component contributed to the final forecast")
             
@@ -1138,4 +1205,4 @@ elif page == "📋 AI Briefing":
 
 # Footer
 st.divider()
-st.caption("Cognitive Forecasting Engine v12.0 | Trend-Aware Self-Learning AI with Confidence Intervals")
+st.caption("Cognitive Forecasting Engine v12.2 | Trend-Aware Self-Learning AI with Confidence Intervals")
