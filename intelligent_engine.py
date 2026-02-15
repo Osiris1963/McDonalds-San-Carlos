@@ -779,12 +779,21 @@ class CognitiveForecaster:
                 regime_info
             )
             
-            # Calculate confidence
+            # Calculate confidence using REAL validation accuracy if available
+            historical_accuracy_real = {}
+            if hasattr(self, '_backtest_accuracy') and self._backtest_accuracy:
+                historical_accuracy_real = self._backtest_accuracy
+            else:
+                # Estimate from validation MAPE if available
+                val_mape = getattr(self, '_validation_mape', 12)
+                base_acc = 100 - val_mape
+                for dow in range(7):
+                    historical_accuracy_real[f'dow_{dow}'] = base_acc
+            
             confidence = self.confidence_scorer.calculate_confidence(
                 row,
-                historical_accuracy={'dow_0': 90, 'dow_1': 88, 'dow_2': 89, 
-                                    'dow_3': 87, 'dow_4': 91, 'dow_5': 85, 'dow_6': 84},
-                data_quality_score=85,
+                historical_accuracy=historical_accuracy_real,
+                data_quality_score=self._assess_data_quality(historical_df).get('score', 85) if hasattr(self, '_assess_data_quality') else 85,
                 component_agreement=0.9
             )
             
