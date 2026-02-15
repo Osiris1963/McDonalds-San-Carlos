@@ -1,5 +1,7 @@
-# app.py - COGNITIVE FORECASTING ENGINE v11.1
+# app.py - COGNITIVE FORECASTING ENGINE v12.0
 # Complete Streamlit Dashboard with all pages implemented
+# v12.0 Improvements: Bug fixes, performance optimization, Philippine holidays,
+# proper CI, forecast decomposition, anomaly handling, and real confidence scoring
 
 import streamlit as st
 import pandas as pd
@@ -30,19 +32,21 @@ from forecasting import (
 try:
     from intelligent_engine import CognitiveForecaster
     INTELLIGENT_MODE = True
-except ImportError:
+except ImportError as e:
     INTELLIGENT_MODE = False
+    print(f"⚠️ Intelligent mode unavailable: {e}")
 
 # Check for trend intelligence
 try:
     from trend_intelligence import TrendAnalyzer, apply_trend_intelligence
     TREND_MODE = True
-except ImportError:
+except ImportError as e:
     TREND_MODE = False
+    print(f"⚠️ Trend intelligence unavailable: {e}")
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Cognitive Forecaster v11.1", 
+    page_title="Cognitive Forecaster v12.0", 
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -168,7 +172,7 @@ def create_forecast_chart(forecast_df, hist_df=None):
             line=dict(color='#EF4444', width=2), marker=dict(size=6)
         ), row=2, col=1)
     
-    # Confidence interval
+    # Confidence interval for sales
     if 'sales_lower' in forecast_df.columns:
         fig.add_trace(go.Scatter(
             x=pd.concat([forecast_df['ds'], forecast_df['ds'][::-1]]),
@@ -176,6 +180,15 @@ def create_forecast_chart(forecast_df, hist_df=None):
             fill='toself', fillcolor='rgba(251, 191, 36, 0.2)',
             line=dict(color='rgba(255,255,255,0)'), name='Sales CI', showlegend=True
         ), row=1, col=1)
+    
+    # Confidence interval for customers
+    if 'customers_lower' in forecast_df.columns:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([forecast_df['ds'], forecast_df['ds'][::-1]]),
+            y=pd.concat([forecast_df['customers_upper'], forecast_df['customers_lower'][::-1]]),
+            fill='toself', fillcolor='rgba(251, 191, 36, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'), name='Customer CI', showlegend=True
+        ), row=2, col=1)
     
     # Forecasts
     fig.add_trace(go.Scatter(
@@ -218,8 +231,8 @@ db = init_db()
 
 # Sidebar
 with st.sidebar:
-    st.title("🧠 Cognitive Forecaster v11.1")
-    st.caption("Self-Learning AI with Trend Intelligence")
+    st.title("🧠 Cognitive Forecaster v12.0")
+    st.caption("Self-Learning AI with Trend Intelligence + CI")
     
     st.divider()
     
@@ -253,8 +266,14 @@ with st.sidebar:
     
     # Data Status
     st.subheader("📁 Data Status")
-    hist_df = load_from_firestore(db, 'historical_data')
-    ev_df = load_from_firestore(db, 'future_activities')
+    
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _cached_load(collection_name):
+        """Cache Firestore data for 5 minutes to avoid re-loading on every interaction."""
+        return load_from_firestore(db, collection_name)
+    
+    hist_df = _cached_load('historical_data')
+    ev_df = _cached_load('future_activities')
     
     if not hist_df.empty:
         st.success(f"✅ {len(hist_df)} days of data")
@@ -357,6 +376,64 @@ if page == "📊 Forecast Dashboard":
                 display_df[['Date', 'Sales', 'Customers', 'ATV']].set_index('Date'),
                 use_container_width=True
             )
+        
+        # === NEW: Forecast Component Decomposition ===
+        if 'model_prediction' in forecast_df.columns and 'sdly_prediction' in forecast_df.columns:
+            st.subheader("🔍 Forecast Decomposition")
+            st.caption("How each component contributed to the final forecast")
+            
+            decomp_fig = go.Figure()
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['model_prediction'],
+                mode='lines+markers', name='ML Model',
+                line=dict(color='#3B82F6', width=2), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['sdly_prediction'],
+                mode='lines+markers', name='SDLY (Last Year)',
+                line=dict(color='#8B5CF6', width=2), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['recent_prediction'],
+                mode='lines+markers', name='Recent Trend',
+                line=dict(color='#10B981', width=2), marker=dict(size=5)
+            ))
+            
+            decomp_fig.add_trace(go.Scatter(
+                x=forecast_df['ds'], y=forecast_df['forecast_customers'],
+                mode='lines+markers', name='Final (Blended)',
+                line=dict(color='#FBBF24', width=3), marker=dict(size=8, symbol='diamond')
+            ))
+            
+            decomp_fig.update_layout(
+                title='Customer Forecast: Component Breakdown',
+                height=400, hovermode='x unified',
+                yaxis_title='Customers',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02)
+            )
+            st.plotly_chart(decomp_fig, use_container_width=True)
+            
+            # Component agreement metric
+            if len(forecast_df) > 0:
+                avg_model = forecast_df['model_prediction'].mean()
+                avg_sdly = forecast_df['sdly_prediction'].mean()
+                avg_recent = forecast_df['recent_prediction'].mean()
+                avg_final = forecast_df['forecast_customers'].mean()
+                
+                col_a, col_b, col_c, col_d = st.columns(4)
+                with col_a:
+                    st.metric("ML Model Avg", f"{avg_model:,.0f}")
+                with col_b:
+                    st.metric("SDLY Avg", f"{avg_sdly:,.0f}")
+                with col_c:
+                    st.metric("Recent Avg", f"{avg_recent:,.0f}")
+                with col_d:
+                    spread = max(avg_model, avg_sdly, avg_recent) - min(avg_model, avg_sdly, avg_recent)
+                    agreement = max(0, 100 - (spread / avg_final * 100))
+                    st.metric("Component Agreement", f"{agreement:.0f}%")
     else:
         st.info("👈 Click 'Generate Forecast' to start")
 
@@ -1061,4 +1138,4 @@ elif page == "📋 AI Briefing":
 
 # Footer
 st.divider()
-st.caption("Cognitive Forecasting Engine v11.1 | Trend-Aware Self-Learning AI")
+st.caption("Cognitive Forecasting Engine v12.0 | Trend-Aware Self-Learning AI with Confidence Intervals")
